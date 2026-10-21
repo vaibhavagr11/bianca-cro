@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     database_url: SecretStr
     # Shared secret n8n sends in the X-Ingest-Token header.
     ingest_token: SecretStr
-    # Single-tenant for now: every ingest call writes to this workspace.
+    # Every ingest call writes to Bianca's workspace.
     workspace_name: str = "Bianca AI"
 
 

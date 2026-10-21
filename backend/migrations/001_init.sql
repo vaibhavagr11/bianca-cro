@@ -1,5 +1,5 @@
 -- 001_init: workspaces, team, companies, and the mirrored sales pipeline.
--- Every table carries workspace_id so customer data stays isolated from day one.
+-- Every table carries workspace_id so all of Bianca's records stay scoped together and can be deleted together.
 
 create or replace function set_updated_at() returns trigger
 language plpgsql as $$
@@ -9,7 +9,7 @@ begin
 end;
 $$;
 
--- A customer account (e.g. Bianca AI).
+-- The Bianca AI workspace.
 create table workspaces (
     id               uuid primary key default gen_random_uuid(),
     name             text not null unique,
@@ -19,7 +19,7 @@ create table workspaces (
     updated_at       timestamptz not null default now()
 );
 
--- The customer's own team; owner_code matches the pipeline's Owner column (NC, RG, NDL).
+-- Bianca's team; owner_code matches the pipeline's Owner column (NC, RG, NDL).
 create table team_members (
     id             uuid primary key default gen_random_uuid(),
     workspace_id   uuid not null references workspaces(id) on delete cascade,

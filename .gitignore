@@ -9,7 +9,7 @@ __pycache__/
 .venv/
 .pytest_cache/
 
-# Local data exports (customer data never goes in git)
+# Local data exports (Bianca data never goes in git)
 data/
 *.xlsx
 *.csv

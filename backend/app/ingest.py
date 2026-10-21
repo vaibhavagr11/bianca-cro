@@ -20,7 +20,7 @@ from app.pipeline import (
     plan_sync,
 )
 
-log = logging.getLogger("ai_cro.ingest")
+log = logging.getLogger("bianca_cro.ingest")
 router = APIRouter(prefix="/ingest")
 
 

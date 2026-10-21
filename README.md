@@ -1,6 +1,7 @@
-# AI CRO
+# Bianca CRO
 
-Always-on commercial intelligence for founder-led sales. First design partner: Bianca AI.
+Commercial intelligence for Bianca AI's founders. It reads Bianca's pipeline file, Gmail, Google Calendar
+and meeting notes, keeps track of deals and commitments, and sends a daily morning brief.
 
 ## Layout
 
@@ -52,5 +53,5 @@ uv run pytest
 
 ## Rules
 
-- Secrets only in `backend/.env` (git-ignored). Never log customer content.
-- No customer data files in the repo.
+- Secrets only in `backend/.env` (git-ignored). Never log email, note or deal contents.
+- No Bianca data files in the repo.
