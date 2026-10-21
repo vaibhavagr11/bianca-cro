@@ -90,7 +90,8 @@ def ingest_gmail(payload: GmailPayload, x_ingest_token: str | None = Header(defa
     with db.connect() as conn:
         workspace_id = _workspace_id(conn)
         internal = conn.execute("select internal_domains from workspaces where id = %s", (workspace_id,)).fetchone()[0]
-        internal_domains = {d.lower() for d in internal} | {d.lower() for d in settings.extra_internal_domains}
+        internal_domains = {d.lower() for d in internal}
+        project_domains = {d.lower() for d in settings.project_team_domains}
         run_id = conn.execute(
             "insert into sync_runs (workspace_id, source, rows_received) values (%s, 'gmail', %s) returning id",
             (workspace_id, len(payload.messages)),
@@ -98,7 +99,9 @@ def ingest_gmail(payload: GmailPayload, x_ingest_token: str | None = Header(defa
         conn.commit()
 
         try:
-            kept, skipped = gmail.process(payload.messages, internal_domains, set(settings.excluded_label_ids))
+            kept, skipped = gmail.process(
+                payload.messages, internal_domains, project_domains, set(settings.excluded_label_ids)
+            )
             created = updated = 0
             with conn.transaction():
                 for m in kept:

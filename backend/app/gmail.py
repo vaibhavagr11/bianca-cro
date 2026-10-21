@@ -86,8 +86,14 @@ def redact_secrets(text: str) -> str:
     return text
 
 
-def skip_reason(message: dict, internal_domains: set[str], excluded_label_ids: set[str]) -> str | None:
-    """Why this message must not be stored or shown to the AI, or None if it passes."""
+def skip_reason(
+    message: dict, internal_domains: set[str], project_domains: set[str], excluded_label_ids: set[str]
+) -> str | None:
+    """Why this message must not be stored or shown to the AI, or None if it passes.
+
+    Bianca-internal threads are kept (the classifier finds internal sales discussions). Threads among only
+    Bianca and the project team are skipped: they are about this tool, not about Bianca's sales.
+    """
     labels = set(message.get("labelIds") or [])
     if labels & excluded_label_ids:
         return "excluded_label"
@@ -103,8 +109,9 @@ def skip_reason(message: dict, internal_domains: set[str], excluded_label_ids: s
     everyone = senders + addresses(message.get("to")) + addresses(message.get("cc"))
     if not everyone:
         return "no_participants"
-    if all(domain(p["address"]) in internal_domains for p in everyone):
-        return "internal_only"
+    domains = {domain(p["address"]) for p in everyone}
+    if domains & project_domains and domains <= internal_domains | project_domains:
+        return "project_team"
 
     if not (message.get("text") or "").strip():
         return "empty"
@@ -127,7 +134,7 @@ def clean(message: dict) -> CleanMessage:
     )
 
 
-def process(messages: list[dict], internal_domains: set[str], excluded_label_ids: set[str]):
+def process(messages: list[dict], internal_domains: set[str], project_domains: set[str], excluded_label_ids: set[str]):
     """Split a batch into messages to store and a count of skips by reason."""
     kept: list[CleanMessage] = []
     skipped: dict[str, int] = {}
@@ -137,7 +144,7 @@ def process(messages: list[dict], internal_domains: set[str], excluded_label_ids
             skipped["duplicate_or_no_id"] = skipped.get("duplicate_or_no_id", 0) + 1
             continue
         seen.add(message["id"])
-        reason = skip_reason(message, internal_domains, excluded_label_ids)
+        reason = skip_reason(message, internal_domains, project_domains, excluded_label_ids)
         if reason:
             skipped[reason] = skipped.get(reason, 0) + 1
         else:
