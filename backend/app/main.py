@@ -2,12 +2,13 @@ import logging
 
 from fastapi import FastAPI, HTTPException
 
-from app import db
+from app import db, ingest
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("ai_cro")
 
 app = FastAPI(title="AI CRO", version="0.1.0")
+app.include_router(ingest.router)
 
 
 @app.get("/health")

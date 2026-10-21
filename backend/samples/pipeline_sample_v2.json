@@ -1,0 +1,6 @@
+{
+  "rows": [
+    {"Empresa": "Acme Foods (TEST)", "Owner": "NC", "Status": "3. Proposal", "Country": "ARG 🇦🇷", "Primary buyer": "COO", "Nombre contacto (Rol)": "Jane Doe (COO)", "Last progress": "Demo went well", "Next step": "- Send proposal by Friday"},
+    {"Empresa": "Globex Beverages (TEST)", "Owner": "RG", "Status": "4. Pilot", "Country": "MEX 🇲🇽", "Primary buyer": "CEO", "Nombre contacto (Rol)": "John Roe (CEO)", "Last progress": "", "Next step": "- Share pilot credentials"}
+  ]
+}

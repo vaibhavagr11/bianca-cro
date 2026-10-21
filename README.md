@@ -23,6 +23,26 @@ uv run uvicorn app.main:app --reload --reload-dir app
 - http://127.0.0.1:8000/health/db — app can reach Supabase
 - http://127.0.0.1:8000/docs — interactive API docs
 
+## Database migrations
+
+```bash
+cd backend
+uv run python -m scripts.migrate --status   # what's applied / pending
+uv run python -m scripts.migrate --seed     # apply pending migrations, (re)run seeds
+```
+
+## Ingest endpoints (called by n8n)
+
+`POST /ingest/pipeline` with header `X-Ingest-Token` and body `{"rows": [ {sheet row}, ... ]}` — the
+whole Pipeline tab in one call. Try it with made-up data:
+
+```bash
+cd backend
+curl -s -X POST http://127.0.0.1:8000/ingest/pipeline \
+  -H "Content-Type: application/json" -H "X-Ingest-Token: $(grep INGEST_TOKEN .env | cut -d= -f2-)" \
+  --data @samples/pipeline_sample.json
+```
+
 ## Tests
 
 ```bash

@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     env: str = "dev"
     # Supabase Session pooler connection string. SecretStr keeps it out of logs and reprs.
     database_url: SecretStr
+    # Shared secret n8n sends in the X-Ingest-Token header.
+    ingest_token: SecretStr
+    # Single-tenant for now: every ingest call writes to this workspace.
+    workspace_name: str = "Bianca AI"
 
 
 settings = Settings()
