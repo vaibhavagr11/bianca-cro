@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     anthropic_workspace_id: str | None = None
     # Only meetings from the notes doc within this many days are stored (testing window).
     notes_window_days: int = 90
+    # Brief recipients override, as a JSON list (e.g. ["a@x.com"]). Empty = team members with receives_brief.
+    brief_to: list[str] = []
     # Threads classified per /process/classify call.
     classify_batch_threads: int = 10
 
