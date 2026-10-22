@@ -5,9 +5,10 @@ import logging
 import anthropic
 from fastapi import APIRouter, Header, HTTPException
 from psycopg.rows import dict_row
+from pydantic import BaseModel
 from psycopg.types.json import Jsonb
 
-from app import classifier, db, resolution
+from app import classifier, db, extractor, resolution
 from app.config import settings
 from app.ingest import _fail, _workspace_id, require_token
 from app.pipeline import normalize_name
@@ -223,3 +224,87 @@ def resolve_entities(x_ingest_token: str | None = Header(default=None)) -> dict:
         "candidate_domains": [{"domain": v.domain, "company": names.get(v.company_id), "evidence": v.votes}
                               for v in untrusted],
     }
+
+
+class ExtractRequest(BaseModel):
+    opportunity_ids: list[str]
+
+
+@router.post("/extract")
+def extract_insights(payload: ExtractRequest, x_ingest_token: str | None = Header(default=None)) -> dict:
+    """Extract insights for up to classify_batch_threads not-yet-extracted units of the given deals."""
+    require_token(x_ingest_token)
+    client = _claude()
+    with db.connect() as conn:
+        workspace_id = _workspace_id(conn)
+        conn.row_factory = dict_row
+        deals = {str(d["company_id"]): d for d in conn.execute(
+            "select o.id, o.company_id, c.name as company, o.stage, o.owner_code from opportunities o"
+            " join companies c on c.id = o.company_id where o.workspace_id = %s and o.id::text = any(%s)",
+            (workspace_id, payload.opportunity_ids))}
+        team = conn.execute("select owner_code, full_name, email from team_members where workspace_id = %s"
+                            " order by owner_code", (workspace_id,)).fetchall()
+        system_prompt = extractor.build_system_prompt(team)
+        units = conn.execute(
+            "select source, thread_id, company_id from source_records where workspace_id = %s"
+            " and company_id::text = any(%s) and status = 'classified' and body is not null"
+            " and (classification->>'is_commercial')::bool"
+            " group by source, thread_id, company_id"
+            " having bool_or(extracted_version is distinct from %s)"
+            " order by max(occurred_at) desc nulls last limit %s",
+            (workspace_id, list(deals), extractor.EXTRACTOR_VERSION, settings.classify_batch_threads),
+        ).fetchall()
+
+        counts = {"units": len(units), "insights": 0, "dropped_quotes": 0, "failed": 0}
+        for unit in units:
+            deal = deals[str(unit["company_id"])]
+            records = conn.execute(
+                "select id, external_id, occurred_at::text, subject, participants, body, meta from source_records"
+                " where workspace_id = %s and source = %s and thread_id = %s order by occurred_at",
+                (workspace_id, unit["source"], unit["thread_id"]),
+            ).fetchall()
+            renderers = {"notes": lambda r: classifier.render_note(r[0]),
+                         "calendar": lambda r: classifier.render_event(r[0])}
+            text = renderers.get(unit["source"], classifier.render_thread)(records)
+            try:
+                result = extractor.extract(client, settings.anthropic_model, system_prompt, deal, text)
+            except (anthropic.APIStatusError, anthropic.APIConnectionError, ValueError) as exc:
+                log.warning("extract unit failed: %s", type(exc).__name__)
+                counts["failed"] += 1
+                continue
+            kept, dropped = extractor.validate(result, text)
+            record_ids = [r["id"] for r in records]
+            occurred_at = records[-1]["occurred_at"]
+            with conn.transaction():
+                conn.execute("delete from insights where workspace_id = %s and source = %s and unit_id = %s",
+                             (workspace_id, unit["source"], unit["thread_id"]))
+                for i in kept:
+                    conn.execute(
+                        "insert into insights (workspace_id, company_id, opportunity_id, source, unit_id,"
+                        " source_record_ids, type, text, quote, owner_side, owner_name, due_date, occurred_at,"
+                        " confidence, extractor_version) values"
+                        " (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        (workspace_id, unit["company_id"], deal["id"], unit["source"], unit["thread_id"],
+                         record_ids, i["type"], i["text"], i["quote"], i["owner_side"], i["owner_name"],
+                         i["due_date"], occurred_at, i["confidence"], extractor.EXTRACTOR_VERSION))
+                conn.execute("update source_records set extracted_version = %s where id = any(%s)",
+                             (extractor.EXTRACTOR_VERSION, record_ids))
+            counts["insights"] += len(kept)
+            counts["dropped_quotes"] += dropped
+
+        remaining = conn.execute(
+            "select count(*) as n from (select 1 from source_records where workspace_id = %s"
+            " and company_id::text = any(%s) and status = 'classified' and body is not null"
+            " and (classification->>'is_commercial')::bool group by source, thread_id"
+            " having bool_or(extracted_version is distinct from %s)) u",
+            (workspace_id, list(deals), extractor.EXTRACTOR_VERSION),
+        ).fetchone()["n"]
+    log.info("extract run: %s remaining_units=%s", counts, remaining)
+    return {**counts, "remaining_units": remaining}
+
+
+def _claude() -> anthropic.Anthropic:
+    if settings.anthropic_api_key is None:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
+    headers = {"anthropic-workspace-id": settings.anthropic_workspace_id} if settings.anthropic_workspace_id else None
+    return anthropic.Anthropic(api_key=settings.anthropic_api_key.get_secret_value(), default_headers=headers)

@@ -72,3 +72,20 @@ def opportunity_timeline(opportunity_id: str, x_ingest_token: str | None = Heade
         "contacts": [{**c, "last_seen_at": timeline._iso(c["last_seen_at"])} for c in contacts],
         "timeline": items,
     }
+
+
+@router.get("/{opportunity_id}/insights")
+def opportunity_insights(opportunity_id: str, x_ingest_token: str | None = Header(default=None)) -> list[dict]:
+    """Extracted insights for a deal, newest first, each with its quote and source records."""
+    require_token(x_ingest_token)
+    with db.connect() as conn:
+        workspace_id = _workspace_id(conn)
+        conn.row_factory = dict_row
+        rows = conn.execute(
+            "select id, type, text, quote, owner_side, owner_name, due_date, occurred_at, status, confidence,"
+            " source, unit_id, source_record_ids from insights"
+            " where workspace_id = %s and opportunity_id::text = %s order by occurred_at desc nulls last, type",
+            (workspace_id, opportunity_id),
+        ).fetchall()
+    return [{**r, "id": str(r["id"]), "source_record_ids": [str(x) for x in r["source_record_ids"]],
+             "due_date": timeline._iso(r["due_date"]), "occurred_at": timeline._iso(r["occurred_at"])} for r in rows]
