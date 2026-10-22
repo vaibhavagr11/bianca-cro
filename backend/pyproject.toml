@@ -8,6 +8,7 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "pydantic-settings>=2.4",
     "psycopg[binary]>=3.2",
+    "anthropic>=2.1.0",
 ]
 
 [dependency-groups]

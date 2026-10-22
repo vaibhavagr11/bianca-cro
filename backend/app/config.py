@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     project_team_domains: list[str] = ["kellogg.northwestern.edu"]
     # Gmail label IDs (e.g. "Label_123") never ingested; backup for the -label: filter in n8n's search.
     excluded_label_ids: list[str] = []
+    # Claude, used by the email classifier. The SDK also reads ANTHROPIC_API_KEY from the environment.
+    anthropic_api_key: SecretStr | None = None
+    anthropic_model: str = "claude-opus-5-5"
+    # Threads classified per /process/classify call.
+    classify_batch_threads: int = 10
 
 
 settings = Settings()
