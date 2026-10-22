@@ -162,13 +162,13 @@ def resolve_entities(x_ingest_token: str | None = Header(default=None)) -> dict:
                 addresses=resolution.external_addresses(rec["participants"] or {}, internal, project),
                 occurred_at=rec["occurred_at"].isoformat() if rec["occurred_at"] else None,
             ))
-        res = resolution.resolve(evidence, names)
-        for row in conn.execute("select domain, company_id from company_domains where workspace_id = %s"
-                                " and origin = 'manual'", (workspace_id,)):
-            res.domains[row["domain"]] = resolution.DomainVerdict(row["domain"], str(row["company_id"]), 0, 1.0, True)
+        manual = {r["domain"]: str(r["company_id"]) for r in conn.execute(
+            "select domain, company_id from company_domains where workspace_id = %s and origin = 'manual'",
+            (workspace_id,))}
+        res = resolution.resolve(evidence, names, manual)
 
         with conn.transaction():
-            learned = [v for v in res.domains.values() if v.votes > 0]
+            learned = [v for v in res.domains.values() if v.domain not in manual]
             conn.execute("delete from company_domains where workspace_id = %s and origin = 'learned'"
                          " and not (domain = any(%s))", (workspace_id, [v.domain for v in learned]))
             for v in learned:

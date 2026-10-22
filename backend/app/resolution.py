@@ -64,8 +64,13 @@ def _name_in_domain(company_name: str, d: str) -> bool:
     return any(len(w) >= 4 and w.replace("-", "") in label for w in normalize_name(company_name).split())
 
 
-def resolve(evidence: list[Evidence], company_names: dict[str, str]) -> Resolution:
-    """Learn domain -> company and contact -> company from confidently linked records."""
+def resolve(
+    evidence: list[Evidence], company_names: dict[str, str], manual_domains: dict[str, str] | None = None
+) -> Resolution:
+    """Learn domain -> company and contact -> company from confidently linked records.
+
+    manual_domains (domain -> company id) are confirmed by a person: always trusted, never overridden.
+    """
     domain_votes: dict[str, Counter] = defaultdict(Counter)
     contact_votes: dict[str, Counter] = defaultdict(Counter)
     for ev in evidence:
@@ -85,8 +90,11 @@ def resolve(evidence: list[Evidence], company_names: dict[str, str]) -> Resoluti
         # Trusted when the domain carries the company's name, or the evidence is plentiful and unanimous.
         trusted = _name_in_domain(company_names.get(company_id, ""), d) or (top >= 3 and share == 1.0)
         result.domains[d] = DomainVerdict(d, company_id, top, round(share, 2), trusted)
+    for d, company_id in (manual_domains or {}).items():
+        votes = domain_votes.get(d, Counter())[company_id]
+        result.domains[d] = DomainVerdict(d, company_id, votes, 1.0, True)
 
-    seen = {a for ev in evidence for a in ev.addresses}
+    seen ={a for ev in evidence for a in ev.addresses}
     for a in seen:
         verdict = result.domains.get(domain(a))
         if verdict and verdict.trusted:

@@ -60,3 +60,10 @@ def test_decide():
     assert decide(None, "globex") == ("globex", "rules")
     assert decide("acme", None) == ("acme", "classifier")
     assert decide(None, None) == (None, None)
+
+
+def test_manual_domain_is_trusted_and_maps_its_contacts():
+    res = resolve([ev("acme", "pat@distri.com", confident=False)], NAMES, manual_domains={"distri.com": "acme"})
+    assert res.domains["distri.com"].trusted
+    assert res.contact_company["pat@distri.com"] == "acme"
+    assert rules_company({"new@distri.com": ""}, res) == "acme"
