@@ -330,8 +330,11 @@ def build_profiles(payload: ExtractRequest, x_ingest_token: str | None = Header(
             log.warning("profile failed: %s", type(exc).__name__)
             results.append({"opportunity_id": opportunity_id, "company": deal["company"], "failed": True})
             continue
-        data, dropped = profiler.check(profile, {i["ref"] for i in insights})
+        today = timeline.utcnow().date().isoformat()
+        data, dropped = profiler.check(profile, {i["ref"] for i in insights} | {"P1", "A1"})
         data["refs"] = {i["ref"]: i["id"] for i in insights}
+        data["facts"] = profiler.facts(deal, header, today)
+        data["dropped_uncited"] = dropped
         with db.connect() as conn:
             workspace_id = _workspace_id(conn)
             conn.execute(

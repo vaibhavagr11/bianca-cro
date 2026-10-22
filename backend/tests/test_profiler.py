@@ -46,7 +46,15 @@ def test_render_inputs_lists_refs_owner_and_due():
           "text": "Send forms.", "owner_name": "NC", "due_date": "2026-10-24"}],
         "2026-10-21")
     assert "I1 | 2026-10-20 | gmail | commitment | Send forms. (owner: NC, due: 2026-10-24)" in body
-    assert "Pipeline 'next step' cell: - Send proposal" in body and "Jane <jane@acme.com>" in body
+    assert "P1 | Pipeline row for Acme: country AR, stage '3. Proposal', owner RG" in body and "next step: - Send proposal" in body
+    assert "A1 | As of 2026-10-21: linked activity 1 gmail; last activity 2026-10-20; next meeting none scheduled" in body
+    assert "Jane <jane@acme.com>" in body
+
+
+def test_check_accepts_fact_citations():
+    data, dropped = check(profile(summary=st("Agreed to become recurring.", "P1"),
+                                  momentum_reason=st("No meeting scheduled.", "A1")), {"I1", "I2", "I3", "I4", "P1", "A1"})
+    assert data["summary"]["evidence"] == ["P1"] and "unsupported" not in data["summary"]
 
 
 def test_profile_endpoints_require_token():

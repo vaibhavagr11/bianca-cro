@@ -112,6 +112,8 @@ def main(companies: list[str]) -> None:
                 "select id, type, text, quote, occurred_at from insights where id::text = any(%s)",
                 (list(refs.values()),))}
             by_ref = {ref: ins[iid] for ref, iid in refs.items() if iid in ins}
+            for ref, fact in (prof.get("facts") or {}).items():  # pipeline row (P1) and activity data (A1)
+                by_ref[ref] = {"type": "fact", "text": fact, "quote": fact, "occurred_at": "current"}
 
             # 2. Faithfulness of every profile statement against its cited quotes.
             statements = profile_statements(prof)
@@ -130,8 +132,9 @@ def main(companies: list[str]) -> None:
             bullets = sheet_bullets(d["next_step"], d["last_progress"])
             coverage = []
             if bullets:
+                # Only real insights: P1 *is* the Sheet row, so including it would make recall trivially 100%.
                 insight_list = "\n".join(f"{r} | {str(i['occurred_at'])[:10]} | {i['type']} | {i['text']}"
-                                         for r, i in by_ref.items())
+                                         for r, i in by_ref.items() if r.startswith("I"))
                 profile_list = "\n".join(f"- ({s['section']}) {s['text']}" for s in statements)
                 notes = "\n".join(f"{n}. {b}" for n, b in enumerate(bullets))
                 rc = ask(client, RECALL_PROMPT, f"Deal: {d['name']}\n\nNote items:\n{notes}\n\nInsights:\n"

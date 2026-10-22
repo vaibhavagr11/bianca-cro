@@ -9,7 +9,7 @@ from typing import Literal
 import anthropic
 from pydantic import BaseModel, Field
 
-PROFILER_VERSION = "profile-v1"
+PROFILER_VERSION = "profile-v2"
 
 Basis = Literal["confirmed", "inferred"]
 
@@ -17,7 +17,8 @@ Basis = Literal["confirmed", "inferred"]
 class Statement(BaseModel):
     text: str = Field(description="One or two sentences in English.")
     basis: Basis
-    evidence: list[str] = Field(description="Insight ids (e.g. I3, I17) that support the statement.")
+    evidence: list[str] = Field(description="Evidence ids that support the statement: insights (I3, I17), the "
+                                            "pipeline row (P1) or activity facts (A1).")
 
 
 class Stakeholder(BaseModel):
@@ -29,7 +30,8 @@ class Stakeholder(BaseModel):
 
 class Commitment(BaseModel):
     text: str
-    owner: str | None
+    owner: str | None = Field(description="A person only if a cited insight names them; otherwise 'Bianca "
+                                          "(unassigned)' or '<customer> (unassigned)'.")
     due: str | None = Field(description="YYYY-MM-DD if the evidence gives a due date, else null.")
     state: Literal["open", "possibly_done"] = Field(
         description="possibly_done only when later evidence suggests it happened.")
@@ -61,12 +63,15 @@ class Profile(BaseModel):
 SYSTEM_PROMPT = """You write deal profiles for Bianca AI's founders. Bianca sells data/AI tools to consumer-goods
 companies, distributors and brands; the founders run sales themselves.
 
-You get one deal: its pipeline row, its activity summary, its contacts, and a numbered list of insights
-extracted from emails, meetings and meeting notes (each with an id like I12, a date, a type, and a one-line
-statement). Write the profile from these inputs only.
+You get one deal: citable facts from its pipeline row (P1, written by the founders) and its activity data (A1),
+its contacts, and a numbered list of insights extracted from emails, meetings and meeting notes (each with an id
+like I12, a date, a type, and a one-line statement). Write the profile from these inputs only.
 
 Rules:
-- Every statement cites the insight ids that support it. Never cite an id that is not in the list.
+- Every statement cites the ids that support it (I.., P1, A1). Never cite an id that is not in the inputs.
+  Facts from the pipeline row cite P1; dates, counts, "no meeting scheduled" and similar cite A1.
+- Owners: name a person only when a cited insight names them. Otherwise write "Bianca (unassigned)" or
+  "<customer> (unassigned)". Never infer the owner from who usually runs the deal.
 - basis = "confirmed" only when the cited insights state it directly; otherwise "inferred".
 - Group needs into a few themes (3-6), not one per feature request.
 - Prefer recent evidence; when later insights contradict earlier ones, say what changed.
@@ -79,16 +84,28 @@ Rules:
 """
 
 
+def facts(deal: dict, header: dict, today: str) -> dict[str, str]:
+    """Citable non-insight evidence: the founders' pipeline row (P1) and activity data (A1)."""
+    nm = header.get("next_meeting")
+    counts = ", ".join(f"{v} {k}" for k, v in (header.get("counts") or {}).items()) or "none"
+    return {
+        "P1": (f"Pipeline row for {deal['company']}: country {deal.get('country') or '?'}, stage '{deal['stage']}', "
+               f"owner {deal['owner_code']}, "
+               f"last progress: {deal.get('last_progress') or '-'}; next step: {deal.get('next_step') or '-'}"),
+        "A1": (f"As of {today}: linked activity {counts}; last activity "
+               f"{str(header.get('last_activity_at') or 'none')[:10]}; next meeting "
+               f"{(str(nm['at'])[:10] + ' ' + str(nm['title'])) if nm else 'none scheduled'}"),
+    }
+
+
 def render_inputs(deal: dict, header: dict, contacts: list[dict], insights: list[dict], today: str) -> str:
     """Prompt body. insights must already carry a short 'ref' (I1, I2, ...)."""
+    f = facts(deal, header, today)
     lines = [
         f"Today: {today}",
-        f"Deal: {deal['company']} | country: {deal.get('country') or '?'} | pipeline stage: {deal['stage']}"
-        f" | owner: {deal['owner_code']}",
-        f"Pipeline 'last progress' cell: {deal.get('last_progress') or '-'}",
-        f"Pipeline 'next step' cell: {deal.get('next_step') or '-'}",
-        f"Activity: {header.get('counts')} | last activity: {header.get('last_activity_at') or '-'}"
-        f" | next meeting: {header.get('next_meeting') or '-'}",
+        f"Deal: {deal['company']} | country: {deal.get('country') or '?'}",
+        f"P1 | {f['P1']}",
+        f"A1 | {f['A1']}",
         "Contacts: " + ("; ".join(f"{c.get('name') or '?'} <{c['email']}> ({c['record_count']} items)"
                                   for c in contacts[:15]) or "none"),
         "",

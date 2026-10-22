@@ -11,7 +11,7 @@ from typing import Literal
 import anthropic
 from pydantic import BaseModel, Field
 
-EXTRACTOR_VERSION = "extract-v1"
+EXTRACTOR_VERSION = "extract-v2"
 MAX_TEXT_CHARS = 30_000
 
 InsightType = Literal["need", "buying_signal", "objection", "commitment", "blocker", "next_step"]
@@ -23,7 +23,9 @@ class ExtractedInsight(BaseModel):
     quote: str = Field(description="Verbatim passage from the text (under 300 characters) that supports it.")
     owner_side: Literal["bianca", "customer", "unclear"] | None = Field(
         description="For commitments and next steps: who must act. Null for other types.")
-    owner_name: str | None = Field(description="Person who must act, if named. Use the team member's full name.")
+    owner_name: str | None = Field(
+        description="Person who must act, only if the text itself names or clearly identifies them (e.g. the "
+                    "sender of an email saying 'I will...'). Otherwise null. Use the team member's full name.")
     due_date: str | None = Field(
         description="YYYY-MM-DD only if a deadline is stated or clearly implied (resolve 'Thursday', 'next week' "
                     "relative to the item's date). Null otherwise.")
@@ -52,7 +54,10 @@ Extract only what the text actually says, as a list of insights:
 Rules:
 - quote: copy a passage verbatim from the text. Never translate or paraphrase the quote. The text field is
   your English one-liner.
-- Commitments and next steps: say who must act (owner_side bianca/customer/unclear). Bianca's team:
+- Commitments and next steps: say who must act (owner_side bianca/customer/unclear). Fill owner_name only when
+  the text names or clearly identifies the person (an email's sender saying "I'll...", "NDL:", "Rama manda...").
+  "We will", "nosotros", or an unattributed task -> owner_name null. Never guess from who usually runs the deal.
+  Bianca's team:
 {team_lines}
   "Nico" alone means Nicolás Casaux (NC); "Nico DL", "NDL" or "de León" means Nicolás de León;
   "Rama" or "RG" means Ramiro Godfrid; "Nico's" means both Nicos. "We/us/nosotros" in notes means Bianca.
