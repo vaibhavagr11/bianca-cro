@@ -7,7 +7,7 @@ from fastapi import APIRouter, Header, HTTPException
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from app import classifier, db
+from app import classifier, db, resolution
 from app.config import settings
 from app.ingest import _fail, _workspace_id, require_token
 from app.pipeline import normalize_name
@@ -124,3 +124,102 @@ def _context(conn, workspace_id) -> tuple[str, dict[str, tuple[str, str]]]:
     ).fetchall()
     prompt = classifier.build_system_prompt(companies, team, ws["internal_domains"])
     return prompt, {c["normalized_name"]: (c["name"], c["id"]) for c in companies}
+
+
+@router.post("/resolve")
+def resolve_entities(x_ingest_token: str | None = Header(default=None)) -> dict:
+    """Rebuild contacts and company domains from classified records, then re-link records by rules.
+
+    Safe to re-run: learned domains are recomputed each time; manually added domains are kept and trusted.
+    """
+    require_token(x_ingest_token)
+    with db.connect() as conn:
+        workspace_id = _workspace_id(conn)
+        conn.row_factory = dict_row
+        internal = {d.lower() for d in conn.execute(
+            "select internal_domains from workspaces where id = %s", (workspace_id,)).fetchone()["internal_domains"]}
+        project = {d.lower() for d in settings.project_team_domains}
+        companies = conn.execute("select id, name, normalized_name from companies where workspace_id = %s",
+                                 (workspace_id,)).fetchall()
+        names = {str(c["id"]): c["name"] for c in companies}
+        by_norm = {c["normalized_name"]: str(c["id"]) for c in companies}
+
+        records = conn.execute(
+            "select id, source, participants, classification, occurred_at from source_records"
+            " where workspace_id = %s and status = 'classified'", (workspace_id,)).fetchall()
+
+        def classifier_company(rec):
+            name = (rec["classification"] or {}).get("company")
+            return by_norm.get(normalize_name(name)) if name else None
+
+        evidence = []
+        for rec in records:
+            cls = rec["classification"] or {}
+            evidence.append(resolution.Evidence(
+                record_id=str(rec["id"]),
+                company_id=classifier_company(rec),
+                confident=cls.get("confidence") == "high" and not cls.get("flags"),
+                addresses=resolution.external_addresses(rec["participants"] or {}, internal, project),
+                occurred_at=rec["occurred_at"].isoformat() if rec["occurred_at"] else None,
+            ))
+        res = resolution.resolve(evidence, names)
+        for row in conn.execute("select domain, company_id from company_domains where workspace_id = %s"
+                                " and origin = 'manual'", (workspace_id,)):
+            res.domains[row["domain"]] = resolution.DomainVerdict(row["domain"], str(row["company_id"]), 0, 1.0, True)
+
+        with conn.transaction():
+            learned = [v for v in res.domains.values() if v.votes > 0]
+            conn.execute("delete from company_domains where workspace_id = %s and origin = 'learned'"
+                         " and not (domain = any(%s))", (workspace_id, [v.domain for v in learned]))
+            for v in learned:
+                conn.execute(
+                    "insert into company_domains (workspace_id, company_id, domain, trusted, evidence_count)"
+                    " values (%s, %s, %s, %s, %s) on conflict (workspace_id, domain) do update set"
+                    " company_id = excluded.company_id, trusted = excluded.trusted,"
+                    " evidence_count = excluded.evidence_count where company_domains.origin = 'learned'",
+                    (workspace_id, v.company_id, v.domain, v.trusted, v.votes))
+
+            seen: dict[str, dict] = {}
+            for ev in evidence:
+                for email, name in ev.addresses.items():
+                    s = seen.setdefault(email, {"name": name, "count": 0, "first": None, "last": None})
+                    s["name"] = s["name"] or name
+                    s["count"] += 1
+                    if ev.occurred_at:
+                        s["first"] = min(filter(None, [s["first"], ev.occurred_at]))
+                        s["last"] = max(filter(None, [s["last"], ev.occurred_at]))
+            for email, s in seen.items():
+                conn.execute(
+                    "insert into contacts (workspace_id, company_id, email, name, record_count, first_seen_at,"
+                    " last_seen_at) values (%s, %s, %s, %s, %s, %s, %s) on conflict (workspace_id, email) do update"
+                    " set company_id = excluded.company_id, name = coalesce(nullif(excluded.name, ''), contacts.name),"
+                    " record_count = excluded.record_count, first_seen_at = excluded.first_seen_at,"
+                    " last_seen_at = excluded.last_seen_at",
+                    (workspace_id, res.contact_company.get(email), email, s["name"] or None, s["count"],
+                     s["first"], s["last"]))
+
+            methods: dict[str, int] = {}
+            conflicts: dict[tuple, int] = {}
+            for ev in evidence:
+                rule = resolution.rules_company(ev.addresses, res)
+                final, method = resolution.decide(ev.company_id, rule)
+                conn.execute("update source_records set company_id = %s, link_method = %s, rules_company_id = %s"
+                             " where id = %s", (final, method, rule, ev.record_id))
+                methods[method or "unlinked"] = methods.get(method or "unlinked", 0) + 1
+                if method == "conflict":
+                    key = (names.get(ev.company_id), names.get(rule))
+                    conflicts[key] = conflicts.get(key, 0) + 1
+
+    trusted = sorted((v for v in res.domains.values() if v.trusted), key=lambda v: -v.votes)
+    untrusted = sorted((v for v in res.domains.values() if not v.trusted), key=lambda v: -v.votes)
+    return {
+        "records": len(records),
+        "link_methods": methods,
+        "conflicts": [{"classifier": a, "rules": b, "records": n} for (a, b), n in conflicts.items()],
+        "contacts": len(seen),
+        "contacts_with_company": sum(1 for e in seen if res.contact_company.get(e)),
+        "trusted_domains": [{"domain": v.domain, "company": names.get(v.company_id), "evidence": v.votes}
+                            for v in trusted],
+        "candidate_domains": [{"domain": v.domain, "company": names.get(v.company_id), "evidence": v.votes}
+                              for v in untrusted],
+    }
