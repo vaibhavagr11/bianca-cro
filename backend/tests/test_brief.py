@@ -62,7 +62,7 @@ def test_fallback_plan_uses_top_scores():
 
 def test_render_and_subject_are_compact_and_escaped():
     m = Meeting(datetime(2026, 10, 22, 12, 0), "Gus <> Ramiro", "Campari", "4. Pilot", ["RG"])
-    sections = [{"name": "Ramiro Godfrid", "actions": [(cand("C1", "Pernod <Ricard>"), ChosenAction(
+    sections = [{"name": "Ramiro Godfrid", "short": "Ramiro", "actions": [(cand("C1", "Pernod <Ricard>"), ChosenAction(
         candidate_id="C1", do_today="Sign NDA", why="Blocks data"))], "meetings": [(m, "Ask about offer")],
                  "attention": []}]
     body = render(sections, [], [Change("Campari", "Stage: 3 → 4", "RG")], TODAY)
@@ -73,3 +73,11 @@ def test_render_and_subject_are_compact_and_escaped():
 
 def test_build_requires_token():
     assert TestClient(app).post("/brief/build").status_code == 401
+
+
+def test_due_label():
+    from app.brief import due_label
+    assert due_label(None, TODAY) == "—"
+    assert due_label(date(2026, 10, 8), TODAY) == "overdue · 08 Oct"
+    assert due_label(TODAY, TODAY) == "today"
+    assert due_label(date(2026, 10, 23), TODAY) == "Fri 23"

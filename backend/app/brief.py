@@ -182,6 +182,16 @@ def table(headers: list[str], rows: list[list[str]], empty: str) -> str:
     return f"<table {_TABLE}><tr>{head}</tr>{body}</table>"
 
 
+def due_label(due: date | None, today: date) -> str:
+    if due is None:
+        return "—"
+    if due < today:
+        return f"overdue · {due:%d %b}"
+    if due == today:
+        return "today"
+    return f"{due:%a %d}"
+
+
 def render(sections: list[dict], ndl_rows: list[Candidate], changes: list[Change], today: date) -> str:
     parts = [f'<div style="font-family:-apple-system,Segoe UI,Arial,sans-serif;color:#1f2328;max-width:760px">',
              f'<p style="color:#57606a;font-size:12px;margin:0 0 12px 0">Bianca brief · {today:%a %d %b %Y}'
@@ -190,7 +200,7 @@ def render(sections: list[dict], ndl_rows: list[Candidate], changes: list[Change
         parts.append(f'<h2 style="font-size:16px;margin:18px 0 4px 0">{_e(s["name"])}</h2>')
         parts.append(table(["#", "Deal", "Do today", "Why", "Due"],
                            [[str(n), _e(c.deal), _link(a.do_today, c.link), _e(a.why),
-                             _e(c.due.strftime("%a %d") if c.due else "today")]
+                             _e(due_label(c.due, today))]
                             for n, (c, a) in enumerate(s["actions"], start=1)], "No priority actions today."))
         parts.append(table(["Time", "Meeting", "Deal", "Prep"],
                            [[_e(f"{m.at:%a %H:%M}"), _link(m.title, m.link), _e(f"{m.deal} · {m.stage}" if m.deal else "-"),
@@ -212,7 +222,7 @@ def render(sections: list[dict], ndl_rows: list[Candidate], changes: list[Change
 
 
 def subject(sections: list[dict], today: date) -> str:
-    bits = [f"{s['name'].split()[0]}: {len(s['actions'])} actions, {len(s['meetings'])} meetings" for s in sections]
+    bits = [f"{s['short']}: {len(s['actions'])} actions, {len(s['meetings'])} meetings" for s in sections]
     return f"Bianca brief · {today:%a %d %b} · " + " · ".join(bits)
 
 

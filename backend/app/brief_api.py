@@ -19,6 +19,8 @@ log = logging.getLogger("bianca_cro.brief")
 router = APIRouter(prefix="/brief")
 
 FOUNDER_ORDER = ["RG", "NC"]  # sections in this order; NDL gets the small shared table
+# Two founders are named Nicolás, so the brief uses these names, not first names.
+DISPLAY = {"RG": ("Ramiro", "Ramiro Godfrid"), "NC": ("Nico", "Nico Casaux"), "NDL": ("Nico DL", "Nico de León")}
 
 
 @router.post("/build")
@@ -182,7 +184,8 @@ def build_brief(dry_run: bool = False, x_ingest_token: str | None = Header(defau
         preps = {p.meeting_index: p.prep for p in plan.preps}
         meet_rows = [(m, preps.get(n, "")) for n, m in enumerate(my_meetings)]
         attention = brief.pick_attention(mine, {c.deal for c, _ in actions})
-        sections.append({"name": names.get(code, code), "actions": actions, "meetings": meet_rows,
+        short, full = DISPLAY.get(code, (code, names.get(code, code)))
+        sections.append({"name": full, "short": short, "actions": actions, "meetings": meet_rows,
                          "attention": attention})
         payload["sections"].append({
             "owner": code,
