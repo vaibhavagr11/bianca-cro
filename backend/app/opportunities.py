@@ -89,3 +89,20 @@ def opportunity_insights(opportunity_id: str, x_ingest_token: str | None = Heade
         ).fetchall()
     return [{**r, "id": str(r["id"]), "source_record_ids": [str(x) for x in r["source_record_ids"]],
              "due_date": timeline._iso(r["due_date"]), "occurred_at": timeline._iso(r["occurred_at"])} for r in rows]
+
+
+@router.get("/{opportunity_id}/profile")
+def opportunity_profile(opportunity_id: str, x_ingest_token: str | None = Header(default=None)) -> dict:
+    """Latest generated profile for a deal."""
+    require_token(x_ingest_token)
+    with db.connect() as conn:
+        workspace_id = _workspace_id(conn)
+        conn.row_factory = dict_row
+        row = conn.execute(
+            "select profile, profiler_version, model, generated_at from opportunity_profiles"
+            " where workspace_id = %s and opportunity_id::text = %s order by generated_at desc limit 1",
+            (workspace_id, opportunity_id),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="no profile yet")
+    return {**row, "generated_at": timeline._iso(row["generated_at"])}

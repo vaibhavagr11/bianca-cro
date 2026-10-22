@@ -8,7 +8,7 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel
 from psycopg.types.json import Jsonb
 
-from app import classifier, db, extractor, resolution
+from app import classifier, db, extractor, opportunities, profiler, resolution, timeline
 from app.config import settings
 from app.ingest import _fail, _workspace_id, require_token
 from app.pipeline import normalize_name
@@ -308,3 +308,40 @@ def _claude() -> anthropic.Anthropic:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
     headers = {"anthropic-workspace-id": settings.anthropic_workspace_id} if settings.anthropic_workspace_id else None
     return anthropic.Anthropic(api_key=settings.anthropic_api_key.get_secret_value(), default_headers=headers)
+
+
+@router.post("/profile")
+def build_profiles(payload: ExtractRequest, x_ingest_token: str | None = Header(default=None)) -> dict:
+    """Write a fresh profile for each given deal from its extracted insights."""
+    require_token(x_ingest_token)
+    client = _claude()
+    results = []
+    for opportunity_id in payload.opportunity_ids:
+        deal_view = opportunities.opportunity_timeline(opportunity_id, x_ingest_token=x_ingest_token)
+        insights = opportunities.opportunity_insights(opportunity_id, x_ingest_token=x_ingest_token)
+        for n, i in enumerate(insights, start=1):
+            i["ref"] = f"I{n}"
+        deal = deal_view["opportunity"]
+        header = {k: deal_view[k] for k in ("counts", "last_activity_at", "next_meeting")}
+        body = profiler.render_inputs(deal, header, deal_view["contacts"], insights, timeline.utcnow().date().isoformat())
+        try:
+            profile = profiler.generate(client, settings.anthropic_model, body)
+        except (anthropic.APIStatusError, anthropic.APIConnectionError, ValueError) as exc:
+            log.warning("profile failed: %s", type(exc).__name__)
+            results.append({"opportunity_id": opportunity_id, "company": deal["company"], "failed": True})
+            continue
+        data, dropped = profiler.check(profile, {i["ref"] for i in insights})
+        data["refs"] = {i["ref"]: i["id"] for i in insights}
+        with db.connect() as conn:
+            workspace_id = _workspace_id(conn)
+            conn.execute(
+                "insert into opportunity_profiles (workspace_id, opportunity_id, profile, insight_ids,"
+                " profiler_version, model) values (%s, %s, %s, %s, %s, %s)",
+                (workspace_id, opportunity_id, Jsonb(data), [i["id"] for i in insights],
+                 profiler.PROFILER_VERSION, settings.anthropic_model))
+        results.append({"opportunity_id": opportunity_id, "company": deal["company"], "insights": len(insights),
+                        "statements": sum(len(data[k]) for k in ("needs", "buying_signals", "objections",
+                                                                 "blockers", "open_commitments",
+                                                                 "recommended_actions")),
+                        "dropped_uncited": dropped})
+    return {"profiles": results}

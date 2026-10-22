@@ -18,3 +18,6 @@ data/
 .DS_Store
 .vscode/
 .idea/
+
+# Human review exports (contain Bianca data)
+review/
