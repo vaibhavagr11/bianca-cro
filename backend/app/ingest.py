@@ -10,7 +10,7 @@ from fastapi import APIRouter, Header, HTTPException
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel
 
-from app import db, gmail, notes
+from app import db, gmail, google_calendar, notes
 from app.config import settings
 from app.pipeline import (
     TRACKED_FIELDS,
@@ -38,6 +38,10 @@ class GmailPayload(BaseModel):
 class NotesPayload(BaseModel):
     documentId: str
     content: str
+
+
+class CalendarPayload(BaseModel):
+    events: list[dict]
 
 
 def require_token(token: str | None) -> None:
@@ -212,6 +216,76 @@ def ingest_notes(payload: NotesPayload, x_ingest_token: str | None = Header(defa
     log.info("notes sync %s succeeded: sections=%s %s", run_id, len(sections), counts)
     return {"sync_run_id": str(run_id), "sections_in_doc": len(sections), "in_window": len(recent),
             "window_days": settings.notes_window_days, **counts}
+
+
+@router.post("/calendar")
+def ingest_calendar(payload: CalendarPayload, x_ingest_token: str | None = Header(default=None)) -> dict:
+    """Store customer meetings from Google Calendar as pending source_records; apply cancellations."""
+    require_token(x_ingest_token)
+
+    with db.connect() as conn:
+        workspace_id = _workspace_id(conn)
+        internal = conn.execute("select internal_domains from workspaces where id = %s", (workspace_id,)).fetchone()[0]
+        internal_domains = {d.lower() for d in internal}
+        project_domains = {d.lower() for d in settings.project_team_domains}
+        run_id = conn.execute(
+            "insert into sync_runs (workspace_id, source, rows_received) values (%s, 'calendar', %s) returning id",
+            (workspace_id, len(payload.events)),
+        ).fetchone()[0]
+        conn.commit()
+
+        try:
+            kept, cancelled_ids, skipped = google_calendar.process(payload.events, internal_domains, project_domains)
+            created = updated = 0
+            with conn.transaction():
+                for e in kept:
+                    row = conn.execute(
+                        "insert into source_records (workspace_id, source, external_id, thread_id, occurred_at,"
+                        " subject, participants, body, content_hash, meta)"
+                        " values (%s, 'calendar', %s, %s, %s, %s, %s, %s, %s, %s)"
+                        " on conflict (workspace_id, source, external_id) do update set"
+                        "  occurred_at = excluded.occurred_at, subject = excluded.subject,"
+                        "  participants = excluded.participants, body = excluded.body,"
+                        "  content_hash = excluded.content_hash, meta = excluded.meta,"
+                        "  status = 'pending', classification = null"
+                        " where source_records.content_hash <> excluded.content_hash"
+                        " returning (xmax = 0) as inserted",
+                        (workspace_id, e.external_id, e.external_id, e.starts_at, e.subject,
+                         Jsonb(e.participants), e.body, e.content_hash, Jsonb(e.meta)),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    if row[0]:
+                        created += 1
+                    else:
+                        updated += 1
+                # Cancellations only touch meetings we already have; the classification stays.
+                cancelled = conn.execute(
+                    "update source_records set meta = meta || '{\"status\": \"cancelled\"}'::jsonb"
+                    " where workspace_id = %s and source = 'calendar' and external_id = any(%s)"
+                    " and meta->>'status' is distinct from 'cancelled'",
+                    (workspace_id, cancelled_ids),
+                ).rowcount
+                counts = {
+                    "created": created,
+                    "updated": updated,
+                    "unchanged": len(kept) - created - updated,
+                    "cancelled": cancelled,
+                    "skipped": sum(skipped.values()),
+                }
+                conn.execute(
+                    "update sync_runs set status = 'succeeded', finished_at = now(), rows_created = %s,"
+                    " rows_updated = %s, rows_unchanged = %s, rows_skipped = %s where id = %s",
+                    (counts["created"], counts["updated"], counts["unchanged"], counts["skipped"], run_id),
+                )
+        except Exception as exc:
+            _fail(conn, run_id, type(exc).__name__)
+            log.exception("calendar sync %s failed", run_id)
+            raise HTTPException(status_code=500, detail="calendar sync failed")
+
+    log.info("calendar sync %s succeeded: received=%s %s skipped_by_reason=%s",
+             run_id, len(payload.events), counts, skipped)
+    return {"sync_run_id": str(run_id), "received": len(payload.events), **counts, "skipped_by_reason": skipped}
 
 
 def _workspace_id(conn: psycopg.Connection):

@@ -55,9 +55,9 @@ def classify_threads(x_ingest_token: str | None = Header(default=None)) -> dict:
                     " where workspace_id = %s and source = %s and thread_id = %s",
                     (workspace_id, source, thread_id),
                 ).fetchall()
-                thread_text = (
-                    classifier.render_note(records[0]) if source == "notes" else classifier.render_thread(records)
-                )
+                renderers = {"notes": lambda r: classifier.render_note(r[0]),
+                             "calendar": lambda r: classifier.render_event(r[0])}
+                thread_text = renderers.get(source, classifier.render_thread)(records)
                 try:
                     result = classifier.classify(client, settings.anthropic_model, system_prompt, thread_text, source)
                 except (anthropic.APIStatusError, anthropic.APIConnectionError, ValueError) as exc:

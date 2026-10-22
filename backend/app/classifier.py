@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from app.pipeline import normalize_name
 
-PROMPT_VERSION = "classify-v2"
+PROMPT_VERSION = "classify-v3"
 MAX_THREAD_CHARS = 20_000
 COMMERCIAL_CATEGORIES = {"customer", "prospect", "partner", "internal_sales"}
 # Text of these is deleted after classification: it is not sales data and is often sensitive.
@@ -45,11 +45,13 @@ def build_system_prompt(companies: list[dict], team: list[dict], internal_domain
         f" | contacts: {(c['contacts_text'] or '').replace(chr(10), '; ')[:200]}"
         for c in companies
     )
-    return f"""You classify email threads from Bianca AI's founders' inboxes and sections of their meeting-notes doc.
+    return f"""You classify items from Bianca AI's founders: email threads, calendar meetings, and sections of their
+meeting-notes doc.
 
 Bianca AI is a startup that sells to consumer-goods companies. Its founders run sales themselves, and
 their deals are tracked in a pipeline. Your job: decide what each email thread or meeting note is, and
-whether it is about one of the pipeline companies below. Meeting notes are informal, often mix Spanish and
+whether it is about one of the pipeline companies below. Calendar meetings often have only a title and
+attendees; use the attendees' email domains and names. Meeting notes are informal, often mix Spanish and
 English, and usually start with a header naming the company or person met.
 
 Categories:
@@ -132,8 +134,19 @@ def render_note(record: dict) -> str:
     return f"Meeting note dated {when}\n\n{record['body'] or ''}"[-MAX_THREAD_CHARS:]
 
 
+def render_event(record: dict) -> str:
+    meta = record.get("meta") or {}
+    people = (record.get("participants") or {}).get("attendees") or []
+    who = "\n".join(f"- {p.get('name') or ''} <{p['address']}>{' (organizer)' if p.get('organizer') else ''}"
+                     for p in people)
+    return (f"Calendar meeting: {record['subject'] or '(no title)'}\nStarts: {record['occurred_at']}"
+            f"  Status: {meta.get('status', 'confirmed')}\nAttendees:\n{who}\n\nDescription:\n{record['body'] or ''}"
+            )[-MAX_THREAD_CHARS:]
+
+
 INSTRUCTIONS = {
     "gmail": "Classify this email thread.",
+    "calendar": "Classify this calendar meeting.",
     "notes": "Classify this section of the meeting-notes doc.",
 }
 
