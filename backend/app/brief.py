@@ -4,6 +4,7 @@ Kept short on purpose: per founder at most 3 actions, 5 attention rows; at most 
 """
 
 import html
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Literal
@@ -28,6 +29,7 @@ class Candidate:
     score: int
     due: date | None = None
     link: str | None = None
+    source: str | None = None
 
 
 @dataclass
@@ -74,7 +76,8 @@ def unanswered_candidate(cid, deal, stage, owner, subject, last_inbound_at: date
         return None
     days = max(1, age.days)
     return Candidate(cid, deal, stage, owner, "unanswered_email", f"Customer email unanswered {days}d",
-                     f"Unanswered customer email: {subject}", 85, None, link)
+                     f"Unanswered customer email ({days}d): {subject}", 85, None, link,
+                     f"Email · {last_inbound_at:%b} {last_inbound_at.day}")
 
 
 def quiet_candidate(cid, deal, stage, stage_rank, owner, last_activity: date | None, open_items: int, today: date):
@@ -159,11 +162,41 @@ def resolve_plan(plan: FounderPlan, cands: list[Candidate]) -> list[tuple[Candid
     return out[:MAX_ACTIONS]
 
 
-# ---------------------------------------------------------------- rendering
+# ---------------------------------------------------------------- rows (approved "Layout A" table)
 
-_TABLE = 'style="border-collapse:collapse;width:100%;margin:6px 0 14px 0;font-size:13px"'
-_TH = 'style="text-align:left;padding:5px 8px;border-bottom:2px solid #d0d7de;color:#57606a;font-weight:600"'
-_TD = 'style="padding:5px 8px;border-bottom:1px solid #eaeef2;vertical-align:top"'
+MAX_ROWS = 15
+OVERDUE_WINDOW_DAYS, WEEK_DAYS = 30, 7
+
+
+@dataclass
+class Row:
+    company: str
+    what: str                 # the follow-up, from notes or emails
+    due: date | None
+    owner: str | None
+    stage: str
+    source: str               # e.g. "Notes · Oct 06", "Email · Oct 20"
+    link: str | None = None
+    why: str | None = None    # set for undated priorities chosen by Claude
+    owner_code: str | None = None  # deal owner, for routing to a founder's section
+
+
+def split_dated(rows: list[Row], today: date) -> tuple[list[Row], list[Row]]:
+    """'To do today' = overdue within the last 30 days + due today; 'Due this week' = the next 7 days."""
+    todo = [r for r in rows if r.due and today - timedelta(days=OVERDUE_WINDOW_DAYS) <= r.due <= today]
+    week = [r for r in rows if r.due and today < r.due <= today + timedelta(days=WEEK_DAYS)]
+    return sorted(todo, key=lambda r: r.due), sorted(week, key=lambda r: r.due)
+
+
+def priority_rows(chosen: list[tuple[Candidate, ChosenAction]]) -> list[Row]:
+    return [Row(c.deal, a.do_today, None, None, c.stage, c.source or "Deal profile", c.link, a.why)
+            for c, a in chosen]
+
+
+# ---------------------------------------------------------------- rendering (matches the approved v2 email)
+
+FONT = "Arial,Helvetica,sans-serif"
+INK, MUTED, LINE, RED, AMBER, BLUE = "#1f2328", "#6b7280", "#e5e7eb", "#b42318", "#b54708", "#155eef"
 
 
 def _e(s) -> str:
@@ -171,59 +204,116 @@ def _e(s) -> str:
 
 
 def _link(text, url) -> str:
-    return f'<a href="{_e(url)}" style="color:#0969da;text-decoration:none">{_e(text)}</a>' if url else _e(text)
+    return f'<a href="{_e(url)}" style="color:{BLUE};text-decoration:none">{_e(text)}</a>' if url else _e(text)
 
 
-def table(headers: list[str], rows: list[list[str]], empty: str) -> str:
-    if not rows:
-        return f'<p style="color:#8c959f;font-size:13px;margin:4px 0 14px 0">{_e(empty)}</p>'
-    head = "".join(f"<th {_TH}>{_e(h)}</th>" for h in headers)
-    body = "".join("<tr>" + "".join(f"<td {_TD}>{cell}</td>" for cell in r) + "</tr>" for r in rows)
-    return f"<table {_TABLE}><tr>{head}</tr>{body}</table>"
+def stage_short(stage: str | None) -> str:
+    return re.sub(r"^\d+\.\s*", "", stage or "") or "—"
 
 
-def due_label(due: date | None, today: date) -> str:
+def _h(title: str, color: str, n: int | None = None) -> str:
+    count = f" ({n})" if n is not None else ""
+    return (f'<h3 style="margin:16px 0 6px;font:600 13px/1.3 {FONT};letter-spacing:.06em;'
+            f'text-transform:uppercase;color:{color}">{_e(title)}{count}</h3>')
+
+
+def _th(t: str, w: str = "") -> str:
+    width = f"width:{w};" if w else ""
+    return (f'<th align="left" style="padding:7px 8px;background:#1b1f3b;color:#fff;font:600 12px/1.3 {FONT};'
+            f'{width}border:1px solid #1b1f3b">{_e(t)}</th>')
+
+
+def _td(inner: str, extra: str = "") -> str:
+    return (f'<td valign="top" style="padding:7px 8px;border:1px solid {LINE};font:13px/1.4 {FONT};'
+            f'color:{INK};{extra}">{inner}</td>')
+
+
+def _empty(msg: str) -> str:
+    return f'<p style="margin:4px 0 0;font:14px {FONT};color:{MUTED}">{_e(msg)}</p>'
+
+
+def _more(n: int) -> str:
+    return f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">+ {n} more</p>' if n > 0 else ""
+
+
+def due_cell(due: date | None, today: date) -> str:
     if due is None:
         return "—"
-    if due < today:
-        return f"overdue · {due:%d %b}"
-    if due == today:
-        return "today"
-    return f"{due:%a %d}"
+    late = (today - due).days
+    tail = f'<br><span style="color:{RED};font-size:12px">{late} day{"" if late == 1 else "s"} late</span>' if late > 0 else ""
+    return f"{_e(f'{due:%b} {due.day}')}{tail}"
 
 
-def render(sections: list[dict], ndl_rows: list[Candidate], changes: list[Change], today: date) -> str:
-    parts = [f'<div style="font-family:-apple-system,Segoe UI,Arial,sans-serif;color:#1f2328;max-width:760px">',
-             f'<p style="color:#57606a;font-size:12px;margin:0 0 12px 0">Bianca brief · {today:%a %d %b %Y}'
-             f' · source links open the evidence</p>']
+def rows_table(rows: list[Row], today: date) -> str:
+    shown = rows[:MAX_ROWS]
+    body = []
+    for r in shown:
+        what = (f'<b>Priority:</b> {_e(r.what)}<br><span style="color:{MUTED};font-size:12px">{_e(r.why)}</span>'
+                if r.why else _e(r.what))
+        body.append("<tr>" + _td(f"<b>{_e(r.company)}</b>") + _td(what) + _td(due_cell(r.due, today), "white-space:nowrap")
+                    + _td(_e(r.owner or "—")) + _td(_e(stage_short(r.stage)))
+                    + _td(f'<span style="color:{MUTED};font-size:12px">{_link(r.source, r.link)}</span>') + "</tr>")
+    head = (_th("Company", "17%") + _th("From notes / emails") + _th("Due", "11%") + _th("Owner", "10%")
+            + _th("Sheet status", "12%") + _th("Source", "14%"))
+    return (f'<table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%">'
+            f"<tr>{head}</tr>{''.join(body)}</table>{_more(len(rows) - len(shown))}")
+
+
+def meetings_table(meetings: list[tuple["Meeting", str]]) -> str:
+    body = "".join(
+        "<tr>" + _td(_e(f"{m.at:%a} {m.at:%H:%M}"), "white-space:nowrap") + _td(_link(m.title, m.link))
+        + _td(f"<b>{_e(m.deal or '—')}</b>") + _td(_e(stage_short(m.stage))) + _td(_e(prep)) + "</tr>"
+        for m, prep in meetings)
+    head = _th("When", "11%") + _th("Meeting", "22%") + _th("Company", "17%") + _th("Sheet status", "12%") + _th("Prep")
+    return (f'<table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%">'
+            f"<tr>{head}</tr>{body}</table>")
+
+
+def render(sections: list[dict], ndl_rows: list[Row], changes: list[Change], today: date, active_deals: int) -> str:
+    counts = " · ".join(f"{s['short']}: {len(s['today'])} to do today, {len(s['week'])} due this week" for s in sections)
+    out = [f'<div style="max-width:720px;margin:0 auto;padding:8px 4px">',
+           f'<p style="font:600 18px {FONT};margin:0 0 2px;color:{INK}">Pipeline brief · {_e(f"{today:%a}, {today:%b} {today.day}")}</p>',
+           f'<p style="font:13px {FONT};margin:0;color:{MUTED}">{_e(counts)} · {active_deals} active deals</p>']
     for s in sections:
-        parts.append(f'<h2 style="font-size:16px;margin:18px 0 4px 0">{_e(s["name"])}</h2>')
-        parts.append(table(["#", "Deal", "Do today", "Why", "Due"],
-                           [[str(n), _e(c.deal), _link(a.do_today, c.link), _e(a.why),
-                             _e(due_label(c.due, today))]
-                            for n, (c, a) in enumerate(s["actions"], start=1)], "No priority actions today."))
-        parts.append(table(["Time", "Meeting", "Deal", "Prep"],
-                           [[_e(f"{m.at:%a %H:%M}"), _link(m.title, m.link), _e(f"{m.deal} · {m.stage}" if m.deal else "-"),
-                             _e(prep)] for m, prep in s["meetings"]], "No customer meetings today or tomorrow."))
-        parts.append(table(["Deal", "Stage", "Needs attention", ""],
-                           [[_e(c.deal), _e(c.stage), _e(c.label), _link("source", c.link) if c.link else ""]
-                            for c in s["attention"]], "Nothing else needs attention."))
+        out.append(f'<p style="margin:24px 0 0;padding:6px 10px;background:#f2f4f7;border-left:3px solid {BLUE};'
+                   f'font:600 14px {FONT};color:{INK}">{_e(s["name"])}</p>')
+        out.append(_h("To do today", RED, len(s["today"])))
+        out.append(rows_table(s["today"], today) if s["today"] else _empty("Nothing overdue, due today, or prioritized."))
+        out.append(_h("Due this week", AMBER, len(s["week"])))
+        out.append(rows_table(s["week"], today) if s["week"] else _empty("Nothing else due in the next 7 days."))
+        out.append(_h("Meetings today & tomorrow", BLUE, len(s["meetings"])))
+        out.append(meetings_table(s["meetings"]) if s["meetings"] else _empty("No customer meetings today or tomorrow."))
     if ndl_rows:
-        parts.append('<h2 style="font-size:15px;margin:18px 0 4px 0">Nico de León\'s deals (urgent only)</h2>')
-        parts.append(table(["Deal", "Stage", "Needs attention", ""],
-                           [[_e(c.deal), _e(c.stage), _e(c.label), _link("source", c.link) if c.link else ""]
-                            for c in ndl_rows], ""))
-    parts.append('<h2 style="font-size:15px;margin:18px 0 4px 0">Changed since last brief</h2>')
-    parts.append(table(["Deal", "What changed", "Owner"],
-                       [[_e(ch.deal), _link(ch.text, ch.link), _e(ch.owner_code or "-")] for ch in changes[:MAX_CHANGES]],
-                       "No notable changes."))
-    parts.append("</div>")
-    return "".join(parts)
+        out.append(f'<p style="margin:24px 0 0;padding:6px 10px;background:#f2f4f7;border-left:3px solid {MUTED};'
+                   f'font:600 14px {FONT};color:{INK}">Nico de León\'s deals · urgent only</p>')
+        out.append(rows_table(ndl_rows, today))
+    out.append(_h("Changed since last brief", MUTED, len(changes[:MAX_CHANGES])))
+    if changes:
+        body = "".join("<tr>" + _td(f"<b>{_e(c.deal)}</b>") + _td(_link(c.text, c.link)) + _td(_e(c.owner_code or "—"))
+                       + "</tr>" for c in changes[:MAX_CHANGES])
+        out.append(f'<table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%">'
+                   f'<tr>{_th("Company", "22%")}{_th("What changed")}{_th("Owner", "10%")}</tr>{body}</table>')
+    else:
+        out.append(_empty("No notable changes."))
+    out.append(f'<p style="font:11px {FONT};color:#98a2b3;margin-top:28px">Built from Bianca\'s pipeline sheet, Gmail, '
+               f"Calendar and meeting notes · every row links to its source so you can check it.</p></div>")
+    return "".join(out)
 
 
 def subject(sections: list[dict], today: date) -> str:
-    bits = [f"{s['short']}: {len(s['actions'])} actions, {len(s['meetings'])} meetings" for s in sections]
-    return f"Bianca brief · {today:%a %d %b} · " + " · ".join(bits)
+    bits = [f"{s['short']} {len(s['today'])} today, {len(s['week'])} this week" for s in sections]
+    return f"Bianca pipeline · {today:%a}, {today:%b} {today.day} · " + " · ".join(bits)
 
 
-Recipient = Literal["preview", "founders"]
+def plain_text(sections: list[dict], today: date) -> str:
+    lines = [f"Pipeline brief · {today:%a}, {today:%b} {today.day}"]
+    for s in sections:
+        lines.append(f"\n{s['name'].upper()}")
+        for title, rows in (("To do today", s["today"]), ("Due this week", s["week"])):
+            lines.append(f"{title} ({len(rows)})")
+            for r in rows[:MAX_ROWS]:
+                due = f"due {r.due:%b} {r.due.day}" if r.due else "priority"
+                lines.append(f"• {r.company} — {r.what} ({due}) — {r.source}")
+        for m, prep in s["meetings"]:
+            lines.append(f"• {m.at:%a %H:%M} {m.title} — {prep}")
+    return "\n".join(lines)

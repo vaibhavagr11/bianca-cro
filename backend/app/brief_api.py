@@ -1,5 +1,6 @@
 """POST /brief/build: assemble today's brief from the commercial memory. n8n sends the returned email."""
 
+import json
 import logging
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -16,6 +17,10 @@ from app.ingest import _workspace_id, require_token
 from app.process import _claude
 
 log = logging.getLogger("bianca_cro.brief")
+
+
+def _dumps(obj) -> str:
+    return json.dumps(obj, default=str, ensure_ascii=False)
 router = APIRouter(prefix="/brief")
 
 FOUNDER_ORDER = ["RG", "NC"]  # sections in this order; NDL gets the small shared table
@@ -55,18 +60,25 @@ def build_brief(dry_run: bool = False, x_ingest_token: str | None = Header(defau
         def cid() -> str:
             return f"C{next(seq)}"
 
-        # Bianca-owed commitments / next steps with a due date, from the last 30 days.
+        # Dated follow-ups Bianca owes (commitments and next steps), overdue up to 30 days or due within 7.
+        dated: list[brief.Row] = []
         for i in conn.execute(
-                "select company_id, type, text, due_date, source, unit_id from insights where workspace_id = %s"
-                " and type in ('commitment', 'next_step') and owner_side = 'bianca' and status = 'open'"
-                " and due_date is not null and occurred_at >= now() - interval '30 days'", (workspace_id,)):
+                "select company_id, text, due_date, owner_name, source, unit_id, occurred_at, meta from insights i"
+                " left join lateral (select meta from source_records r where r.id = i.source_record_ids[1]) m on true"
+                " where i.workspace_id = %s and i.type in ('commitment', 'next_step') and i.owner_side = 'bianca'"
+                " and i.status = 'open' and i.due_date between %s and %s",
+                (workspace_id, today - timedelta(days=brief.OVERDUE_WINDOW_DAYS), today + timedelta(days=brief.WEEK_DAYS))):
             d = deals.get(str(i["company_id"]))
-            if d:
-                link = timeline.GMAIL_THREAD_URL.format(i["unit_id"]) if i["source"] == "gmail" else None
-                c = brief.commitment_candidate(cid(), d["name"], d["stage"], d["owner_code"], i["text"],
-                                               i["due_date"], today, link)
-                if c:
-                    cands.append(c)
+            if not d:
+                continue
+            when = i["occurred_at"].astimezone(tz)
+            label = {"gmail": "Email", "notes": "Notes", "calendar": "Meeting"}.get(i["source"], i["source"])
+            link = (timeline.GMAIL_THREAD_URL.format(i["unit_id"]) if i["source"] == "gmail"
+                    else timeline.DOC_URL.format((i["meta"] or {}).get("doc_id")) if i["source"] == "notes"
+                    and (i["meta"] or {}).get("doc_id") else None)
+            dated.append(brief.Row(d["name"], i["text"], i["due_date"], i["owner_name"], d["stage"],
+                                   f"{label} · {when:%b} {when.day}", link))
+            dated[-1].owner_code = d["owner_code"]
 
         # Profile recommendations and blockers.
         for company_id, d in deals.items():
@@ -180,31 +192,36 @@ def build_brief(dry_run: bool = False, x_ingest_token: str | None = Header(defau
         except (anthropic.APIStatusError, anthropic.APIConnectionError, ValueError) as exc:
             log.warning("brief plan failed for %s: %s", code, type(exc).__name__)
             plan = brief.fallback_plan(mine, my_meetings)
-        actions = brief.resolve_plan(plan, mine)
+        todo, week = brief.split_dated([r for r in dated if r.owner_code == code], today)
+        todo += brief.priority_rows(brief.resolve_plan(plan, mine))
         preps = {p.meeting_index: p.prep for p in plan.preps}
         meet_rows = [(m, preps.get(n, "")) for n, m in enumerate(my_meetings)]
-        attention = brief.pick_attention(mine, {c.deal for c, _ in actions})
         short, full = DISPLAY.get(code, (code, names.get(code, code)))
-        sections.append({"name": full, "short": short, "actions": actions, "meetings": meet_rows,
-                         "attention": attention})
+        sections.append({"name": full, "short": short, "today": todo, "week": week, "meetings": meet_rows})
         payload["sections"].append({
             "owner": code,
-            "actions": [{"deal": c.deal, "do": a.do_today, "why": a.why, "kind": c.kind, "link": c.link} for c, a in actions],
+            "today": [{"company": r.company, "what": r.what, "due": r.due, "why": r.why, "source": r.source}
+                      for r in todo],
+            "week": [{"company": r.company, "what": r.what, "due": r.due, "source": r.source} for r in week],
             "meetings": [{"at": m.at.isoformat(), "title": m.title, "deal": m.deal, "prep": p} for m, p in meet_rows],
-            "attention": [{"deal": c.deal, "label": c.label, "kind": c.kind} for c in attention],
         })
-    ndl = sorted((c for c in cands if c.owner_code == "NDL" and c.score >= 80), key=lambda c: -c.score)[:brief.MAX_NDL]
-    payload["ndl"] = [{"deal": c.deal, "label": c.label} for c in ndl]
+    ndl_today, _ = brief.split_dated([r for r in dated if r.owner_code == "NDL"], today)
+    ndl_unanswered = [brief.Row(c.deal, c.detail, None, None, c.stage, c.source or "Email", c.link)
+                      for c in cands if c.owner_code == "NDL" and c.kind == "unanswered_email"]
+    ndl = (ndl_today + ndl_unanswered)[:brief.MAX_NDL]
+    payload["ndl"] = [{"company": r.company, "what": r.what, "due": r.due} for r in ndl]
     payload["changes"] = [{"deal": c.deal, "text": c.text, "owner": c.owner_code} for c in changes[:brief.MAX_CHANGES]]
 
-    html_body = brief.render(sections, ndl, changes, today)
+    html_body = brief.render(sections, ndl, changes, today, len(deals))
+    text_body = brief.plain_text(sections, today)
     subj = brief.subject(sections, today)
     to = settings.brief_to or [t["email"] for t in team if t["receives_brief"]]
     if not dry_run:
         with db.connect() as conn:
             conn.execute("insert into briefs (workspace_id, for_date, subject, html, payload, recipients)"
-                         " values (%s, %s, %s, %s, %s, %s)", (workspace_id, today, subj, html_body, Jsonb(payload), to))
+                         " values (%s, %s, %s, %s, %s, %s)",
+                         (workspace_id, today, subj, html_body, Jsonb(payload, dumps=_dumps), to))
     log.info("brief built for %s: candidates=%s meetings=%s changes=%s dry_run=%s",
              today, len(cands), len(meetings), len(changes), dry_run)
-    return {"subject": subj, "html": html_body, "to": ",".join(to), "for_date": today.isoformat(),
+    return {"subject": subj, "html": html_body, "text": text_body, "to": ",".join(to), "for_date": today.isoformat(),
             "candidates": len(cands), "dry_run": dry_run}
