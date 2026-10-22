@@ -115,3 +115,38 @@ def test_process_output_is_clean_and_hash_stable():
     assert m1.body == "Price list?"
     assert m1.participants["from"] == [{"address": "buyer@acme.com", "name": ""}]
     assert m1.content_hash == m2.content_hash
+
+
+# --- bank-detail redaction -----------------------------------------------------
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "text, leaked",
+    [
+        ("CBU: 0170099220000067797370", "0170099220000067797370"),
+        ("Alias: mi.cuenta.pagos", "mi.cuenta.pagos"),
+        ("Cuenta corriente 123-456789/0", "456789"),
+        ("Número de cuenta: 4021-2345-01", "2345"),
+        ("IBAN: DE89 3704 0044 0532 0130 00", "3704"),
+        ("SWIFT: BOFAUS3NXXX", "BOFAUS3NXXX"),
+        ("Routing number 021000021 and account number 000123456789", "021000021"),
+        ("Call me at +54 911 3181-7980", "3181"),
+    ],
+)
+def test_redacts_bank_details(text, leaked):
+    out = redact_secrets(text)
+    assert leaked not in out and REDACTED in out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "We received payment for both invoices.",
+        "Pilot starts on 2026-10-22 at 4pm, budget $50,000 for 3 months.",
+        "Order of 1,200 units across 35 stores.",
+    ],
+)
+def test_bank_redaction_keeps_business_text(text):
+    assert redact_secrets(text) == text

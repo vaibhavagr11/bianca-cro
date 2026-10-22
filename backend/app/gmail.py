@@ -36,6 +36,14 @@ _SECRET_PATTERNS = [
     re.compile(r"\b(?:ghp|gho|ghs|github_pat)_[A-Za-z0-9_]{20,}"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),  # AWS access key id
     re.compile(r"\b[A-Za-z0-9_\-+/=]{40,}\b"),  # long opaque tokens
+    # Bank details: labelled account/bank codes (EN/ES), IBANs, and long digit runs (account numbers, CBU/CVU).
+    re.compile(
+        r"\b(?:cbu|cvu|iban|swift|bic|aba|routing(?:\s+number)?|account\s*(?:number|no\.?|#)|"
+        r"n[uú]mero\s+de\s+cuenta|cuenta(?:\s+corriente|\s+bancaria)?|alias)\b[\s:#.]*[A-Za-z0-9][A-Za-z0-9.\-]{3,}",
+        re.I,
+    ),
+    re.compile(r"\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){3,7}(?:\s?[A-Z0-9]{1,4})?\b"),  # IBAN
+    re.compile(r"(?<![\w.])\+?\d(?:[\s\-]?\d){8,}(?![\w.])"),  # 9+ digits, allowing spaces/dashes
 ]
 REDACTED = "[redacted]"
 
