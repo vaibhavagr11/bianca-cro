@@ -78,6 +78,11 @@ def _squash(text: str) -> str:
     return " ".join(text.split()).lower()
 
 
+def insight_key(type_: str, quote: str) -> tuple[str, str]:
+    """Identity of an insight across re-extractions: its type and its quote, whitespace and case folded."""
+    return type_, _squash(quote)
+
+
 def parse_due(value: str | None) -> date | None:
     if not value or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value.strip()):
         return None

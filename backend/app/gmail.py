@@ -37,7 +37,9 @@ _SECRET_PATTERNS = [
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),  # AWS access key id
     re.compile(r"\b[A-Za-z0-9_\-+/=]{40,}\b"),  # long opaque tokens
     # Credentials written inline, e.g. "Contraseña admin: 1234", "password = x", "PIN: 3072"
-    re.compile(r"\b(?:contrase[nñ]a|password|passwd|pwd|pin|clave|usuario|user(?:name)?)\b[^:=\n]{0,30}[:=]\s*\S+", re.I),
+    re.compile(r"\b(?:contrase[nñ]a|password|passwd|pwd|pin|clave|usuario|user(?:name)?|pass\s?code|"
+               r"c[oó]digo\s+de\s+acceso)\b[^:=\n]{0,30}[:=]\s*\S+", re.I),
+    re.compile(r"(?<=[?&])p=[A-Za-z0-9]{8,}"),  # Teams meeting passcode in join links
     # Bank details: labelled account/bank codes (EN/ES), IBANs, and long digit runs (account numbers, CBU/CVU).
     re.compile(
         r"\b(?:cbu|cvu|iban|swift|bic|aba|routing(?:\s+number)?|account\s*(?:number|no\.?|#)|"

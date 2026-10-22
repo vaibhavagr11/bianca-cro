@@ -1,3 +1,5 @@
+import pytest
+
 from app.gmail import REDACTED, process, redact_secrets, skip_reason, strip_quoted
 
 INTERNAL = {"bianca-ai.com"}
@@ -90,6 +92,20 @@ def test_redacts_secret_sharing_links_and_keys():
     assert out.count(REDACTED) == 2
 
 
+@pytest.mark.parametrize(
+    "text, leaked",
+    [
+        ("Join by phone passcode: 650806", "650806"),
+        ("Passcode: yk9Ey2yM", "yk9Ey2yM"),
+        ("Código de acceso: 12ab34", "12ab34"),
+        ("https://zoom.us/j/123?pwd=FakePwd123abc&jst=2", "FakePwd123abc"),
+        ("https://teams.microsoft.com/meet/123?p=FakeTeamsCode12", "FakeTeamsCode12"),
+    ],
+)
+def test_redacts_meeting_passcodes(text, leaked):
+    assert leaked not in redact_secrets(text)
+
+
 def test_redaction_leaves_normal_text():
     assert redact_secrets("Let's meet Thursday at 4pm ART") == "Let's meet Thursday at 4pm ART"
 
@@ -119,7 +135,6 @@ def test_process_output_is_clean_and_hash_stable():
 
 # --- bank-detail redaction -----------------------------------------------------
 
-import pytest  # noqa: E402
 
 
 @pytest.mark.parametrize(

@@ -276,17 +276,24 @@ def extract_insights(payload: ExtractRequest, x_ingest_token: str | None = Heade
             record_ids = [r["id"] for r in records]
             occurred_at = records[-1]["occurred_at"]
             with conn.transaction():
+                # A thread re-extracted after a new message keeps the review state of insights it finds again.
+                reviewed = {extractor.insight_key(r["type"], r["quote"]): r for r in conn.execute(
+                    "select type, quote, status, completion from insights where workspace_id = %s and source = %s"
+                    " and unit_id = %s and status <> 'open'", (workspace_id, unit["source"], unit["thread_id"]))}
                 conn.execute("delete from insights where workspace_id = %s and source = %s and unit_id = %s",
                              (workspace_id, unit["source"], unit["thread_id"]))
                 for i in kept:
+                    prior = reviewed.get(extractor.insight_key(i["type"], i["quote"]))
                     conn.execute(
                         "insert into insights (workspace_id, company_id, opportunity_id, source, unit_id,"
                         " source_record_ids, type, text, quote, owner_side, owner_name, due_date, occurred_at,"
-                        " confidence, extractor_version) values"
-                        " (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        " confidence, extractor_version, status, completion) values"
+                        " (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                         (workspace_id, unit["company_id"], deal["id"], unit["source"], unit["thread_id"],
                          record_ids, i["type"], i["text"], i["quote"], i["owner_side"], i["owner_name"],
-                         i["due_date"], occurred_at, i["confidence"], extractor.EXTRACTOR_VERSION))
+                         i["due_date"], occurred_at, i["confidence"], extractor.EXTRACTOR_VERSION,
+                         prior["status"] if prior else "open",
+                         Jsonb(prior["completion"]) if prior and prior["completion"] else None))
                 conn.execute("update source_records set extracted_version = %s where id = any(%s)",
                              (extractor.EXTRACTOR_VERSION, record_ids))
             counts["insights"] += len(kept)
@@ -354,6 +361,11 @@ def build_profiles(payload: ExtractRequest, x_ingest_token: str | None = Header(
 def reconcile_commitments(x_ingest_token: str | None = Header(default=None)) -> dict:
     """Mark open Bianca-owed commitments / next steps 'possibly_done' when later activity shows completion."""
     require_token(x_ingest_token)
+    return reconcile(None)
+
+
+def reconcile(opportunity_ids: list[str] | None) -> dict:
+    """The completion check for the given deals (all deals when None)."""
     client = _claude()
     today = timeline.utcnow().date().isoformat()
     results, counts = [], {"items_checked": 0, "deals": 0, "marked": 0, "failed_deals": 0}
@@ -365,7 +377,8 @@ def reconcile_commitments(x_ingest_token: str | None = Header(default=None)) -> 
             " i.source_record_ids from insights i join companies c on c.id = i.company_id"
             " where i.workspace_id = %s and i.type in ('commitment', 'next_step') and i.owner_side = 'bianca'"
             " and i.status = 'open' and i.occurred_at >= now() - interval '45 days'"
-            " order by i.company_id, i.occurred_at", (workspace_id,)).fetchall()
+            " and (%s::text[] is null or i.opportunity_id::text = any(%s))"
+            " order by i.company_id, i.occurred_at", (workspace_id, opportunity_ids, opportunity_ids)).fetchall()
         by_company: dict[str, list[dict]] = {}
         for t in targets:
             by_company.setdefault(str(t["company_id"]), []).append(t)

@@ -47,3 +47,9 @@ def test_system_prompt_names_team_and_nico_rule():
 
 def test_extract_endpoint_requires_token():
     assert TestClient(app).post("/process/extract", json={"opportunity_ids": []}).status_code == 401
+
+
+def test_insight_key_ignores_whitespace_and_case():
+    from app.extractor import insight_key
+    assert insight_key("commitment", "Te mando  las\nslides") == insight_key("commitment", "te mando las slides")
+    assert insight_key("commitment", "x") != insight_key("next_step", "x")
