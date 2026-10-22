@@ -279,6 +279,10 @@ def render(sections: list[dict], ndl_rows: list[Row], changes: list[Change], tod
                    f'font:600 14px {FONT};color:{INK}">{_e(s["name"])}</p>')
         out.append(_h("To do today", RED, len(s["today"])))
         out.append(rows_table(s["today"], today) if s["today"] else _empty("Nothing overdue, due today, or prioritized."))
+        if s.get("hidden"):
+            n = s["hidden"]
+            out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">{n} item{"s" if n != 1 else ""} '
+                       f'hidden: later emails/notes suggest {"they were" if n != 1 else "it was"} done.</p>')
         out.append(_h("Due this week", AMBER, len(s["week"])))
         out.append(rows_table(s["week"], today) if s["week"] else _empty("Nothing else due in the next 7 days."))
         out.append(_h("Meetings today & tomorrow", BLUE, len(s["meetings"])))

@@ -80,6 +80,15 @@ def build_brief(dry_run: bool = False, x_ingest_token: str | None = Header(defau
                                    f"{label} · {when:%b} {when.day}", link))
             dated[-1].owner_code = d["owner_code"]
 
+        # Dated items hidden because the completion check found evidence they were done.
+        hidden: dict[str, int] = {}
+        for h in conn.execute(
+                "select o.owner_code, count(*) as n from insights i join opportunities o on o.company_id = i.company_id"
+                " where i.workspace_id = %s and i.type in ('commitment', 'next_step') and i.owner_side = 'bianca'"
+                " and i.status = 'possibly_done' and i.due_date between %s and %s group by o.owner_code",
+                (workspace_id, today - timedelta(days=brief.OVERDUE_WINDOW_DAYS), today + timedelta(days=brief.WEEK_DAYS))):
+            hidden[h["owner_code"]] = h["n"]
+
         # Profile recommendations and blockers.
         for company_id, d in deals.items():
             prof = profiles.get(str(d["id"]))
@@ -197,7 +206,8 @@ def build_brief(dry_run: bool = False, x_ingest_token: str | None = Header(defau
         preps = {p.meeting_index: p.prep for p in plan.preps}
         meet_rows = [(m, preps.get(n, "")) for n, m in enumerate(my_meetings)]
         short, full = DISPLAY.get(code, (code, names.get(code, code)))
-        sections.append({"name": full, "short": short, "today": todo, "week": week, "meetings": meet_rows})
+        sections.append({"name": full, "short": short, "today": todo, "week": week, "meetings": meet_rows,
+                         "hidden": hidden.get(code, 0)})
         payload["sections"].append({
             "owner": code,
             "today": [{"company": r.company, "what": r.what, "due": r.due, "why": r.why, "source": r.source}

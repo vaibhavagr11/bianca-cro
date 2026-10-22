@@ -8,7 +8,7 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel
 from psycopg.types.json import Jsonb
 
-from app import classifier, db, extractor, opportunities, profiler, resolution, timeline
+from app import classifier, db, extractor, opportunities, profiler, reconciler, resolution, timeline
 from app.config import settings
 from app.ingest import _fail, _workspace_id, require_token
 from app.pipeline import normalize_name
@@ -348,3 +348,63 @@ def build_profiles(payload: ExtractRequest, x_ingest_token: str | None = Header(
                                                                  "recommended_actions")),
                         "dropped_uncited": dropped})
     return {"profiles": results}
+
+
+@router.post("/reconcile")
+def reconcile_commitments(x_ingest_token: str | None = Header(default=None)) -> dict:
+    """Mark open Bianca-owed commitments / next steps 'possibly_done' when later activity shows completion."""
+    require_token(x_ingest_token)
+    client = _claude()
+    today = timeline.utcnow().date().isoformat()
+    results, counts = [], {"items_checked": 0, "deals": 0, "marked": 0, "failed_deals": 0}
+    with db.connect() as conn:
+        workspace_id = _workspace_id(conn)
+        conn.row_factory = dict_row
+        targets = conn.execute(
+            "select i.id, i.company_id, c.name as company, i.text, i.quote, i.due_date, i.occurred_at, i.source,"
+            " i.source_record_ids from insights i join companies c on c.id = i.company_id"
+            " where i.workspace_id = %s and i.type in ('commitment', 'next_step') and i.owner_side = 'bianca'"
+            " and i.status = 'open' and i.occurred_at >= now() - interval '45 days'"
+            " order by i.company_id, i.occurred_at", (workspace_id,)).fetchall()
+        by_company: dict[str, list[dict]] = {}
+        for t in targets:
+            by_company.setdefault(str(t["company_id"]), []).append(t)
+
+        for company_id, items in by_company.items():
+            own = {str(r["id"]): r for r in conn.execute(
+                "select id, subject, body from source_records where id = any(%s)",
+                ([rid for it in items for rid in it["source_record_ids"]],))}
+            item_map = {}
+            for n, it in enumerate(items, start=1):
+                recs = [own.get(str(rid)) for rid in it["source_record_ids"]]
+                item_map[f"T{n}"] = {**it, "ref": f"T{n}", "id": it["id"], "record_id": it["source_record_ids"][-1],
+                                     "own_text": " ".join(f"{r['subject'] or ''} {r['body'] or ''}" for r in recs if r)}
+            later = conn.execute(
+                "select id, source, subject, body, occurred_at from source_records where workspace_id = %s"
+                " and company_id = %s and status = 'classified' and body is not null and occurred_at > %s"
+                " and occurred_at <= now() order by occurred_at desc limit %s",
+                (workspace_id, company_id, min(it["occurred_at"] for it in items), reconciler.MAX_LATER_RECORDS),
+            ).fetchall()[::-1]
+            rec_map = {f"R{n}": {**r, "ref": f"R{n}"} for n, r in enumerate(later, start=1)}
+            body = reconciler.render(today, items[0]["company"], list(item_map.values()), list(rec_map.values()))
+            try:
+                verdicts = reconciler.check(client, settings.anthropic_model, body)
+            except (anthropic.APIStatusError, anthropic.APIConnectionError, ValueError) as exc:
+                log.warning("reconcile failed for a deal: %s", type(exc).__name__)
+                counts["failed_deals"] += 1
+                continue
+            accepted = reconciler.validate(verdicts, item_map, rec_map)
+            with conn.transaction():
+                for a in accepted:
+                    evidence = {k: a[k] for k in ("state", "record_id", "quote", "reason")}
+                    evidence.update(checked_at=timeline.utcnow().isoformat(), checker_version=reconciler.CHECKER_VERSION)
+                    conn.execute("update insights set status = 'possibly_done', completion = %s where id = %s",
+                                 (Jsonb(evidence), a["insight_id"]))
+            counts["deals"] += 1
+            counts["items_checked"] += len(items)
+            counts["marked"] += len(accepted)
+            text_of = {str(v["id"]): v["text"] for v in item_map.values()}
+            results += [{"deal": items[0]["company"], "item": text_of[str(a["insight_id"])], "state": a["state"],
+                         "reason": a["reason"]} for a in accepted]
+    log.info("reconcile: %s", counts)
+    return {**counts, "marked_items": results}
