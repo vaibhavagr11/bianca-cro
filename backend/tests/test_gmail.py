@@ -84,7 +84,7 @@ def test_strip_quoted_keeps_text_without_quotes():
 
 
 def test_redacts_secret_sharing_links_and_keys():
-    text = "key: https://password.link/mef2pZU8/#UnlrVFBh and sk-abcdefghijklmnopqrstuv"
+    text = "key: https://password.link/AbCd1234/#FakeFragmentXyz and sk-abcdefghijklmnopqrstuv"
     out = redact_secrets(text)
     assert "password.link" not in out and "sk-abc" not in out
     assert out.count(REDACTED) == 2
