@@ -22,7 +22,12 @@ def classify_threads(x_ingest_token: str | None = Header(default=None)) -> dict:
     require_token(x_ingest_token)
     if settings.anthropic_api_key is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key.get_secret_value())
+    workspace_header = (
+        {"anthropic-workspace-id": settings.anthropic_workspace_id} if settings.anthropic_workspace_id else None
+    )
+    client = anthropic.Anthropic(
+        api_key=settings.anthropic_api_key.get_secret_value(), default_headers=workspace_header
+    )
 
     with db.connect() as conn:
         workspace_id = _workspace_id(conn)

@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     # Claude, used by the email classifier. The SDK also reads ANTHROPIC_API_KEY from the environment.
     anthropic_api_key: SecretStr | None = None
     anthropic_model: str = "claude-opus-5-5"
+    # Needed only when the API key isn't scoped to a workspace (sent as the anthropic-workspace-id header).
+    anthropic_workspace_id: str | None = None
     # Threads classified per /process/classify call.
     classify_batch_threads: int = 10
 
