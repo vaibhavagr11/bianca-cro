@@ -18,7 +18,7 @@ router = APIRouter(prefix="/process")
 
 @router.post("/classify")
 def classify_threads(x_ingest_token: str | None = Header(default=None)) -> dict:
-    """Classify up to classify_batch_threads Gmail threads that have pending messages."""
+    """Classify up to classify_batch_threads pending units: Gmail threads and notes-doc meetings, newest first."""
     require_token(x_ingest_token)
     if settings.anthropic_api_key is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
@@ -34,10 +34,10 @@ def classify_threads(x_ingest_token: str | None = Header(default=None)) -> dict:
         conn.row_factory = dict_row
         system_prompt, company_ids = _context(conn, workspace_id)
         threads = [
-            r["thread_id"]
+            (r["source"], r["thread_id"])
             for r in conn.execute(
-                "select thread_id from source_records where workspace_id = %s and source = 'gmail'"
-                " and status = 'pending' group by thread_id order by max(occurred_at) desc limit %s",
+                "select source, thread_id from source_records where workspace_id = %s and status = 'pending'"
+                " group by source, thread_id order by max(occurred_at) desc nulls last limit %s",
                 (workspace_id, settings.classify_batch_threads),
             )
         ]
@@ -49,22 +49,24 @@ def classify_threads(x_ingest_token: str | None = Header(default=None)) -> dict:
 
         counts = {"classified": 0, "commercial": 0, "linked_to_company": 0, "failed": 0}
         try:
-            for thread_id in threads:
+            for source, thread_id in threads:
                 records = conn.execute(
-                    "select id, external_id, occurred_at::text, subject, participants, body from source_records"
-                    " where workspace_id = %s and source = 'gmail' and thread_id = %s",
-                    (workspace_id, thread_id),
+                    "select id, external_id, occurred_at::text, subject, participants, body, meta from source_records"
+                    " where workspace_id = %s and source = %s and thread_id = %s",
+                    (workspace_id, source, thread_id),
                 ).fetchall()
-                thread_text = classifier.render_thread(records)
+                thread_text = (
+                    classifier.render_note(records[0]) if source == "notes" else classifier.render_thread(records)
+                )
                 try:
-                    result = classifier.classify(client, settings.anthropic_model, system_prompt, thread_text)
+                    result = classifier.classify(client, settings.anthropic_model, system_prompt, thread_text, source)
                 except (anthropic.APIStatusError, anthropic.APIConnectionError, ValueError) as exc:
                     # One bad thread doesn't stop the batch; it stays visible as failed.
                     log.warning("classify thread failed: %s", type(exc).__name__)
                     conn.execute(
                         "update source_records set status = 'failed' where workspace_id = %s and thread_id = %s"
-                        " and source = 'gmail'",
-                        (workspace_id, thread_id),
+                        " and source = %s",
+                        (workspace_id, thread_id, source),
                     )
                     conn.commit()
                     counts["failed"] += 1
@@ -73,10 +75,14 @@ def classify_threads(x_ingest_token: str | None = Header(default=None)) -> dict:
                 stored = classifier.check(result, thread_text, {k: v[0] for k, v in company_ids.items()})
                 stored["model"] = settings.anthropic_model
                 company_id = company_ids[normalize_name(stored["company"])][1] if stored["company"] else None
+                discard = stored["category"] in classifier.DISCARD_TEXT_CATEGORIES
+                if discard:
+                    stored["evidence_quote"] = None  # keep only the label; the text is not sales data
                 conn.execute(
-                    "update source_records set status = 'classified', classification = %s, company_id = %s"
-                    " where workspace_id = %s and thread_id = %s and source = 'gmail'",
-                    (Jsonb(stored), company_id, workspace_id, thread_id),
+                    "update source_records set status = 'classified', classification = %s, company_id = %s,"
+                    " body = case when %s then null else body end"
+                    " where workspace_id = %s and thread_id = %s and source = %s",
+                    (Jsonb(stored), company_id, discard, workspace_id, thread_id, source),
                 )
                 conn.commit()
                 counts["classified"] += 1
@@ -88,8 +94,8 @@ def classify_threads(x_ingest_token: str | None = Header(default=None)) -> dict:
             raise HTTPException(status_code=500, detail="classify failed")
 
         remaining = conn.execute(
-            "select count(distinct thread_id) as n from source_records"
-            " where workspace_id = %s and source = 'gmail' and status = 'pending'",
+            "select count(distinct (source, thread_id)) as n from source_records"
+            " where workspace_id = %s and status = 'pending'",
             (workspace_id,),
         ).fetchone()["n"]
         conn.execute(

@@ -1,14 +1,16 @@
 """Ingest endpoints called by n8n. Thin layer: auth, sync_runs bookkeeping, DB writes. Logic lives in pipeline.py."""
 
+import hashlib
 import hmac
 import logging
+from datetime import date
 
 import psycopg
 from fastapi import APIRouter, Header, HTTPException
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel
 
-from app import db, gmail
+from app import db, gmail, notes
 from app.config import settings
 from app.pipeline import (
     TRACKED_FIELDS,
@@ -31,6 +33,11 @@ class PipelinePayload(BaseModel):
 
 class GmailPayload(BaseModel):
     messages: list[dict]
+
+
+class NotesPayload(BaseModel):
+    documentId: str
+    content: str
 
 
 def require_token(token: str | None) -> None:
@@ -142,6 +149,69 @@ def ingest_gmail(payload: GmailPayload, x_ingest_token: str | None = Header(defa
 
     log.info("gmail sync %s succeeded: received=%s %s skipped_by_reason=%s", run_id, len(payload.messages), counts, skipped)
     return {"sync_run_id": str(run_id), "received": len(payload.messages), **counts, "skipped_by_reason": skipped}
+
+
+@router.post("/notes")
+def ingest_notes(payload: NotesPayload, x_ingest_token: str | None = Header(default=None)) -> dict:
+    """Split the meeting-notes doc into meetings and store those within the window as pending source_records."""
+    require_token(x_ingest_token)
+    today = date.today()
+    sections = notes.split_sections(payload.content, today)
+    recent = notes.recent_sections(sections, today, settings.notes_window_days)
+
+    with db.connect() as conn:
+        workspace_id = _workspace_id(conn)
+        run_id = conn.execute(
+            "insert into sync_runs (workspace_id, source, rows_received) values (%s, 'notes', %s) returning id",
+            (workspace_id, len(sections)),
+        ).fetchone()[0]
+        conn.commit()
+
+        try:
+            created = updated = 0
+            with conn.transaction():
+                for position, s in enumerate(recent):
+                    body = notes.clean_body(s)
+                    external_id = f"{payload.documentId}:{s.section_id}"
+                    content_hash = hashlib.sha256(body.encode()).hexdigest()
+                    meta = {"doc_id": payload.documentId, "date_inferred": s.date_inferred, "position": position}
+                    row = conn.execute(
+                        "insert into source_records (workspace_id, source, external_id, thread_id, occurred_at,"
+                        " subject, body, content_hash, meta) values (%s, 'notes', %s, %s, %s, %s, %s, %s, %s)"
+                        " on conflict (workspace_id, source, external_id) do update set"
+                        "  occurred_at = excluded.occurred_at, subject = excluded.subject, body = excluded.body,"
+                        "  content_hash = excluded.content_hash, meta = excluded.meta,"
+                        "  status = 'pending', classification = null"
+                        " where source_records.content_hash <> excluded.content_hash"
+                        " returning (xmax = 0) as inserted",
+                        (workspace_id, external_id, external_id, s.meeting_date, notes.redact_secrets(s.header)[:200],
+                         body, content_hash, Jsonb(meta)),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    if row[0]:
+                        created += 1
+                    else:
+                        updated += 1
+                counts = {
+                    "created": created,
+                    "updated": updated,
+                    "unchanged": len(recent) - created - updated,
+                    "skipped": len(sections) - len(recent),
+                }
+                conn.execute(
+                    "update sync_runs set status = 'succeeded', finished_at = now(), rows_created = %s,"
+                    " rows_updated = %s, rows_unchanged = %s, rows_skipped = %s where id = %s",
+                    (counts["created"], counts["updated"], counts["unchanged"], counts["skipped"], run_id),
+                )
+        except Exception as exc:
+            _fail(conn, run_id, type(exc).__name__)
+            log.exception("notes sync %s failed", run_id)
+            raise HTTPException(status_code=500, detail="notes sync failed")
+
+    log.info("notes sync %s succeeded: sections=%s %s", run_id, len(sections), counts)
+    return {"sync_run_id": str(run_id), "sections_in_doc": len(sections), "in_window": len(recent),
+            "window_days": settings.notes_window_days, **counts}
 
 
 def _workspace_id(conn: psycopg.Connection):
