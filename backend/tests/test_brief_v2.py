@@ -6,7 +6,8 @@ from fastapi.testclient import TestClient
 
 from app.brief import Meeting
 from app.brief_v2 import (
-    ChangeRow, DealView, Item, Note, Unanswered, bucket, build_section, classify_event, deal_status, first_sentence, has_request,
+    ChangeRow, DealView, Item, Note, Unanswered, bucket, build_section, classify_event, deal_status, describe_change,
+    reply_text, first_sentence, has_request,
     is_new_insight, item_kind, norm, primary_move, render, reply_label, resolve_owner, select_changes, subject,
     to_payload,
 )
@@ -158,7 +159,8 @@ def test_unverified_recommendation_is_labelled_and_has_no_evidence_link():
 
 
 def test_first_sentence_keeps_moves_short():
-    assert first_sentence("Call Ale. Ask for intros.") == "Call Ale."
+    assert first_sentence("Call Ale. Ask for intros to the MDM owners. Then book.") == "Call Ale. Ask for intros to the MDM owners."
+    assert first_sentence("Email Zach to follow up on the store data. Offer a template.") == "Email Zach to follow up on the store data."
     assert len(first_sentence("word " * 80)) <= 96
     assert first_sentence("Sharing data depends on the NDA. It is now at signature.") == "Sharing data depends on the NDA."
 
@@ -312,3 +314,100 @@ def test_selection_is_stable_for_identical_inputs():
         again = section("RG", v2, i2)
         assert [v.deal for v, _, _ in again.highlights] == [v.deal for v, _, _ in first.highlights]
         assert [(r.deal, r.reason) for r in again.audit] == [(r.deal, r.reason) for r in first.audit]
+
+
+
+# ---- round 4: semantic correctness
+
+def test_femsa_completed_zha_adjustment_is_progress_not_a_commitment():
+    # Ramiro's own email: "Con eso, los 12 clientes ... ya no deberían salir con ZHA". The current profile cites it
+    # only under "Validate the ZHA assignment fix" owned by FEMSA, so our part is done.
+    quote = "Con eso, los 12 clientes que marcaron como RUTA ZHA = NO ya no deberían salir con ZHA."
+    assert item_kind("commitment", None, "bianca", quote, profile_side="customer") == "progress"
+    assert item_kind("commitment", None, "bianca", quote, profile_side="none") == "progress"
+    assert item_kind("commitment", None, "notes", "Mandamos el deck", profile_side="bianca") == "owed"
+    assert item_kind("commitment", None, "notes", "Mandamos el deck", profile_side=None) == "owed"   # no profile to ask
+    assert item_kind("commitment", date(2026, 10, 30), "bianca", quote, profile_side="customer") == "owed"  # deadline
+    _, text = describe_change("commitment", "bianca", "progress", False, "gmail",
+                              "Ramiro adjusted the ZHA assignment logic so the 12 clients no longer get ZHA.", "Re: AJUSTES ZHA",
+                              date(2026, 10, 26))
+    assert text.startswith("Progress made:") and "commitment" not in text.lower()
+
+
+def test_pernod_title_only_buying_signal_reports_the_fact_not_the_interpretation():
+    cat, text = describe_change("buying_signal", None, None, True, "calendar",
+                                "A project kick-off meeting is confirmed, suggesting the project is moving forward.",
+                                "Kick Off proyecto PRA <> Bianca", date(2026, 10, 26))
+    assert cat == "recorded" and text == "Meeting on Oct 26: Kick Off proyecto PRA <> Bianca"
+    _, text = describe_change("buying_signal", None, None, False, "gmail",
+                              "Legal accepted Bianca's NDA changes and sent it via DocuSign.", "Re: NDA", date(2026, 10, 20))
+    assert text.startswith("Buying signal:")                                 # body evidence: shown as a signal
+    _, text = describe_change("commitment", "customer", None, False, "gmail", "Tomas will share the sell-out data.",
+                              "RE: Próximos Pasos", date(2026, 10, 26))
+    assert text.startswith("Customer committed:")
+
+
+def campari_view(recs):
+    blocker = Note("Bianca cannot filter Plan Kiosco stores until Campari shares the list.", verified=True,
+                   link="https://b", evidence=frozenset({"I1"}))
+    return view("Campari", 4, owner="RG", blocker=blocker, recommendations=recs,
+                recommendation=recs[0] if recs else None)
+
+
+def test_campari_next_move_addresses_the_blocker_and_keeps_the_promise_visible():
+    handover = Note("Book the On Premise demo and handover.", verified=True, link="https://r1", evidence=frozenset({"I5", "I18", "I2"}))
+    owed_list = Note("Send Campari the list of data they owe and deadlines: the Plan Kiosco list.", verified=True,
+                     link="https://r2", evidence=frozenset({"I1", "I15", "I16"}))
+    promise = item("Campari", "Add On Premise data to the platform", due=TODAY + timedelta(days=2), deal_owner="RG", id="I2")
+    s = section("RG", [campari_view([handover, owed_list])], [promise])
+    (_, move, sit), = s.highlights
+    assert move.tag == "AI recommendation" and "Plan Kiosco" in move.text and sit.text.startswith("Bianca cannot filter")
+    assert any("Add On Premise data" in m.text for m in s.followups)       # the unrelated promise is not lost
+
+
+def test_no_matching_move_says_clarify_instead_of_an_unrelated_task():
+    unrelated = Note("Turn the pilot into a written proposal.", verified=True, evidence=frozenset({"I7"}))
+    promise = item("Campari", "Add On Premise data", due=TODAY + timedelta(days=2), deal_owner="RG", id="I2")
+    (_, move, _), = section("RG", [campari_view([unrelated])], [promise]).highlights
+    assert move.tag == "Clarify next action" and "On Premise" not in move.text
+
+
+def test_reply_needed_uses_the_extracted_request_or_a_neutral_instruction():
+    generic = Unanswered("RE: Próximos Pasos: Pernod Ricard <> Bianca", 1, "l", True)
+    assert reply_text(generic).startswith("Review the customer's email") and not reply_text(generic).startswith("Customer asked")
+    specific = Unanswered("RE: Info Distribucion", 1, "l", True, action="Build the distribution cuts from the shared file.")
+    assert reply_text(specific) == "Build the distribution cuts from the shared file."
+    s = section("RG", [view("Pernod", 3, owner="RG", unanswered=generic)], [])
+    assert not s.today[0].text.startswith("Customer asked: RE:")
+
+
+def test_semantic_fixes_do_not_change_deal_selection():
+    views, items = ramiro_oct28()
+    before = [v.deal for v, _, _ in section("RG", views, items).highlights]
+    for v in views:                                                         # moves change, selection must not
+        v.recommendations = [Note("unrelated", verified=True, evidence=frozenset({"X"}))]
+    assert [v.deal for v, _, _ in section("RG", views, items).highlights] == before
+
+
+def test_backfill_is_never_reported_as_new_or_late():
+    for occurred in (datetime(2026, 10, 9, tzinfo=timezone.utc), datetime(2026, 10, 14, 3, tzinfo=timezone.utc)):
+        assert classify_event(occurred, STORED_TODAY, CUTOFF, NOW, 7) == "backfill"
+
+
+
+# ---- round 5: final verification fixes
+
+def test_buying_signal_written_by_bianca_is_progress_not_customer_intent():  # Coca-Cola USA supplier onboarding
+    cat, text = describe_change("buying_signal", None, None, False, "gmail",
+                                "Bianca has completed supplier onboarding with Coca-Cola Company.", "Re: Possible Femsa MDM",
+                                date(2026, 10, 22), speaker="bianca")
+    assert cat == "progress" and text.startswith("Progress made:")
+    cat, _ = describe_change("buying_signal", None, None, False, "gmail", "Legal accepted the NDA changes.", "Re: NDA",
+                             date(2026, 10, 20), speaker="customer")
+    assert cat == "buying_signal"
+
+
+def test_calendar_change_without_a_link_is_named_not_invented():
+    c = ChangeRow("Pernod Ricard", 3, "Meeting on Oct 26: Kick Off proyecto PRA <> Bianca", "Meeting · Oct 26", None)
+    html = render([], [], [c], TODAY, 0, "c", False)
+    assert "calendar event" in html and "href" not in html.split("Kick Off proyecto")[1].split("</tr>")[0]

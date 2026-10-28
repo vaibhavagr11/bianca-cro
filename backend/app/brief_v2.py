@@ -64,6 +64,7 @@ class Note:
     verified: bool = False
     basis: str | None = None
     link: str | None = None
+    evidence: frozenset = frozenset()  # ids of the insights it cites (resolved)
 
 
 @dataclass
@@ -72,6 +73,7 @@ class Unanswered:
     days: int
     link: str | None
     has_request: bool
+    action: str | None = None       # what the latest customer message asks of us, if extraction found it
 
 
 @dataclass
@@ -88,6 +90,7 @@ class DealView:
     summary: Note | None = None
     unanswered: Unanswered | None = None
     developments: int = 0           # new or late-recorded developments since the last brief
+    recommendations: list[Note] = field(default_factory=list)  # all of the profile's suggested moves
 
 
 @dataclass
@@ -174,15 +177,25 @@ def has_request(text: str | None) -> bool:
     return bool(text and REQUEST_RE.search(text))
 
 
-def item_kind(type_: str, due: date | None, speaker: str, quote: str) -> str:
+def item_kind(type_: str, due: date | None, speaker: str, quote: str, profile_side: str | None = None) -> str:
     """What an extracted Bianca-side item really is (the extractor does not record this).
 
-    owed: an explicit promise, or anything with a deadline. customer_request: asked for by the customer (their
-    email, or a request phrase in the notes). proposed: written in Bianca's own email; our part is done and the
-    next move is theirs. next_step: an agreed step from the meeting notes, not a promise.
+    owed: a deadline, or a promise the current deal profile still lists as open on Bianca's side.
+    progress: a "commitment" the profile reads as done on our side (it cites it only in an open item owned by the
+    customer, e.g. "validate our fix"), or that it no longer lists as open although Bianca wrote it.
+    customer_request: asked for by the customer. proposed: written in Bianca's own email, the next move is theirs.
+    next_step: an agreed step from the meeting notes, not a promise.
+
+    profile_side is how the current, evidence-checked profile lists the same insight among open commitments:
+    "bianca", "customer", "none" (not listed), or None when there is no current profile to ask.
     """
-    if type_ == "commitment" or due is not None:
+    if due is not None:
         return "owed"
+    if type_ == "commitment":
+        if profile_side in (None, "bianca"):
+            return "owed"
+        if profile_side == "customer" or speaker == "bianca":
+            return "progress"
     if speaker == "customer" or (speaker == "notes" and has_request(quote) and "?" not in quote):
         return "customer_request"
     if speaker == "bianca":
@@ -206,8 +219,15 @@ def reply_label(u: Unanswered) -> str:
     return "reply_needed" if u.days <= REPLY_DAYS and u.has_request else "follow_up"
 
 
+def reply_text(u: Unanswered) -> str:
+    """What to do about an unanswered customer email: the extracted request if there is one, otherwise a neutral
+    instruction. Never an action invented from the subject line."""
+    return u.action or f"Review the customer's email and decide the response needed ({u.subject[:60]})"
+
+
 def first_sentence(text: str, limit: int = 95) -> str:
-    s = re.split(r"(?<=[^\d\s][.!?])\s+(?=[A-Z¿¡\"'])", text.strip(), maxsplit=1)[0]
+    parts = re.split(r"(?<=[^\d\s][.!?])\s+(?=[A-Z¿¡\"'])", text.strip(), maxsplit=2)
+    s = parts[0] if len(parts[0]) >= 30 or len(parts) == 1 else f"{parts[0]} {parts[1]}"  # "Call Ale." alone says too little
     return s if len(s) <= limit else s[:limit].rsplit(" ", 1)[0] + "…"
 
 
@@ -215,9 +235,32 @@ def _date(d: date) -> str:
     return f"{d:%b} {d.day}"
 
 
+def addresses(evidence: frozenset, blocker: Note) -> bool:
+    """A move addresses a blocker when it rests on the same source evidence (shared cited insights)."""
+    return bool(evidence & blocker.evidence)
+
+
 def primary_move(d: DealView, today: date, used: set[str]) -> Move:
-    """One next move per deal, in a fixed precedence: obligations first, then the customer, then AI suggestions."""
+    """One next move per deal.
+
+    With a verified blocker (the situation shown next to it), the move must address that blocker: a promise,
+    customer request or suggested move citing the same evidence. If none does, say the next action needs
+    clarification rather than show an unrelated task. Without a blocker: obligations first, then the customer,
+    then AI suggestions.
+    """
     open_items = [i for i in d.items if i.id not in used]
+    b = d.blocker if d.blocker and d.blocker.verified else None
+    if b is not None:
+        for i in sorted((i for i in open_items if i.kind in ("owed", "customer_request") and i.id in b.evidence),
+                        key=lambda i: i.due or date.max):
+            tag = "We owe" if i.kind == "owed" else "Customer asked"
+            when = f"due {_date(i.due)}" if i.due else f"recorded {_date(i.recorded)}"
+            return Move(tag, i.text, when, i.link, i.id)
+        for r in d.recommendations:
+            if r.verified and addresses(r.evidence, b):
+                return Move("AI recommendation", first_sentence(r.text), _last(d, today), r.link)
+        return Move("Clarify next action", "No recorded action or suggestion addresses this blocker yet",
+                    _last(d, today), b.link)
     for i in sorted((i for i in open_items if i.kind == "owed" and i.bucket in ("overdue", "week")),
                     key=lambda i: i.due or date.max):
         late = (today - i.due).days
@@ -226,8 +269,7 @@ def primary_move(d: DealView, today: date, used: set[str]) -> Move:
                     key=lambda i: -i.recorded.toordinal()):
         return Move("Customer asked", i.text, f"asked {_date(i.recorded)}", i.link, i.id)
     if d.unanswered and reply_label(d.unanswered) == "follow_up":
-        return Move("Follow up", f"Customer email still unanswered: {d.unanswered.subject}",
-                    f"{d.unanswered.days}d ago", d.unanswered.link)
+        return Move("Follow up", reply_text(d.unanswered), f"email {d.unanswered.days}d ago", d.unanswered.link)
     if d.recommendation and d.recommendation.verified:
         return Move("AI recommendation", first_sentence(d.recommendation.text), _last(d, today), d.recommendation.link)
     for i in sorted((i for i in open_items if i.kind == "proposed"), key=lambda i: -i.recorded.toordinal()):
@@ -352,6 +394,37 @@ def select_deals(eligible: list[DealView], today: date, in_today: set[str], crit
     return selected, records
 
 
+CHANGE_LABELS = {"buying_signal": "Buying signal", "blocker": "New blocker", "objection": "Objection",
+                 "need": "Customer need", "commitment_owed": "New commitment (we owe)", "progress": "Progress made",
+                 "customer_request": "Customer request", "proposed": "We proposed", "next_step": "Next step noted",
+                 "they_owe": "Customer committed"}
+
+
+def describe_change(type_: str, owner_side: str | None, kind: str | None, title_only: bool, source: str,
+                    text: str, title: str | None, event: date | None, speaker: str | None = None) -> tuple[str, str]:
+    """(category, display text) for a new development, from structure and evidence rather than wording.
+
+    If the quote is only a title (a calendar event with no description, an email subject), report the recorded
+    fact itself and do not repeat the extracted interpretation. A "buying signal" quoted from Bianca's own email is
+    Bianca describing its own progress, not the customer's intent, so it is labelled as progress.
+    """
+    if title_only:
+        what = "Meeting" if source == "calendar" else "Email"
+        return "recorded", f"{what} on {_date(event)}: {title}" if event else f"{what}: {title}"
+    if type_ in ("commitment", "next_step"):
+        if owner_side == "customer":
+            cat = "they_owe"
+        elif kind == "owed":
+            cat = "commitment_owed"
+        else:
+            cat = kind or "next_step"
+    elif type_ == "buying_signal" and speaker == "bianca":
+        cat = "progress"
+    else:
+        cat = type_
+    return cat, f"{CHANGE_LABELS.get(cat, cat)}: {first_sentence(text, 140)}"
+
+
 def change_group(rank: int | None) -> int:
     """0: prospects and pilots, 1: customers, 2: early or paused."""
     return 0 if rank in (2, 3, 4) else 1 if rank == CUSTOMER_RANK else 2
@@ -413,7 +486,8 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
             mine[deal] = DealView(src.deal, src.stage, src.rank, src.owner, src.last_contact,
                                   blocker=src.blocker if own else None, recommendation=src.recommendation if own else None,
                                   summary=src.summary if own else None, unanswered=src.unanswered if own else None,
-                                  developments=src.developments if own else 0)
+                                  developments=src.developments if own else 0,
+                                  recommendations=src.recommendations if own else [])
         return mine[deal]
 
     routed = [i for i in items if i.route == code]
@@ -434,7 +508,7 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                 today_rows.append(TodayRow(v.deal, v.stage, "Due now", i.text, when, owner_label(i), i.link, i.id))
                 used.add(i.id)
         if v.unanswered and reply_label(v.unanswered) == "reply_needed":
-            today_rows.append(TodayRow(v.deal, v.stage, "Reply needed", f"Customer asked: {v.unanswered.subject}",
+            today_rows.append(TodayRow(v.deal, v.stage, "Reply needed", reply_text(v.unanswered),
                                        f"received {v.unanswered.days}d ago", display.get(code, code) + " (deal owner)",
                                        v.unanswered.link))
     today_rows.sort(key=lambda r: (r.tag != "Due now", r.when))
@@ -474,12 +548,18 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
     # Follow-ups that may be needed (not today): unanswered without a request or older, recent overdue promises,
     # our proposals with no reply, customer requests on deals not shown above.
     follow: list[Move] = []
+    for v, m, _ in highlights:  # when the move addresses the blocker instead, the nearest promise stays visible
+        dated = sorted((i for i in v.items if i.id not in used and i.kind == "owed" and i.bucket in ("overdue", "week")),
+                       key=lambda i: i.due)
+        if m.tag != "We owe" and dated:
+            i = dated[0]
+            follow.append(Move("We owe", f"{v.deal}: {i.text}", f"due {_date(i.due)}", i.link, i.id))
     for v in mine.values():
         if v.deal in shown:
             continue
         if v.unanswered and reply_label(v.unanswered) == "follow_up":
-            follow.append(Move("Follow up", f"{v.deal}: customer email unanswered ({v.unanswered.subject})",
-                               f"{v.unanswered.days}d ago", v.unanswered.link))
+            follow.append(Move("Follow up", f"{v.deal}: {reply_text(v.unanswered)}",
+                               f"email {v.unanswered.days}d ago", v.unanswered.link))
         for i in v.items:
             if i.id in used:
                 continue
@@ -515,7 +595,7 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
 # ---------------------------------------------------------------- rendering
 
 TAG_COLOR = {"Due now": RED, "Reply needed": BLUE, "We owe": INK, "Customer asked": BLUE,
-             "AI recommendation": PURPLE, "Follow up": AMBER, "Confirm status": MUTED}
+             "AI recommendation": PURPLE, "Follow up": AMBER, "Confirm status": MUTED, "Clarify next action": AMBER}
 
 
 def _tag(text: str) -> str:
@@ -627,7 +707,9 @@ def render(sections: list[Section], ndl_rows: list[TodayRow], changes: list[Chan
     out.append(_h("What changed since the last brief", MUTED, len(changes)))
     out.append(_table(_th("Deal", "20%") + _th("What changed (from the source)") + _th("", "8%"),
                       ["<tr>" + _td(f"<b>{_e(c.deal)}</b>") + _td(f"{_e(first_sentence(c.text, 100))} {_muted(_e(change_label(c)))}")
-                       + _td(_src(c.link)) + "</tr>" for c in changes]) if changes else _empty("No notable changes."))
+                       + _td(_src(c.link) if c.link or not c.source.startswith("Meeting")
+                             else _muted("calendar event")) + "</tr>" for c in changes])
+                if changes else _empty("No notable changes."))
     if backfill:
         out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">{_e(backfill)}</p>')
     out.append(f'<p style="font:11px {FONT};color:#98a2b3;margin-top:28px">{_e(coverage)} <b>We owe</b> = promise '

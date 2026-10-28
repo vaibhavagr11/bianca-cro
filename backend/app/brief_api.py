@@ -319,6 +319,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
 
         # Unanswered customer emails (v1 window), newest per deal, with whether the email asks for something.
         unanswered: dict[str, brief_v2.Unanswered] = {}
+        unanswered_src: dict[str, tuple[str, str]] = {}  # deal -> (thread id, latest customer message body)
         for t in conn.execute(
                 "select distinct on (thread_id) thread_id, company_id, subject, body, occurred_at, participants"
                 " from source_records where workspace_id = %s and source = 'gmail' and company_id is not null"
@@ -334,6 +335,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
                 if d["name"] not in unanswered or days < unanswered[d["name"]].days:
                     unanswered[d["name"]] = brief_v2.Unanswered(
                         t["subject"] or "", days, c.link, brief_v2.has_request(f"{t['subject'] or ''} {t['body'] or ''}"))
+                    unanswered_src[d["name"]] = (t["thread_id"], t["body"] or "")
 
         start = datetime.combine(today, time.min, tz)
         meetings: list[brief.Meeting] = []
@@ -378,7 +380,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
         verified = bool(refs) and len(resolved) == len(refs) and fresh
         link = _link_for(resolved[0]["source"], resolved[0]["unit_id"], resolved[0]["meta"]) if resolved else None
         return brief_v2.Note(entry.get("action") or entry.get("text") or "", entry.get("why") if with_why else None,
-                             verified, entry.get("basis"), link if verified else None)
+                             verified, entry.get("basis"), link if verified else None,
+                             frozenset(str(x["id"]) for x in resolved))
 
     views: dict[str, brief_v2.DealView] = {}
     for company_id, d in deals.items():
@@ -389,7 +392,34 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
             d["name"], d["stage"], d["stage_rank"], d["owner_code"], last_contact.get(company_id),
             blocker=note(d, blockers[0], prow, False) if blockers else None,
             recommendation=note(d, recs_[0], prow, True) if recs_ else None,
+            recommendations=[n for n in (note(d, a, prow, True) for a in recs_) if n],
             summary=note(d, prof.get("summary"), prow, False), unanswered=unanswered.get(d["name"]))
+
+    bianca_names = {brief_v2.norm(t["full_name"]) for t in team} | {"bianca"}
+
+    def owner_side_of(owner: str | None) -> str:
+        o = brief_v2.norm((owner or "").split("(")[0])
+        return "bianca" if o in bianca_names or o.startswith("bianca") else "customer"
+
+    profile_side: dict[str, str] = {}   # insight id -> side of the open commitment that cites it ("none" if not listed)
+    fresh_opps: set[str] = set()
+    for d in deals.values():
+        prow = profiles.get(str(d["id"]))
+        if not prow or prow["generated_at"] < newest_insight.get(str(d["id"]), prow["generated_at"]):
+            continue                    # no current profile: no second reading available
+        fresh_opps.add(str(d["id"]))
+        refs = prow["profile"].get("refs") or {}
+        for oc in prow["profile"].get("open_commitments") or []:
+            for ref in oc.get("evidence") or []:
+                if ref in refs:
+                    side = owner_side_of(oc.get("owner"))
+                    if profile_side.get(refs[ref]) != "bianca":
+                        profile_side[refs[ref]] = side
+
+    def side_for(r: dict) -> str | None:
+        if str(r["opportunity_id"]) not in fresh_opps:
+            return None
+        return profile_side.get(str(r["id"]), "none")
 
     def speaker(r: dict) -> str:
         if r["source"] != "gmail":
@@ -415,7 +445,16 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
             f"{SOURCE_LABEL.get(r['source'], r['source'])} · {when:%b} {when.day}" if when else r["source"],
             _link_for(r["source"], r["unit_id"], r["meta"]),
             brief_v2.bucket(r["due_date"], recorded, today, t1, t2),
-            brief_v2.item_kind(r["type"], r["due_date"], speaker(r), r["quote"])))
+            brief_v2.item_kind(r["type"], r["due_date"], speaker(r), r["quote"], side_for(r))))
+
+    # ---- what each unanswered customer email asks of us (only from items extracted from that very message)
+    kinds = {i.id: i for i in items}
+    for deal, (thread_id, body) in unanswered_src.items():
+        asks = [kinds[str(r["id"])] for r in open_items if r["source"] == "gmail" and r["unit_id"] == thread_id
+                and str(r["id"]) in kinds and kinds[str(r["id"])].kind in ("owed", "customer_request")
+                and brief_v2.is_new_insight(r["quote"], body)]
+        if asks:
+            unanswered[deal].action = brief_v2.first_sentence(asks[0].text, 120)
 
     # ---- classify every newly extracted insight by the event time of the record its quote comes from
     lookback = settings.brief_late_lookback_days
@@ -496,11 +535,17 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
         if per_deal.get(d["name"], 0) >= 1:
             continue
         per_deal[d["name"]] = per_deal.get(d["name"], 0) + 1
-        side = ({"bianca": " (we owe)", "customer": " (they owe)"}.get(r["owner_side"] or "", "")
-                if r["type"] in ("commitment", "next_step") else "")
         event = _event_day(rec, tz)
-        changes.append(brief_v2.ChangeRow(d["name"], d["stage_rank"],
-                                          f"{brief_v2.CHANGE_TYPES[r['type']]}{side}: {brief_v2.first_sentence(r['text'], 140)}",
+        q = " ".join(r["quote"].split()).lower()
+        title_only = q in " ".join((rec["subject"] or "").split()).lower() and q not in " ".join((rec["body"] or "").split()).lower()
+        frm = [x["address"] for x in (rec["participants"] or {}).get("from") or []]
+        spk = (r["source"] if r["source"] != "gmail" else
+               "bianca" if frm and all(domain(a) in internal for a in frm) else "customer")
+        ikind = (brief_v2.item_kind(r["type"], r["due_date"], spk, r["quote"], side_for(r))
+                 if r["type"] in ("commitment", "next_step") and r["owner_side"] == "bianca" else None)
+        _, text = brief_v2.describe_change(r["type"], r["owner_side"], ikind, title_only, r["source"], r["text"],
+                                           rec["subject"], event, spk)
+        changes.append(brief_v2.ChangeRow(d["name"], d["stage_rank"], text,
                                           f"{SOURCE_LABEL.get(r['source'], r['source'])} · {event:%b} {event.day}",
                                           _link_for(r["source"], r["unit_id"], r["meta"]), kind, event))
     seen: set[tuple[str, str]] = set()
