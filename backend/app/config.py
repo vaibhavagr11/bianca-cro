@@ -27,6 +27,16 @@ class Settings(BaseSettings):
     notes_window_days: int = 90
     # Brief recipients override, as a JSON list (e.g. ["a@x.com"]). Empty = team members with receives_brief.
     brief_to: list[str] = []
+    # Brief v2: open items up to this many days late count as "needs you today"; older than the stale limit
+    # they move to "still open? please confirm" (never hidden).
+    brief_today_overdue_days: int = 3
+    brief_stale_overdue_days: int = 14
+    # "What changed": events this many days before the last brief that reached us after it count as recorded late.
+    brief_late_lookback_days: int = 7
+    # A promise due within this many days makes its deal time-critical (it is never displaced from the brief).
+    brief_critical_ahead_days: int = 3
+    # Preferred number of active In Talks deals among the four shown per founder (not a quota).
+    brief_in_talks_target: int = 2
     # Threads classified per /process/classify call.
     classify_batch_threads: int = 10
 
