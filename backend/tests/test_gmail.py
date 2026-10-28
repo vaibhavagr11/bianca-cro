@@ -165,3 +165,26 @@ def test_redacts_bank_details(text, leaked):
 )
 def test_bank_redaction_keeps_business_text(text):
     assert redact_secrets(text) == text
+
+
+# --- multiple inboxes -------------------------------------------------------
+
+from app.gmail import clean, normalize_message_id  # noqa: E402
+
+
+def test_message_id_is_normalized_and_kept():
+    assert normalize_message_id(" <CAF+X@Mail.Gmail.com> ") == "caf+x@mail.gmail.com"
+    assert normalize_message_id(None) is None and normalize_message_id("<>") is None
+    m = clean(msg(id="g1") | {"messageId": "<ABC@x.com>", "threadId": "t1"})
+    assert m.message_id == "abc@x.com"
+
+
+def test_message_id_does_not_change_the_content_hash():  # existing records stay "unchanged" on re-send
+    base = msg(id="g1")
+    assert clean(base).content_hash == clean(base | {"messageId": "<a@b>"}).content_hash
+
+
+def test_gmail_payload_defaults_to_ramiros_inbox():
+    from app.ingest import GmailPayload
+    assert GmailPayload(messages=[]).mailbox == "RG"
+    assert GmailPayload(messages=[], mailbox="NC").mailbox == "NC"

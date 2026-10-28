@@ -82,3 +82,11 @@ def test_render_event_for_classifier():
     text = render_event({"subject": e.subject, "occurred_at": e.starts_at, "participants": e.participants,
                          "body": "Agenda: pricing", "meta": e.meta})
     assert "Acme <> Bianca" in text and "jane@acme.com" in text and "Agenda: pricing" in text
+
+
+def test_hash_ignores_whose_calendar_it_is():
+    from app.google_calendar import clean as clean_event
+    base = {"id": "e1", "summary": "Weekly", "start": {"dateTime": "2026-10-30T14:00:00-03:00"},
+            "attendees": [{"email": "a@bianca-ai.com", "self": True}, {"email": "b@kof.com"}]}
+    other_view = base | {"attendees": [{"email": "a@bianca-ai.com"}, {"email": "b@kof.com", "self": True}]}
+    assert clean_event(base).content_hash == clean_event(other_view).content_hash

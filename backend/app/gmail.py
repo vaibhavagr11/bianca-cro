@@ -60,6 +60,7 @@ class CleanMessage:
     subject: str | None
     participants: dict[str, list[dict[str, str]]]
     body: str
+    message_id: str | None = None   # RFC 5322 Message-ID: identical in every inbox, unlike Gmail's id/threadId
 
     @property
     def content_hash(self) -> str:
@@ -130,6 +131,12 @@ def skip_reason(
     return None
 
 
+def normalize_message_id(value) -> str | None:
+    """'<CAF+x@mail.gmail.com>' -> 'caf+x@mail.gmail.com'; None when missing."""
+    v = str(value or "").strip().strip("<>").strip().lower()
+    return v or None
+
+
 def clean(message: dict) -> CleanMessage:
     body = redact_secrets(strip_quoted(message.get("text") or ""))[:MAX_BODY_CHARS]
     return CleanMessage(
@@ -143,6 +150,7 @@ def clean(message: dict) -> CleanMessage:
             "cc": addresses(message.get("cc")),
         },
         body=body,
+        message_id=normalize_message_id(message.get("messageId")),
     )
 
 

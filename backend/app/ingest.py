@@ -33,6 +33,7 @@ class PipelinePayload(BaseModel):
 
 class GmailPayload(BaseModel):
     messages: list[dict]
+    mailbox: str = "RG"  # whose inbox this batch came from (team owner code)
 
 
 class NotesPayload(BaseModel):
@@ -93,6 +94,74 @@ def ingest_pipeline(payload: PipelinePayload, x_ingest_token: str | None = Heade
     return {"sync_run_id": str(run_id), "received": len(payload.rows), **counts}
 
 
+def store_gmail(conn: psycopg.Connection, workspace_id, kept: list, mailbox: str) -> tuple[int, int, int]:
+    """Store one inbox's messages. (created, updated, duplicates_from_another_inbox).
+
+    Gmail's message id and thread id differ per inbox. The same email already stored from another inbox is matched
+    on its Message-ID (or, for older records without one, on sender + sent time + subject) and not stored twice;
+    this inbox's thread is then linked to the stored thread, so later replies join the same conversation.
+    """
+    created = updated = duplicates = 0
+    for m in sorted(kept, key=lambda m: m.occurred_at or ""):
+        alias = conn.execute(
+            "select canonical_thread_id from gmail_thread_aliases where workspace_id = %s and mailbox = %s"
+            " and thread_id = %s", (workspace_id, mailbox, m.thread_id)).fetchone()
+        thread = alias[0] if alias else m.thread_id
+        mine = conn.execute("select 1 from source_records where workspace_id = %s and source = 'gmail'"
+                            " and external_id = %s", (workspace_id, m.external_id)).fetchone()
+        if mine is None:
+            sender = ((m.participants.get("from") or [{}])[0].get("address") or "").lower()
+            other = conn.execute(
+                "select id, thread_id from source_records where workspace_id = %s and source = 'gmail'"
+                " and external_id <> %s and ((%s::text is not null and meta->>'message_id' = %s)"
+                "  or (occurred_at = %s::timestamptz and lower(participants->'from'->0->>'address') = %s"
+                "      and coalesce(subject, '') = coalesce(%s, '')))"
+                " order by created_at limit 1",
+                (workspace_id, m.external_id, m.message_id, m.message_id, m.occurred_at, sender, m.subject),
+            ).fetchone()
+            if other is not None:
+                conn.execute("update source_records set meta = jsonb_set(meta, '{mailboxes}',"
+                             " (coalesce(meta->'mailboxes', '[\"RG\"]'::jsonb) || to_jsonb(%s::text))) where id = %s"
+                             " and not coalesce(meta->'mailboxes', '[\"RG\"]'::jsonb) ? %s", (mailbox, other[0], mailbox))
+                if other[1] and m.thread_id and other[1] != thread:
+                    link_thread(conn, workspace_id, mailbox, m.thread_id, other[1])
+                duplicates += 1
+                continue
+        meta = {"mailboxes": [mailbox], **({"message_id": m.message_id} if m.message_id else {})}
+        row = conn.execute(
+            "insert into source_records (workspace_id, source, external_id, thread_id, occurred_at,"
+            " subject, participants, body, content_hash, meta)"
+            " values (%s, 'gmail', %s, %s, %s, %s, %s, %s, %s, %s)"
+            " on conflict (workspace_id, source, external_id) do update set"
+            "  thread_id = excluded.thread_id, occurred_at = excluded.occurred_at,"
+            "  subject = excluded.subject, participants = excluded.participants, body = excluded.body,"
+            "  content_hash = excluded.content_hash, meta = source_records.meta || excluded.meta,"
+            "  status = 'pending', classification = null"
+            " where source_records.content_hash <> excluded.content_hash"
+            " returning (xmax = 0) as inserted",
+            (workspace_id, m.external_id, thread, m.occurred_at, m.subject,
+             Jsonb(m.participants), m.body, m.content_hash, Jsonb(meta)),
+        ).fetchone()
+        if row is None:
+            continue  # unchanged
+        if row[0]:
+            created += 1
+        else:
+            updated += 1
+    return created, updated, duplicates
+
+
+def link_thread(conn: psycopg.Connection, workspace_id, mailbox: str, inbox_thread: str, canonical: str) -> None:
+    """Point this inbox's thread at the stored conversation, and move anything already filed under it."""
+    conn.execute("insert into gmail_thread_aliases (workspace_id, mailbox, thread_id, canonical_thread_id)"
+                 " values (%s, %s, %s, %s) on conflict do nothing", (workspace_id, mailbox, inbox_thread, canonical))
+    conn.execute("update source_records set thread_id = %s where workspace_id = %s and source = 'gmail'"
+                 " and thread_id = %s and coalesce(meta->'mailboxes', '[\"RG\"]'::jsonb) ? %s",
+                 (canonical, workspace_id, inbox_thread, mailbox))
+    conn.execute("update insights set unit_id = %s where workspace_id = %s and source = 'gmail' and unit_id = %s",
+                 (canonical, workspace_id, inbox_thread))
+
+
 @router.post("/gmail")
 def ingest_gmail(payload: GmailPayload, x_ingest_token: str | None = Header(default=None)) -> dict:
     """Store filtered, cleaned Gmail messages as pending source_records. Re-sends are idempotent."""
@@ -113,32 +182,14 @@ def ingest_gmail(payload: GmailPayload, x_ingest_token: str | None = Header(defa
             kept, skipped = gmail.process(
                 payload.messages, internal_domains, project_domains, set(settings.excluded_label_ids)
             )
-            created = updated = 0
             with conn.transaction():
-                for m in kept:
-                    row = conn.execute(
-                        "insert into source_records (workspace_id, source, external_id, thread_id, occurred_at,"
-                        " subject, participants, body, content_hash)"
-                        " values (%s, 'gmail', %s, %s, %s, %s, %s, %s, %s)"
-                        " on conflict (workspace_id, source, external_id) do update set"
-                        "  thread_id = excluded.thread_id, occurred_at = excluded.occurred_at,"
-                        "  subject = excluded.subject, participants = excluded.participants, body = excluded.body,"
-                        "  content_hash = excluded.content_hash, status = 'pending', classification = null"
-                        " where source_records.content_hash <> excluded.content_hash"
-                        " returning (xmax = 0) as inserted",
-                        (workspace_id, m.external_id, m.thread_id, m.occurred_at, m.subject,
-                         Jsonb(m.participants), m.body, m.content_hash),
-                    ).fetchone()
-                    if row is None:
-                        continue  # unchanged
-                    if row[0]:
-                        created += 1
-                    else:
-                        updated += 1
+                created, updated, duplicates = store_gmail(conn, workspace_id, kept, payload.mailbox.upper())
+                if duplicates:
+                    skipped["already_stored_from_other_inbox"] = duplicates
                 counts = {
                     "created": created,
                     "updated": updated,
-                    "unchanged": len(kept) - created - updated,
+                    "unchanged": len(kept) - created - updated - duplicates,
                     "skipped": sum(skipped.values()),
                 }
                 conn.execute(

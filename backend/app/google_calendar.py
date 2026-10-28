@@ -29,7 +29,10 @@ class CleanEvent:
 
     @property
     def content_hash(self) -> str:
-        payload = json.dumps([self.subject, self.starts_at, self.participants, self.body, self.meta],
+        # "self" depends on whose calendar we read; leaving it out stops two calendars' copies of one meeting
+        # from overwriting each other (and being re-classified) every day.
+        people = {k: [{f: v for f, v in p.items() if f != "self"} for p in ps] for k, ps in self.participants.items()}
+        payload = json.dumps([self.subject, self.starts_at, people, self.body, self.meta],
                              ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(payload.encode()).hexdigest()
 
