@@ -247,7 +247,7 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None) -> dict
 # ---------------------------------------------------------------- v2 (deal-grouped, owner-checked, stage-aware)
 
 SOURCE_LABEL = {"gmail": "Email", "notes": "Notes", "calendar": "Meeting"}
-NICO_INBOX_CONNECTED = False  # only Ramiro's Gmail/Calendar are ingested today
+NICO_INBOX_CONNECTED = True  # Ramiro's and Nico's Gmail/Calendar are both ingested
 
 
 def _link_for(source: str, unit_id: str | None, meta: dict | None) -> str | None:
@@ -580,7 +580,9 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
     if undated_events:
         backfill = (backfill + " " if backfill else "") + f"{undated_events} without a reliable event date."
 
-    coverage = ("Sources: pipeline Sheet, Ramiro's Gmail and Calendar, meeting notes. Not connected: Nico's inbox "
+    coverage = ("Sources: pipeline Sheet, Ramiro's and Nico's Gmail and Calendar, meeting notes. Not connected: "
+                "WhatsApp, so missing activity is not proof nothing happened." if NICO_INBOX_CONNECTED else
+                "Sources: pipeline Sheet, Ramiro's Gmail and Calendar, meeting notes. Not connected: Nico's inbox "
                 "and calendar, WhatsApp, so missing activity is not proof nothing happened.")
     html_body = brief_v2.render(sections, ndl, changes, today, len(deals), coverage, not NICO_INBOX_CONNECTED,
                                 backfill)
