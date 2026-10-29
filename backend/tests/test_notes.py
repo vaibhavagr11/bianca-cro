@@ -3,7 +3,7 @@ from datetime import date
 import pytest
 
 from app.gmail import REDACTED, redact_secrets
-from app.notes import clean_body, parse_header_date, recent_sections, split_sections
+from app.notes import clean_body, is_meeting_header, parse_header_date, recent_sections, split_sections
 
 TODAY = date(2026, 10, 21)
 GAP = "\n\n\n\n\n"
@@ -88,3 +88,37 @@ def test_clean_body_redacts_passwords():
 @pytest.mark.parametrize("text", ["Esto es clave para el negocio", "Usuario final compra más", "PIN the meeting"])
 def test_password_redaction_ignores_normal_words(text):
     assert redact_secrets(text) == text
+
+
+# Two meetings with only one or two blank lines between them (the doc's real merged cases, made up).
+MERGED = GAP.join([
+    "Gus RG 15-10\n\nCampaña de kioscos\n\n\nGlobex <> Bianca Fri 16 Oct 2026\n-Next steps",
+    "Paolo\n-escribir a todos los de la uni\n\n\nAcme Shower Head, 19 Agosto 2026\nNotes on the pilot",
+    "Tomi, Agus\n-route pictures\n\nVista Wines, 10 de Septiembre de 2026\nPablo\n\n"
+    "Hooli Foods <> Bianca AI Wed 9 Sep 1:05 PM\nJohnny",
+    "Roger 06-10\n-descargable\n\n\nFEMSA 6 Oct 2026\n\n-Estamos matando mayoristas",
+])
+
+
+def test_dated_header_after_a_blank_line_starts_a_new_meeting():
+    headers = [s.header for s in split_sections(MERGED, TODAY)]
+    assert headers == ["Gus RG 15-10", "Globex <> Bianca Fri 16 Oct 2026", "Paolo", "Acme Shower Head, 19 Agosto 2026",
+                       "Tomi, Agus", "Vista Wines, 10 de Septiembre de 2026",
+                       "Hooli Foods <> Bianca AI Wed 9 Sep 1:05 PM", "Roger 06-10", "FEMSA 6 Oct 2026"]
+    acme = next(s for s in split_sections(MERGED, TODAY) if s.header.startswith("Acme"))
+    assert acme.meeting_date == date(2026, 8, 19) and "uni" not in acme.text
+
+
+@pytest.mark.parametrize("line", [
+    "Adding Amazon y otro DTCs (6/7?)", "Re-scans take 2/4 business days", "Semi-activos: 1-2 compras",
+    "A16z (es el evento principal de tech), 6,7,8 de agosto", "Ejemplo fecha 20/08 fue reactivado",
+    "-Circle back 30 de septiembre", "Resumen 9 Sep 2026", "Encompass <> Bianca",
+])
+def test_lines_that_mention_a_date_are_not_meeting_headers(line):
+    assert not is_meeting_header(line, TODAY)
+
+
+def test_existing_doc_splits_the_same():
+    assert [s.header for s in split_sections(DOC, TODAY)] == [
+        "ACME 08-10", "Globex <> Bianca", "Initech <> Bianca Reestructurador 7 oct 2026 11 am", "Umbrella 06-10",
+        "Hooli, 05 October 2026", "Stark, 29 de septiembre de 2026", "Wayne 17/09", "ACME 08-10"]

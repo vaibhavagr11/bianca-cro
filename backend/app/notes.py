@@ -99,10 +99,39 @@ def _looks_like_header(first_line: str, has_date: bool) -> bool:
     return len(line) <= 60 and not line.endswith(":")
 
 
+_SHORT_DATED_HEADER = re.compile(r"[A-ZÁÉÍÓÚ][\w .]{1,20}\s\d{1,2}-\d{1,2}")  # "Gus RG 15-10"
+
+
+def is_meeting_header(line: str, today: date) -> bool:
+    """A dated meeting header that can start a new meeting without the usual run of blank lines before it:
+    'X <> Bianca … <date>', 'Company, 19 Agosto 2026' or 'Name 15-10'. A bullet, a 'Resumen …' line or a
+    sentence that merely mentions a date is not one."""
+    line = line.strip()
+    if (not line or len(line) > 80 or line[0] in "-•*>(·–" or line[0].isdigit()
+            or line.lower().startswith(_CONTINUATION_WORDS) or parse_header_date([line], today) is None):
+        return False
+    words = line.split()
+    return ("<>" in line or bool(_SHORT_DATED_HEADER.fullmatch(line))
+            or (len(words) <= 9 and "(" not in line and any(w.strip(",.").lower() in _MONTHS for w in words)))
+
+
+def _chunks(content: str, today: date) -> list[str]:
+    """Split at runs of blank lines, and also before a dated meeting header that follows a blank line."""
+    out = []
+    for chunk in _SECTION_BREAK.split(content.replace("\r\n", "\n")):
+        lines, start = chunk.split("\n"), 0
+        for i in range(1, len(lines)):
+            if not lines[i - 1].strip() and is_meeting_header(lines[i], today):
+                out.append("\n".join(lines[start:i]))
+                start = i
+        out.append("\n".join(lines[start:]))
+    return out
+
+
 def split_sections(content: str, today: date) -> list[Section]:
     """Doc text -> meetings in doc order (newest first), with dates and stable IDs."""
     sections: list[Section] = []
-    for chunk in _SECTION_BREAK.split(content.replace("\r\n", "\n")):
+    for chunk in _chunks(content, today):
         lines = [ln for ln in chunk.strip().split("\n") if ln.strip()]
         if not lines:
             continue

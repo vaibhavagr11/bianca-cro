@@ -136,7 +136,7 @@ def store_gmail(conn: psycopg.Connection, workspace_id, kept: list, mailbox: str
             "  thread_id = excluded.thread_id, occurred_at = excluded.occurred_at,"
             "  subject = excluded.subject, participants = excluded.participants, body = excluded.body,"
             "  content_hash = excluded.content_hash, meta = source_records.meta || excluded.meta,"
-            "  status = 'pending', classification = null"
+            "  status = 'pending', classification = null, extracted_version = null"
             " where source_records.content_hash <> excluded.content_hash"
             " returning (xmax = 0) as inserted",
             (workspace_id, m.external_id, thread, m.occurred_at, m.subject,
@@ -236,7 +236,7 @@ def ingest_notes(payload: NotesPayload, x_ingest_token: str | None = Header(defa
                         " on conflict (workspace_id, source, external_id) do update set"
                         "  occurred_at = excluded.occurred_at, subject = excluded.subject, body = excluded.body,"
                         "  content_hash = excluded.content_hash, meta = excluded.meta,"
-                        "  status = 'pending', classification = null"
+                        "  status = 'pending', classification = null, extracted_version = null"
                         " where source_records.content_hash <> excluded.content_hash"
                         " returning (xmax = 0) as inserted",
                         (workspace_id, external_id, external_id, s.meeting_date, notes.redact_secrets(s.header)[:200],
@@ -298,7 +298,7 @@ def ingest_calendar(payload: CalendarPayload, x_ingest_token: str | None = Heade
                         "  occurred_at = excluded.occurred_at, subject = excluded.subject,"
                         "  participants = excluded.participants, body = excluded.body,"
                         "  content_hash = excluded.content_hash, meta = excluded.meta,"
-                        "  status = 'pending', classification = null"
+                        "  status = 'pending', classification = null, extracted_version = null"
                         " where source_records.content_hash <> excluded.content_hash"
                         " returning (xmax = 0) as inserted",
                         (workspace_id, e.external_id, e.external_id, e.starts_at, e.subject,

@@ -250,9 +250,9 @@ def extract_insights(payload: ExtractRequest, x_ingest_token: str | None = Heade
             " and company_id::text = any(%s) and status = 'classified' and body is not null"
             " and (classification->>'is_commercial')::bool"
             " group by source, thread_id, company_id"
-            " having bool_or(extracted_version is distinct from %s)"
+            " having bool_or(extracted_version is null or not extracted_version = any(%s))"
             " order by max(occurred_at) desc nulls last limit %s",
-            (workspace_id, list(deals), extractor.EXTRACTOR_VERSION, settings.classify_batch_threads),
+            (workspace_id, list(deals), list(extractor.KEPT_VERSIONS), settings.classify_batch_threads),
         ).fetchall()
 
         counts = {"units": len(units), "insights": 0, "dropped_quotes": 0, "failed": 0}
@@ -303,8 +303,8 @@ def extract_insights(payload: ExtractRequest, x_ingest_token: str | None = Heade
             "select count(*) as n from (select 1 from source_records where workspace_id = %s"
             " and company_id::text = any(%s) and status = 'classified' and body is not null"
             " and (classification->>'is_commercial')::bool group by source, thread_id"
-            " having bool_or(extracted_version is distinct from %s)) u",
-            (workspace_id, list(deals), extractor.EXTRACTOR_VERSION),
+            " having bool_or(extracted_version is null or not extracted_version = any(%s))) u",
+            (workspace_id, list(deals), list(extractor.KEPT_VERSIONS)),
         ).fetchone()["n"]
     log.info("extract run: %s remaining_units=%s", counts, remaining)
     return {**counts, "remaining_units": remaining}
