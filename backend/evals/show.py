@@ -1,6 +1,13 @@
-"""Show the failure-mode checks live: a summary table, or one run with the team's note, each version's output and the
-checks run on the spot.
+"""Show the product and its failure-mode checks live, for class.
 
+Product run (read-only against production):
+    uv run python -m evals.show run-log            what this morning's (or the latest) processing run did, step by step
+    uv run python -m evals.show item [N]           the N most recently processed items: stored -> classified -> linked
+                                                   -> extracted -> quotes re-checked now
+    uv run python -m evals.show brief              build today's brief as a dry run on Render (nothing stored or sent)
+                                                   and open it in the browser
+
+Failure modes:
     uv run python -m evals.show summary
     uv run python -m evals.show run 24 [--only FM2,FM3] [--live] [--no-judge] [--save]
 
@@ -148,9 +155,106 @@ def run(n: int, live: bool, use_judge: bool, only: set[str]) -> list[str]:
     return out
 
 
+# ---------------------------------------------------------------- product run
+
+def run_log() -> None:
+    from app import db
+    with db.connect() as conn:
+        r = conn.execute("select for_date, stage, steps, started_at, finished_at, log from daily_runs"
+                         " order by for_date desc, started_at desc limit 1").fetchone()
+    for_date, stage, steps, started, finished, log = r
+    print(f"Processing run for {for_date}: {stage}, {steps} steps, started {started:%H:%M} UTC"
+          f"{f', finished {finished:%H:%M} UTC' if finished else ''}\n")
+    totals: dict[str, dict] = {}
+    for e in log:
+        t = totals.setdefault(e["stage"], {"calls": 0})
+        t["calls"] += 1
+        for k, v in e.items():
+            if isinstance(v, int) and k not in ("remaining_threads", "remaining_units"):
+                t[k] = t.get(k, 0) + v
+    labels = {"classify": "1. Classify (AI): is it commercial, which company?",
+              "resolve": "2. Link to companies (rules + AI's guess)",
+              "extract": "3. Extract insights (AI), every quote checked against the source",
+              "reconcile": "4. Completion check (AI): which open to-dos look done?",
+              "profile": "5. Refresh deal profiles (AI)"}
+    for stage_key, label in labels.items():
+        t = totals.get(stage_key)
+        if t:
+            detail = ", ".join(f"{k} {v}" for k, v in t.items() if k not in ("calls", "stage"))
+            print(f"{label}\n     {t['calls']} call(s): {detail}")
+
+
+def items(n: int) -> None:
+    from psycopg.rows import dict_row
+
+    from app import db
+    from app.extractor import _squash
+    with db.connect() as conn:
+        conn.row_factory = dict_row
+        units = conn.execute(
+            "select r.source, r.thread_id, max(r.updated_at) as at from source_records r where r.status = 'classified'"
+            " and (r.classification->>'is_commercial')::bool and r.company_id is not null"
+            " group by r.source, r.thread_id order by at desc limit %s", (n,)).fetchall()
+        for u in units:
+            recs = conn.execute(
+                "select r.subject, r.occurred_at, r.created_at, r.participants, r.body, r.classification, r.link_method,"
+                " r.extracted_version, r.meta, c.name as company from source_records r left join companies c"
+                " on c.id = r.company_id where r.source = %s and r.thread_id = %s order by r.occurred_at",
+                (u["source"], u["thread_id"])).fetchall()
+            ins = conn.execute("select type, owner_side, due_date, text, quote, extractor_version from insights"
+                               " where source = %s and unit_id = %s order by occurred_at, id",
+                               (u["source"], u["thread_id"])).fetchall()
+            last, c = recs[-1], recs[-1]["classification"] or {}
+            senders = {a["address"].split("@")[-1] for x in recs for a in (x["participants"] or {}).get("from") or []}
+            boxes = sorted({b for x in recs for b in (x["meta"] or {}).get("mailboxes") or []})
+            print("=" * 100)
+            print(f"{u['source'].upper()} · {(last['subject'] or '(no subject)')[:80]} · {last['occurred_at']:%b %d %H:%M} UTC")
+            print(f"  Stored     {len(recs)} record(s), latest stored {last['created_at']:%b %d %H:%M} UTC"
+                  f"{' · from ' + ', '.join(sorted(senders)) if senders else ''}"
+                  f"{' · inbox ' + '+'.join(boxes) if boxes else ''} · secrets redacted before storage")
+            print(f"  Classified [{c.get('prompt_version')}] {c.get('category')} · company {c.get('company')} · "
+                  f"confidence {c.get('confidence')}")
+            print(f"             why: {EMAIL.sub('<email>', c.get('reason') or '')[:160]}")
+            print(f"  Linked     {last['company']} (by {last['link_method']})")
+            text = _squash("\n".join(x["body"] or "" for x in recs))
+            ok_quotes = sum(1 for i in ins if _squash(i["quote"]) in text)
+            print(f"  Extracted  [{ins[0]['extractor_version'] if ins else last['extracted_version']}] {len(ins)} insight(s);"
+                  f" quotes found verbatim in the source, re-checked now: {ok_quotes}/{len(ins)}")
+            for i in ins:
+                due = f" · due {i['due_date']}" if i["due_date"] else ""
+                print(f"    - {i['type']} · owner {i['owner_side'] or '–'}{due}: {i['text']}")
+                print(f"        “{EMAIL.sub('<email>', i['quote'])[:110]}”")
+
+
+def brief() -> None:
+    import subprocess
+
+    import httpx
+
+    from app.config import settings
+    r = httpx.post("https://bianca-cro-api.onrender.com/brief/build", params={"version": "v2", "dry_run": "true"},
+                   headers={"X-Ingest-Token": settings.ingest_token.get_secret_value()}, timeout=180)
+    r.raise_for_status()
+    d = r.json()
+    out = REVIEW / "demo_runs" / f"brief_{d['for_date']}.html"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(d["html"])
+    print(f"Brief for {d['for_date']} (dry run: nothing stored, nothing sent)\n  Subject: {d['subject']}\n  Saved: {out}")
+    subprocess.run(["open", str(out)], check=False)
+
+
 def main(args: list[str]) -> None:
     if not args or args[0] == "summary":
         summary()
+        return
+    if args[0] == "run-log":
+        run_log()
+        return
+    if args[0] == "item":
+        items(int(args[1]) if len(args) > 1 else 1)
+        return
+    if args[0] == "brief":
+        brief()
         return
     n = int(args[1])
     only = set(args[args.index("--only") + 1].upper().split(",")) if "--only" in args else set()
