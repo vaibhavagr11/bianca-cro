@@ -99,17 +99,14 @@ def load_runs(sheet: Path) -> list[dict]:
     return runs
 
 
-def run_v2(runs: list[dict], conn, workspace_id, team, refresh: bool) -> dict:
-    """Today's pipeline on every input: classify, link by classifier, extract. Cached so judging can be re-run."""
-    cache = json.loads(V2_CACHE.read_text()) if V2_CACHE.exists() and not refresh else {}
+def v2_pipeline(conn, workspace_id, team):
+    """Today's pipeline for one input (redact -> classify -> link by classifier -> extract), as a function."""
     client = claude()
     system_prompt, company_ids = _context(conn, workspace_id)
     names = {k: v[0] for k, v in company_ids.items()}
     team_prompt = extractor.build_system_prompt(team)
-    for r in runs:
-        key = str(r["run"])
-        if key in cache:
-            continue
+
+    def run(r: dict) -> dict:
         text = redact_secrets(r["input"])
         stored = classifier.check(classifier.classify(client, settings.anthropic_model, system_prompt, text,
                                                       r["source"]), text, names)
@@ -121,10 +118,24 @@ def run_v2(runs: list[dict], conn, workspace_id, team, refresh: bool) -> dict:
             if deal:
                 items, _ = extractor.validate(extractor.extract(client, settings.anthropic_model, team_prompt, deal,
                                                                 text), text)
-        cache[key] = {"relevant": bool(stored["is_commercial"]), "category": stored["category"], "company": company,
-                      "items": [{k: i[k] for k in ("type", "text", "quote", "owner_side")} for i in items]}
+        return {"relevant": bool(stored["is_commercial"]), "category": stored["category"], "company": company,
+                "items": [{k: i[k] for k in ("type", "text", "quote", "owner_side")} for i in items],
+                "extractor": extractor.EXTRACTOR_VERSION}
+    return run
+
+
+def run_v2(runs: list[dict], conn, workspace_id, team, refresh: bool) -> dict:
+    """Today's pipeline on every input. Cached so judging can be re-run without re-extracting."""
+    cache = json.loads(V2_CACHE.read_text()) if V2_CACHE.exists() and not refresh else {}
+    pipeline = v2_pipeline(conn, workspace_id, team)
+    for r in runs:
+        key = str(r["run"])
+        if key in cache:
+            continue
+        cache[key] = pipeline(r)
         V2_CACHE.write_text(json.dumps(cache, indent=1, ensure_ascii=False))
-        print(f"  v2 run {key}: {stored['category']}, {company}, {len(items)} insights", flush=True)
+        print(f"  v2 run {key}: {cache[key]['category']}, {cache[key]['company']}, {len(cache[key]['items'])} insights",
+              flush=True)
     return cache
 
 
@@ -480,7 +491,11 @@ def write(res: dict) -> None:
 def main(args: list[str]) -> None:
     sheet = Path(next(a for a in args if not a.startswith("--")))
     runs = load_runs(sheet)
-    res: dict = {"ran_at": timeline.utcnow().isoformat(timespec="minutes"), "sheet": sheet.name}
+    previous = REVIEW / "failure_modes.json"
+    partial = "--skip-judge" in args or "--skip-briefs" in args
+    # A partial re-run keeps the earlier results of the parts it skips.
+    res: dict = json.loads(previous.read_text()) if partial and previous.exists() else {}
+    res.update({"ran_at": timeline.utcnow().isoformat(timespec="minutes"), "sheet": sheet.name})
     with db.connect() as conn:
         workspace_id = _workspace_id(conn)
         conn.row_factory = dict_row
