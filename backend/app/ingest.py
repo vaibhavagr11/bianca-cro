@@ -18,6 +18,7 @@ from app.pipeline import (
     PipelineValidationError,
     SyncPlan,
     SyncRefused,
+    describe_plan,
     parse_rows,
     parse_stage,
     plan_sync,
@@ -52,8 +53,20 @@ def require_token(token: str | None) -> None:
 
 
 @router.post("/pipeline")
-def ingest_pipeline(payload: PipelinePayload, x_ingest_token: str | None = Header(default=None)) -> dict:
+def ingest_pipeline(payload: PipelinePayload, dry_run: bool = False,
+                    x_ingest_token: str | None = Header(default=None)) -> dict:
+    """Sync the pipeline Sheet. dry_run=true reports what would change and writes nothing (not even a sync run)."""
     require_token(x_ingest_token)
+
+    if dry_run:
+        try:
+            rows = parse_rows(payload.rows)
+        except PipelineValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        with db.connect() as conn:
+            existing = _load_existing(conn, _workspace_id(conn))
+        return {"dry_run": True, "received": len(payload.rows),
+                **describe_plan(plan_sync(existing, rows, guard=False), existing, payload.rows)}
 
     with db.connect() as conn:
         workspace_id = _workspace_id(conn)

@@ -115,8 +115,10 @@ class SyncPlan:
     removals: list[ExistingDeal] = field(default_factory=list)
 
 
-def plan_sync(existing: list[ExistingDeal], incoming: list[PipelineRow]) -> SyncPlan:
-    """Compare the stored pipeline with a fresh snapshot. Pure function: no I/O."""
+def plan_sync(existing: list[ExistingDeal], incoming: list[PipelineRow], guard: bool = True) -> SyncPlan:
+    """Compare the stored pipeline with a fresh snapshot. Pure function: no I/O.
+
+    With guard (the default), refuse a snapshot that would remove too many deals."""
     by_key = {deal.normalized_name: deal for deal in existing}
     plan = SyncPlan()
 
@@ -134,6 +136,26 @@ def plan_sync(existing: list[ExistingDeal], incoming: list[PipelineRow]) -> Sync
     plan.removals = [d for d in existing if not d.removed and d.normalized_name not in incoming_keys]
 
     active = sum(1 for d in existing if not d.removed)
-    if active and len(plan.removals) > active * MAX_REMOVAL_SHARE:
+    if guard and active and len(plan.removals) > active * MAX_REMOVAL_SHARE:
         raise SyncRefused(f"would remove {len(plan.removals)} of {active} active deals")
     return plan
+
+
+def describe_plan(plan: SyncPlan, existing: list[ExistingDeal], raw_rows: list[dict]) -> dict:
+    """What a sync would do, for a dry run: columns read, deals created / removed, and every changed field."""
+    headers = sorted({h.strip() for row in raw_rows for h in row})
+    read = {h.strip().lower() for h in headers}
+    active = sum(1 for d in existing if not d.removed)
+    return {
+        "columns_read": [h for h in headers if h.lower() in COLUMN_MAP],
+        "columns_ignored": [h for h in headers if h.lower() not in COLUMN_MAP],
+        "columns_missing": [h for h in COLUMN_MAP if h not in read],
+        "created": [r.company for r in plan.creates],
+        "removed": [d.normalized_name for d in plan.removals],
+        "restored": [r.company for _, r, _, restored in plan.updates if restored],
+        "changes": [{"company": r.company, "field": f, "old": old, "new": new}
+                    for _, r, changes, _ in plan.updates for f, old, new in changes],
+        "changed_deals": len(plan.updates),
+        "unchanged": len(plan.unchanged),
+        "would_be_refused": bool(active and len(plan.removals) > active * MAX_REMOVAL_SHARE),
+    }

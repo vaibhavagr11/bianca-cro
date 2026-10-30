@@ -40,6 +40,7 @@ from app.pipeline import (  # noqa: E402
     ExistingDeal,
     PipelineValidationError,
     SyncRefused,
+    describe_plan,
     parse_rows,
     plan_sync,
 )
@@ -158,3 +159,25 @@ def test_plan_sync_allows_removing_exactly_half():
     rows = parse_rows([sheet_row(n) for n in ["A", "B", "C", "D"]])
     existing = [existing_from(r, f"o{i}") for i, r in enumerate(rows)]
     assert len(plan_sync(existing, rows[:2]).removals) == 2
+
+
+def test_describe_plan_reports_columns_renames_and_changes():
+    old = parse_rows([sheet_row("Acme", stage="2. In Talks"), sheet_row("Globex")])
+    raw = [sheet_row("Acme", stage="3. Proposal", Notas="x"), sheet_row("Globex SA")]
+    for r in raw:
+        r.pop("Primary buyer")
+    existing = [existing_from(r, f"o{i}") for i, r in enumerate(old)]
+    report = describe_plan(plan_sync(existing, parse_rows(raw), guard=False), existing, raw)
+    assert report["columns_missing"] == ["primary buyer"]
+    assert report["columns_ignored"] == ["Notas"]
+    assert report["created"] == ["Globex SA"] and report["removed"] == ["globex"]
+    assert {"company": "Acme", "field": "stage", "old": "2. In Talks", "new": "3. Proposal"} in report["changes"]
+    assert report["changed_deals"] == 1 and report["unchanged"] == 0 and not report["would_be_refused"]
+
+
+def test_dry_run_plan_reports_mass_removal_instead_of_refusing():
+    rows = parse_rows([sheet_row(n) for n in ["A", "B", "C", "D"]])
+    existing = [existing_from(r, f"o{i}") for i, r in enumerate(rows)]
+    raw = [sheet_row("A")]
+    report = describe_plan(plan_sync(existing, rows[:1], guard=False), existing, raw)
+    assert report["would_be_refused"] and len(report["removed"]) == 3
