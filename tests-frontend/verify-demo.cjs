@@ -1,0 +1,181 @@
+'use strict';
+
+// Run with the bundled Node runtime. Exercises the actual pure state engine in index.html.
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+
+const html = fs.readFileSync(path.join(__dirname, '../artifacts/sales-pipeline-updates-demo.html'), 'utf8');
+const match = html.match(/<script\s+id="bianca-core"[^>]*>([\s\S]*?)<\/script>/);
+assert.ok(match, 'The demo must expose its actual pure core script.');
+const context = vm.createContext({});
+vm.runInContext(match[1] + '\n;globalThis.BiancaCore = BiancaCore;', context);
+const core = context.BiancaCore;
+const json = value => JSON.parse(JSON.stringify(value));
+const rowFor = (state, id) => state.rows.find(row => row.id === id);
+const proposalFor = (state, id) => state.proposals.find(proposal => proposal.id === id);
+const at = '2026-11-02T20:30:00.000Z';
+let passed = 0;
+let failed = 0;
+function test(name, run) {
+  try { run(); passed++; process.stdout.write(`PASS ${name}\n`); }
+  catch (error) { failed++; process.stdout.write(`FAIL ${name}\n  ${error.message}\n`); }
+}
+
+test('Fresh workspace has six pending proposals, matching company rows, and valid state', () => {
+  const state = core.initial();
+  assert.equal(state.proposals.length, 6);
+  assert.equal(state.rows.length, 6);
+  assert.ok(state.proposals.every(proposal => proposal.status === 'pending'));
+  assert.deepEqual(state.proposals.map(p => p.id).sort(), state.rows.map(r => r.id).sort());
+  assert.equal(core.valid(state), true);
+});
+
+test('Approval exactly replaces Last progress with previous Next step', () => {
+  const before = core.initial();
+  const id = 'pernod-ricard';
+  const oldRow = rowFor(before, id);
+  const after = core.approve(before, id, proposalFor(before, id).bullets, at);
+  const updated = rowFor(after, id);
+  assert.equal(updated.lastProgress, oldRow.nextStep);
+  assert.notEqual(updated.lastProgress, oldRow.lastProgress);
+  assert.equal(updated.lastProgress.includes(oldRow.lastProgress), false, 'Old Last progress must not be appended.');
+  assert.equal(updated.nextStep, proposalFor(before, id).bullets.map(b => '- ' + b).join('\n'));
+  assert.equal(updated.revision, 1);
+  assert.equal(proposalFor(after, id).status, 'approved');
+  assert.equal(proposalFor(after, id).edited, false);
+});
+
+test('Approval preserves every unrelated row and proposal', () => {
+  const before = core.initial();
+  const id = 'campari';
+  const after = core.approve(before, id, ['Send the agreed field list.'], at);
+  assert.deepEqual(json(after.rows.filter(r => r.id !== id)), json(before.rows.filter(r => r.id !== id)));
+  assert.deepEqual(json(after.proposals.filter(p => p.id !== id)), json(before.proposals.filter(p => p.id !== id)));
+});
+
+test('Approval does not mutate its input workspace', () => {
+  const before = core.initial();
+  const snapshot = JSON.stringify(before);
+  core.approve(before, 'campari', ['A manually approved next step.'], at);
+  assert.equal(JSON.stringify(before), snapshot);
+});
+
+test('Manual edits accept common bullet markers, preserve wording, and write one dash per line', () => {
+  const before = core.initial();
+  const edited = core.parseBullets('  • Confirm the pilot scope.\r\n\r\n* Send the checklist.\n1. Book the kickoff.\n2) Include Tomás and Elaine.  ');
+  assert.deepEqual(json(edited), ['Confirm the pilot scope.', 'Send the checklist.', 'Book the kickoff.', 'Include Tomás and Elaine.']);
+  const after = core.approve(before, 'pernod-ricard', edited, at);
+  assert.equal(rowFor(after, 'pernod-ricard').nextStep, '- Confirm the pilot scope.\n- Send the checklist.\n- Book the kickoff.\n- Include Tomás and Elaine.');
+  assert.equal(proposalFor(after, 'pernod-ricard').edited, true);
+  assert.equal(after.activity[0].edited, true);
+});
+
+test('Edited approval keeps an exact audit snapshot of overwritten and written cells', () => {
+  const before = core.initial();
+  const oldRow = rowFor(before, 'campari');
+  const after = core.approve(before, 'campari', ['Confirm the import date.'], at);
+  assert.deepEqual(json(after.activity[0].before), {lastProgress: oldRow.lastProgress, nextStep: oldRow.nextStep});
+  assert.deepEqual(json(after.activity[0].after), {lastProgress: oldRow.nextStep, nextStep: '- Confirm the import date.'});
+  assert.equal(after.activity[0].at, at);
+});
+
+test('Repeated approval is idempotent and cannot rotate the sheet twice', () => {
+  const initial = core.initial();
+  const once = core.approve(initial, 'campari', ['First approved wording.'], at);
+  const twice = core.approve(once, 'campari', ['Different duplicate wording.'], '2026-11-02T20:31:00.000Z');
+  assert.equal(twice, once);
+  assert.equal(twice.activity.length, 1);
+  assert.equal(rowFor(twice, 'campari').revision, 1);
+  assert.equal(rowFor(twice, 'campari').nextStep, '- First approved wording.');
+});
+
+test('An empty previous Next step replaces Last progress with an empty cell', () => {
+  const initial = core.initial();
+  rowFor(initial, 'koala-eco').nextStep = '';
+  const after = core.approve(initial, 'koala-eco', ['Send the onboarding checklist.'], at);
+  assert.equal(rowFor(after, 'koala-eco').lastProgress, '');
+  assert.equal(after.activity[0].after.lastProgress, '');
+});
+
+test('Blank edits and malformed bullet arrays cannot be approved', () => {
+  const before = core.initial();
+  const snapshot = JSON.stringify(before);
+  for (const bullets of [core.parseBullets(' \n - \n • \n * '), [], [''], ['   '], ['Valid', ' '], [null], 'A string']) {
+    assert.throws(() => core.approve(before, 'campari', bullets, at), /at least one bullet/);
+  }
+  assert.equal(JSON.stringify(before), snapshot);
+});
+
+test('Ignore removes a pending card without changing any sheet cell', () => {
+  const before = core.initial();
+  const after = core.ignore(before, 'farmater', at);
+  assert.deepEqual(json(after.rows), json(before.rows));
+  assert.equal(proposalFor(after, 'farmater').status, 'ignored');
+  assert.equal(after.proposals.filter(p => p.status === 'pending').length, 5);
+  assert.equal(after.activity[0].kind, 'ignored');
+  assert.equal(proposalFor(before, 'farmater').status, 'pending');
+});
+
+test('Repeated ignore is idempotent', () => {
+  const ignored = core.ignore(core.initial(), 'farmater', at);
+  assert.equal(core.ignore(ignored, 'farmater', at), ignored);
+  assert.equal(ignored.activity.length, 1);
+});
+
+test('Undo ignore restores the original card and leaves sheet rows unchanged', () => {
+  const before = core.initial();
+  const ignored = core.ignore(before, 'farmater', at);
+  const restored = core.undoIgnore(ignored, ignored.activity[0].id);
+  assert.deepEqual(json(restored), json(before));
+  assert.equal(core.valid(restored), true);
+});
+
+test('Undo ignore cannot revert an approved company', () => {
+  const before = core.initial();
+  const ignored = core.ignore(before, 'farmater', at);
+  const actionId = ignored.activity[0].id;
+  const restored = core.undoIgnore(ignored, actionId);
+  const approved = core.approve(restored, 'farmater', ['Deliver the guide.'], at);
+  assert.equal(core.undoIgnore(approved, actionId), approved);
+  assert.equal(proposalFor(approved, 'farmater').status, 'approved');
+});
+
+test('Approving an ignored company or ignoring an approved company makes no changes', () => {
+  const ignored = core.ignore(core.initial(), 'farmater', at);
+  assert.equal(core.approve(ignored, 'farmater', ['Unexpected content.'], at), ignored);
+  const approved = core.approve(core.initial(), 'farmater', ['Approved content.'], at);
+  assert.equal(core.ignore(approved, 'farmater', at), approved);
+});
+
+test('Unknown companies cannot be approved or ignored', () => {
+  assert.throws(() => core.approve(core.initial(), 'unknown', ['A bullet.'], at), /Company not found/);
+  assert.throws(() => core.ignore(core.initial(), 'unknown', at), /Company not found/);
+});
+
+test('Normal review transitions and JSON persistence retain valid state', () => {
+  let state = core.initial();
+  state = core.approve(state, 'pernod-ricard', ['Confirm the scope.'], at);
+  state = core.ignore(state, 'farmater', at);
+  assert.equal(core.valid(state), true);
+  assert.equal(core.valid(json(state)), true);
+});
+
+test('State validation rejects wrong schema, missing companies, invalid status, and non-text cells', () => {
+  for (const mutate of [s => {s.schema = 99;}, s => {s.proposals.pop();}, s => {s.rows.pop();}, s => {s.proposals[0].status = 'sent';}, s => {s.rows[0].lastProgress = null;}, s => {s.rows[0].nextStep = 42;}, s => {s.rows[0].revision = 0.5;}]) {
+    const state = core.initial();
+    mutate(state);
+    assert.equal(core.valid(state), false);
+  }
+  assert.equal(Boolean(core.valid(null)), false);
+});
+
+test('State validation rejects malformed saved activity instead of accepting data that crashes rendering', () => {
+  const state = core.initial();
+  state.activity = [null];
+  assert.equal(core.valid(state), false, 'Local-storage state with null activity must not reach render().');
+});
+
+process.stdout.write(`\n${passed} passed; ${failed} failed.\n`);
+process.exitCode = failed ? 1 : 0;
