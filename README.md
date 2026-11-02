@@ -11,6 +11,18 @@ backend/   FastAPI service (Python 3.12, managed with uv)
 
 n8n (Cloud) fetches data from Google and posts it to the backend; all business logic lives in `backend/`.
 
+## Sales Pipeline Updates
+
+The founder review application groups proposed changes by company and supports **Approve**, **Edit → Save & approve**,
+and **Ignore**. Approval replaces `Last progress` with the exact previous `Next step`, then writes the approved bullets
+into `Next step`. Ignore never writes to the Sheet. Owners RG, NC, and NDL are supported.
+
+- [Live interface and approved sample-data preview](artifacts/README.md)
+- [Deployment, Claude Enterprise connector, and n8n setup](docs/gsheet-updates.md)
+
+This feature is disabled by default. It requires migration `012_sheet_review.sql`, a configured Google service account,
+and separate founder review credentials. Committing this code does not connect or modify a production Sheet or Claude account.
+
 ## Run the backend locally
 
 ```bash
