@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     notes_window_days: int = 90
     # Brief recipients override, as a JSON list (e.g. ["a@x.com"]). Empty = team members with receives_brief.
     brief_to: list[str] = []
+    # "Mark as complete" buttons in the brief: links are signed with this secret; without it the buttons are left out.
+    brief_action_secret: SecretStr | None = None
+    public_base_url: str = "https://bianca-cro-api.onrender.com"
     # Brief v2: open items up to this many days late count as "needs you today"; older than the stale limit
     # they move to "still open? please confirm" (never hidden).
     brief_today_overdue_days: int = 3

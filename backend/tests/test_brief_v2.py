@@ -6,7 +6,8 @@ from fastapi.testclient import TestClient
 
 from app.brief import Meeting
 from app.brief_v2 import (
-    ChangeRow, DealView, Item, Note, Unanswered, bucket, build_section, classify_event, deal_status, describe_change,
+    ChangeRow, DealView, Item, Note, Unanswered, bucket, build_section, classify_event, completable, deal_status,
+    describe_change,
     reply_text, first_sentence, has_request,
     is_new_insight, item_kind, norm, primary_move, render, reply_label, resolve_owner, select_changes, subject,
     to_payload,
@@ -410,4 +411,36 @@ def test_buying_signal_written_by_bianca_is_progress_not_customer_intent():  # C
 def test_calendar_change_without_a_link_is_named_not_invented():
     c = ChangeRow("Pernod Ricard", 3, "Meeting on Oct 26: Kick Off proyecto PRA <> Bianca", "Meeting · Oct 26", None)
     html = render([], [], [c], TODAY, 0, "c", False)
-    assert "calendar event" in html and "href" not in html.split("Kick Off proyecto")[1].split("</tr>")[0]
+    row = html.split("Kick Off proyecto")[1].split("</tr>")[0]
+    assert "Meeting · Oct 26" in row and "href" not in row
+
+
+# ---- plain Source column, no evidence links, "Mark as complete" buttons (Nov 2 request)
+
+def _brief_with_rows():
+    owed = item("Campari", "Add On Premise data", due=TODAY + timedelta(days=2), deal_owner="RG", id="c")
+    sit = Note("Waiting on the sell-out file", verified=True, link="https://src/blocker", source="Notes · Oct 20",
+               evidence=frozenset({"x"}))
+    rec = Note("Book a demo with the new buyer", verified=True, link="https://src/rec", source="Email · Oct 22",
+               ref="opp:abc")
+    campari = view("Campari", 4, owner="RG", items=[owed], summary=sit)
+    arca = view("Arca Peru", 2, owner="RG", recommendation=rec, recommendations=[rec],
+                unanswered=Unanswered("Pricing?", 2, "https://mail/t1", True, source="Email · Oct 26", thread_id="t1"))
+    return section("RG", [campari, arca], [owed])
+
+
+def test_source_column_is_plain_text_and_situation_has_no_evidence_link():
+    html = render([_brief_with_rows()], [], [], TODAY, 2, "c", False)
+    assert ">Source<" in html and "Notes · Oct 5" in html and "Email · Oct 26" in html
+    assert "evidence" not in html and "href" not in html  # no links at all without buttons
+
+
+def test_done_buttons_link_each_closable_row_and_skip_the_rest():
+    s = _brief_with_rows()
+    refs = completable([s], [])
+    assert "insight:c" in refs and "thread:t1" in refs and refs["insight:c"][0] == "Campari"
+    html = render([s], [], [], TODAY, 2, "c", False, action_url=lambda ref: f"https://x/done?r={ref}")
+    assert html.count("✓ Done") >= len(refs)
+    assert "https://x/done?r=insight:c" in html and "https://x/done?r=thread:t1" in html
+    no_target = primary_move(view("Quiet Co", 2, owner="RG"), TODAY, set())
+    assert no_target.tag == "Confirm status" and no_target.done is None

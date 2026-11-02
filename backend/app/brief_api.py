@@ -1,5 +1,6 @@
 """POST /brief/build: assemble today's brief from the commercial memory. n8n sends the returned email."""
 
+import hashlib
 import json
 import logging
 from datetime import datetime, time, timedelta
@@ -10,7 +11,7 @@ from fastapi import APIRouter, Header
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from app import brief, brief_v2, db, timeline
+from app import actions, brief, brief_v2, db, timeline
 from app.config import settings
 from app.gmail import domain
 from app.ingest import _workspace_id, require_token
@@ -303,6 +304,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
             if r["created_at"] and (k not in newest_insight or r["created_at"] > newest_insight[k]):
                 newest_insight[k] = r["created_at"]
         ins_by_id = {str(r["id"]): r for r in ins_rows}
+        closed = actions.latest(conn, workspace_id)  # founders' "Mark as complete" clicks: (kind, ref) -> (action, at)
         open_items = [r for r in ins_rows if r["type"] in ("commitment", "next_step") and r["owner_side"] == "bianca"
                       and r["status"] == "open" and str(r["company_id"]) in deals]
         # Who wrote the passage each open item quotes: Bianca, the customer, or the notes doc.
@@ -328,13 +330,18 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
             senders = [p["address"] for p in (t["participants"] or {}).get("from") or []]
             if not (d and senders and all(domain(s) not in internal for s in senders)):
                 continue
+            handled = closed.get(("thread", t["thread_id"]))
+            if handled and handled[0] == "done" and handled[1] >= t["occurred_at"]:
+                continue  # a founder marked it handled after the customer's latest message
             c = brief.unanswered_candidate("x", d["name"], d["stage"], d["owner_code"], t["subject"],
                                            t["occurred_at"], now, timeline.GMAIL_THREAD_URL.format(t["thread_id"]))
             if c:
                 days = max(1, (now - t["occurred_at"]).days)
                 if d["name"] not in unanswered or days < unanswered[d["name"]].days:
+                    sent = t["occurred_at"].astimezone(tz)
                     unanswered[d["name"]] = brief_v2.Unanswered(
-                        t["subject"] or "", days, c.link, brief_v2.has_request(f"{t['subject'] or ''} {t['body'] or ''}"))
+                        t["subject"] or "", days, c.link, brief_v2.has_request(f"{t['subject'] or ''} {t['body'] or ''}"),
+                        source=f"Email · {sent:%b} {sent.day}", thread_id=t["thread_id"])
                     unanswered_src[d["name"]] = (t["thread_id"], t["body"] or "")
 
         start = datetime.combine(today, time.min, tz)
@@ -379,15 +386,22 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
         fresh = prof_row["generated_at"] >= newest_insight.get(str(d["id"]), prof_row["generated_at"])
         verified = bool(refs) and len(resolved) == len(refs) and fresh
         link = _link_for(resolved[0]["source"], resolved[0]["unit_id"], resolved[0]["meta"]) if resolved else None
-        return brief_v2.Note(entry.get("action") or entry.get("text") or "", entry.get("why") if with_why else None,
-                             verified, entry.get("basis"), link if verified else None,
-                             frozenset(str(x["id"]) for x in resolved))
+        text = entry.get("action") or entry.get("text") or ""
+        newest = max(resolved, key=lambda x: x["occurred_at"]) if resolved else None
+        when = (newest["occurred_at"] if newest["source"] == "notes" else newest["occurred_at"].astimezone(tz)) \
+            if newest else None  # notes carry the meeting's calendar date in UTC
+        source = f"{SOURCE_LABEL.get(newest['source'], newest['source'])} · {when:%b} {when.day}" if newest else ""
+        ref = f"{d['id']}:{hashlib.sha1(brief_v2.norm(text).encode()).hexdigest()[:12]}"
+        return brief_v2.Note(text, entry.get("why") if with_why else None, verified, entry.get("basis"),
+                             link if verified else None, frozenset(str(x["id"]) for x in resolved), source, ref)
 
     views: dict[str, brief_v2.DealView] = {}
     for company_id, d in deals.items():
         prow = profiles.get(str(d["id"]))
         prof = prow["profile"] if prow else {}
         blockers, recs_ = prof.get("blockers") or [], prof.get("recommended_actions") or []
+        recs_ = [a for a in recs_ if (n := note(d, a, prow, True)) is None
+                 or closed.get(("rec", n.ref), ("",))[0] != "done"]  # suggestions a founder dismissed
         views[d["name"]] = brief_v2.DealView(
             d["name"], d["stage"], d["stage_rank"], d["owner_code"], last_contact.get(company_id),
             blocker=note(d, blockers[0], prow, False) if blockers else None,
@@ -508,10 +522,11 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
         s.meetings = [(m, preps.get(n, "")) for n, m in enumerate(my_meetings)]
 
     ndl = [brief_v2.TodayRow(i.deal, views[i.deal].stage, "Due now", i.text, f"due {i.due:%b} {i.due.day}", "Nico DL",
-                             i.link, i.id)
+                             i.link, i.id, i.source, f"insight:{i.id}")
            for i in items if i.route == "NDL" and i.kind == "owed" and i.bucket in ("today", "overdue")]
     ndl += [brief_v2.TodayRow(v.deal, v.stage, "Reply needed", f"Customer asked: {v.unanswered.subject}",
-                              f"received {v.unanswered.days}d ago", "Nico DL", v.unanswered.link)
+                              f"received {v.unanswered.days}d ago", "Nico DL", v.unanswered.link, None,
+                              v.unanswered.source, f"thread:{v.unanswered.thread_id}")
             for v in views.values() if v.owner == "NDL" and v.unanswered and brief_v2.reply_label(v.unanswered) == "reply_needed"]
     ndl = ndl[:brief.MAX_NDL]
 
@@ -584,8 +599,10 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
                 "WhatsApp, so missing activity is not proof nothing happened." if NICO_INBOX_CONNECTED else
                 "Sources: pipeline Sheet, Ramiro's Gmail and Calendar, meeting notes. Not connected: Nico's inbox "
                 "and calendar, WhatsApp, so missing activity is not proof nothing happened.")
+    labels = brief_v2.completable(sections, ndl)  # ref -> (deal, text) for each row's "Mark as complete" link
+    action_url = (lambda ref: actions.link(ref, *labels[ref])) if settings.brief_action_secret else None
     html_body = brief_v2.render(sections, ndl, changes, today, len(deals), coverage, not NICO_INBOX_CONNECTED,
-                                backfill)
+                                backfill, action_url)
     text_body = brief_v2.plain_text(sections, today)
     subj = brief_v2.subject(sections, today)
     to = settings.brief_to or [t["email"] for t in team if t["receives_brief"]]

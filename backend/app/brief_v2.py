@@ -65,6 +65,8 @@ class Note:
     basis: str | None = None
     link: str | None = None
     evidence: frozenset = frozenset()  # ids of the insights it cites (resolved)
+    source: str = ""                # newest cited evidence, e.g. "Notes · Oct 20"
+    ref: str | None = None          # stable id of a suggestion, so a founder can dismiss it
 
 
 @dataclass
@@ -74,6 +76,8 @@ class Unanswered:
     link: str | None
     has_request: bool
     action: str | None = None       # what the latest customer message asks of us, if extraction found it
+    source: str = ""                # "Email · Oct 6": the customer's latest message
+    thread_id: str | None = None
 
 
 @dataclass
@@ -101,6 +105,8 @@ class Move:
     when: str                       # deadline or last recorded interaction
     link: str | None
     item_id: str | None = None
+    source: str = ""                # where it comes from and when, e.g. "Email · Oct 6"
+    done: str | None = None         # what "Mark as complete" closes: insight:<id> | thread:<id> | rec:<ref>
 
 
 @dataclass
@@ -113,6 +119,8 @@ class TodayRow:
     owner: str
     link: str | None
     item_id: str | None = None
+    source: str = ""
+    done: str | None = None
 
 
 @dataclass
@@ -240,6 +248,18 @@ def addresses(evidence: frozenset, blocker: Note) -> bool:
     return bool(evidence & blocker.evidence)
 
 
+def item_move(tag: str, text: str, when: str, i: Item) -> Move:
+    return Move(tag, text, when, i.link, i.id, i.source, f"insight:{i.id}")
+
+
+def email_move(tag: str, text: str, when: str, u: Unanswered) -> Move:
+    return Move(tag, text, when, u.link, None, u.source, f"thread:{u.thread_id}" if u.thread_id else None)
+
+
+def note_move(tag: str, text: str, when: str, n: Note, link: str | None) -> Move:
+    return Move(tag, text, when, link, None, n.source, f"rec:{n.ref}" if n.ref else None)
+
+
 def primary_move(d: DealView, today: date, used: set[str]) -> Move:
     """One next move per deal.
 
@@ -255,30 +275,31 @@ def primary_move(d: DealView, today: date, used: set[str]) -> Move:
                         key=lambda i: i.due or date.max):
             tag = "We owe" if i.kind == "owed" else "Customer asked"
             when = f"due {_date(i.due)}" if i.due else f"recorded {_date(i.recorded)}"
-            return Move(tag, i.text, when, i.link, i.id)
+            return item_move(tag, i.text, when, i)
         for r in d.recommendations:
             if r.verified and addresses(r.evidence, b):
-                return Move("AI recommendation", first_sentence(r.text), _last(d, today), r.link)
+                return note_move("AI recommendation", first_sentence(r.text), _last(d, today), r, r.link)
         return Move("Clarify next action", "No recorded action or suggestion addresses this blocker yet",
-                    _last(d, today), b.link)
+                    _last(d, today), b.link, None, b.source)
     for i in sorted((i for i in open_items if i.kind == "owed" and i.bucket in ("overdue", "week")),
                     key=lambda i: i.due or date.max):
         late = (today - i.due).days
-        return Move("We owe", i.text, f"due {_date(i.due)}" + (f", {late}d late" if late > 0 else ""), i.link, i.id)
+        return item_move("We owe", i.text, f"due {_date(i.due)}" + (f", {late}d late" if late > 0 else ""), i)
     for i in sorted((i for i in open_items if i.kind == "customer_request" and i.bucket == "undated"),
                     key=lambda i: -i.recorded.toordinal()):
-        return Move("Customer asked", i.text, f"asked {_date(i.recorded)}", i.link, i.id)
+        return item_move("Customer asked", i.text, f"asked {_date(i.recorded)}", i)
     if d.unanswered and reply_label(d.unanswered) == "follow_up":
-        return Move("Follow up", reply_text(d.unanswered), f"email {d.unanswered.days}d ago", d.unanswered.link)
+        return email_move("Follow up", reply_text(d.unanswered), f"email {d.unanswered.days}d ago", d.unanswered)
     if d.recommendation and d.recommendation.verified:
-        return Move("AI recommendation", first_sentence(d.recommendation.text), _last(d, today), d.recommendation.link)
+        return note_move("AI recommendation", first_sentence(d.recommendation.text), _last(d, today), d.recommendation,
+                         d.recommendation.link)
     for i in sorted((i for i in open_items if i.kind == "proposed"), key=lambda i: -i.recorded.toordinal()):
         age = (today - i.recorded).days
         if PROPOSAL_FOLLOWUP_DAYS[0] <= age <= PROPOSAL_FOLLOWUP_DAYS[1] and (d.last_contact or i.recorded) <= i.recorded:
-            return Move("Follow up", f"No reply since we proposed: {i.text}", f"proposed {_date(i.recorded)}", i.link, i.id)
+            return item_move("Follow up", f"No reply since we proposed: {i.text}", f"proposed {_date(i.recorded)}", i)
     if d.recommendation:
-        return Move("AI recommendation", first_sentence(d.recommendation.text) + " (profile not verified)",
-                    _last(d, today), None)
+        return note_move("AI recommendation", first_sentence(d.recommendation.text) + " (profile not verified)",
+                         _last(d, today), d.recommendation, None)
     return Move("Confirm status", "Check where this deal stands", _last(d, today), None)
 
 
@@ -505,12 +526,14 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
             if i.kind == "owed" and i.bucket == "today":
                 late = (today - i.due).days
                 when = "due tomorrow" if late < 0 else "due today" if late == 0 else f"due {_date(i.due)}, {late}d late"
-                today_rows.append(TodayRow(v.deal, v.stage, "Due now", i.text, when, owner_label(i), i.link, i.id))
+                today_rows.append(TodayRow(v.deal, v.stage, "Due now", i.text, when, owner_label(i), i.link, i.id,
+                                           i.source, f"insight:{i.id}"))
                 used.add(i.id)
         if v.unanswered and reply_label(v.unanswered) == "reply_needed":
-            today_rows.append(TodayRow(v.deal, v.stage, "Reply needed", reply_text(v.unanswered),
-                                       f"received {v.unanswered.days}d ago", display.get(code, code) + " (deal owner)",
-                                       v.unanswered.link))
+            u = v.unanswered
+            today_rows.append(TodayRow(v.deal, v.stage, "Reply needed", reply_text(u), f"received {u.days}d ago",
+                                       display.get(code, code) + " (deal owner)", u.link, None, u.source,
+                                       f"thread:{u.thread_id}" if u.thread_id else None))
     today_rows.sort(key=lambda r: (r.tag != "Due now", r.when))
     in_today = {r.deal for r in today_rows}
 
@@ -553,19 +576,19 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                        key=lambda i: i.due)
         if m.tag != "We owe" and dated:
             i = dated[0]
-            follow.append(Move("We owe", f"{v.deal}: {i.text}", f"due {_date(i.due)}", i.link, i.id))
+            follow.append(item_move("We owe", f"{v.deal}: {i.text}", f"due {_date(i.due)}", i))
     for v in mine.values():
         if v.deal in shown:
             continue
         if v.unanswered and reply_label(v.unanswered) == "follow_up":
-            follow.append(Move("Follow up", f"{v.deal}: {reply_text(v.unanswered)}",
-                               f"email {v.unanswered.days}d ago", v.unanswered.link))
+            follow.append(email_move("Follow up", f"{v.deal}: {reply_text(v.unanswered)}",
+                                     f"email {v.unanswered.days}d ago", v.unanswered))
         for i in v.items:
             if i.id in used:
                 continue
             if (i.kind == "owed" and i.bucket == "overdue") or (i.kind == "customer_request" and i.bucket == "undated"):
-                follow.append(Move("We owe" if i.kind == "owed" else "Customer asked", f"{v.deal}: {i.text}",
-                                   f"due {_date(i.due)}" if i.due else f"recorded {_date(i.recorded)}", i.link, i.id))
+                follow.append(item_move("We owe" if i.kind == "owed" else "Customer asked", f"{v.deal}: {i.text}",
+                                        f"due {_date(i.due)}" if i.due else f"recorded {_date(i.recorded)}", i))
     follow_shown = follow[:MAX_FOLLOWUPS]
     used |= {m.item_id for m in follow_shown if m.item_id}
 
@@ -613,17 +636,29 @@ def _table(head: str, rows: list[str]) -> str:
             f"<tr>{head}</tr>{''.join(rows)}</table>")
 
 
-def _src(link: str | None) -> str:
-    return _link("source", link) if link else _muted("—")
+def _src(source: str | None) -> str:
+    """Where a row comes from and when, as plain text: "Email · Oct 6", "Notes · Sep 28"."""
+    return f'<span style="white-space:nowrap">{_muted(_e(source))}</span>' if source else _muted("—")
 
 
-def render_section(s: Section, today: date, nico_gap: bool) -> str:
+def _done(ref: str | None, action_url) -> str:
+    """The "Mark as complete" button: a link to a confirm page (email can't post forms)."""
+    if not (ref and action_url):
+        return ""
+    return (f'<a href="{_e(action_url(ref))}" style="display:inline-block;padding:2px 7px;border:1px solid #d0d5dd;'
+            f'border-radius:4px;font:12px {FONT};color:#344054;text-decoration:none;white-space:nowrap">✓ Done</a>')
+
+
+def render_section(s: Section, today: date, nico_gap: bool, action_url=None) -> str:
+    done_th = _th("", "9%") if action_url else ""
+    done_td = (lambda ref: _td(_done(ref, action_url))) if action_url else (lambda ref: "")
     out = [f'<p style="margin:24px 0 0;padding:6px 10px;background:#f2f4f7;border-left:3px solid {BLUE};'
            f'font:600 14px {FONT};color:{INK}">{_e(s.name)}</p>']
     out.append(_h("Needs you today", RED, len(s.today)))
-    out.append(_table(_th("Deal", "20%") + _th("What") + _th("When", "15%") + _th("", "8%"),
+    out.append(_table(_th("Deal", "20%") + _th("What") + _th("When", "13%") + _th("Source", "12%") + done_th,
                       ["<tr>" + _td(f"<b>{_e(r.deal)}</b> {_muted(_e(stage_short(r.stage)))}")
-                       + _td(f"{_tag(r.tag)} {_e(first_sentence(r.text))}") + _td(_muted(_e(r.when))) + _td(_src(r.link)) + "</tr>"
+                       + _td(f"{_tag(r.tag)} {_e(first_sentence(r.text))}") + _td(_muted(_e(r.when))) + _td(_src(r.source))
+                       + done_td(r.done) + "</tr>"
                        for r in s.today]) if s.today else _empty("Nothing due now or waiting on your reply."))
 
     out.append(_h("Deals to move · prospects & pilots", PURPLE, len(s.highlights)))
@@ -631,12 +666,12 @@ def render_section(s: Section, today: date, nico_gap: bool) -> str:
         rows = []
         for v, m, sit in s.highlights:
             gap = " · Nico's inbox not connected" if nico_gap and v.owner == "NC" else ""
-            sit_html = (f"{_e(sit.text)} {_link('evidence', sit.link)}" if sit else _muted("—"))
-            rows.append("<tr>" + _td(f"<b>{_e(v.deal)}</b><br>{_muted(_e(stage_short(v.stage)))}", "width:18%")
-                        + _td(sit_html, "width:32%")
+            sit_html = _e(sit.text) if sit else _muted("—")
+            rows.append("<tr>" + _td(f"<b>{_e(v.deal)}</b><br>{_muted(_e(stage_short(v.stage)))}", "width:16%")
+                        + _td(sit_html, "width:30%")
                         + _td(f"{_tag(m.tag)} {_e(first_sentence(m.text))}<br>{_muted(_e(m.when + gap))}")
-                        + _td(_src(m.link), "width:8%") + "</tr>")
-        out.append(_table(_th("Deal") + _th("Situation") + _th("Next move") + _th(""), rows))
+                        + _td(_src(m.source), "width:12%") + done_td(m.done) + "</tr>")
+        out.append(_table(_th("Deal") + _th("Situation") + _th("Next move") + _th("Source") + done_th, rows))
     else:
         out.append(_empty("No active prospect or pilot needs attention."))
     if s.also_active:
@@ -644,9 +679,9 @@ def render_section(s: Section, today: date, nico_gap: bool) -> str:
 
     if s.customers:
         out.append(_h("Customer accounts", AMBER, len(s.customers)))
-        out.append(_table(_th("Account", "20%") + _th("Next move") + _th("", "8%"),
+        out.append(_table(_th("Account", "20%") + _th("Next move") + _th("Source", "12%") + done_th,
                           ["<tr>" + _td(f"<b>{_e(v.deal)}</b>") + _td(f"{_tag(m.tag)} {_e(first_sentence(m.text))} {_muted(_e(m.when))}")
-                           + _td(_src(m.link)) + "</tr>" for v, m in s.customers]))
+                           + _td(_src(m.source)) + done_td(m.done) + "</tr>" for v, m in s.customers]))
 
     out.append(_h("Meetings today & tomorrow", BLUE, len(s.meetings)))
     out.append(meetings_table(s.meetings) if s.meetings else _empty("No customer meetings today or tomorrow."))
@@ -654,7 +689,8 @@ def render_section(s: Section, today: date, nico_gap: bool) -> str:
     if s.followups:
         out.append(_h("Follow-ups that may be needed", AMBER, len(s.followups) + s.more_followups))
         lines = "".join(f'<p style="margin:3px 0;font:13px/1.4 {FONT};color:{INK}">{_tag(m.tag)} {_e(first_sentence(m.text))} '
-                        f'{_muted(_e(m.when))} {_link("source", m.link) if m.link else ""}</p>' for m in s.followups)
+                        f'{_muted(_e(m.when + (" · " + m.source if m.source else "")))} {_done(m.done, action_url)}</p>'
+                        for m in s.followups)
         more = (f'<p style="margin:3px 0;font:12px {FONT};color:{MUTED}">+ {s.more_followups} more on record</p>'
                 if s.more_followups else "")
         out.append(lines + more)
@@ -674,8 +710,8 @@ def render_section(s: Section, today: date, nico_gap: bool) -> str:
         notes.append(f"<b>Backlog:</b> {b.count} older open items, {b.deals} deals{_e(top)}, since {_date(b.oldest)}. "
                      f"Kept on record; may be done outside our sources.")
         for i in b.exceptions:
-            notes.append(f"&nbsp;&nbsp;• Promised to {_e(i.deal)}: {_e(i.text)} {_muted(f'due {_date(i.due)}')} "
-                         f"{_link('source', i.link) if i.link else ''}")
+            notes.append(f"&nbsp;&nbsp;• Promised to {_e(i.deal)}: {_e(i.text)} "
+                         f"{_muted(_e(f'due {_date(i.due)}' + (' · ' + i.source if i.source else '')))}")
     if b.delegated:
         notes.append(f"{b.delegated} item(s) on your deals name someone else (delegated).")
     if s.hidden:
@@ -691,24 +727,42 @@ def change_label(c: ChangeRow) -> str:
     return c.source
 
 
+def completable(sections: list[Section], ndl_rows: list[TodayRow]) -> dict[str, tuple[str, str]]:
+    """Every row that gets a "Mark as complete" button: its target -> (deal, what the row says)."""
+    out: dict[str, tuple[str, str]] = {}
+    for s in sections:
+        rows = [(r.done, r.deal, r.text) for r in s.today]
+        rows += [(m.done, v.deal, m.text) for v, m, _ in s.highlights] + [(m.done, v.deal, m.text) for v, m in s.customers]
+        rows += [(m.done, m.text.split(":", 1)[0], m.text.split(":", 1)[-1].strip()) for m in s.followups]
+        for ref, deal, text in rows:
+            if ref:
+                out.setdefault(ref, (deal, text))
+    for r in ndl_rows:
+        if r.done:
+            out.setdefault(r.done, (r.deal, r.text))
+    return out
+
+
 def render(sections: list[Section], ndl_rows: list[TodayRow], changes: list[ChangeRow], today: date,
-           active_deals: int, coverage: str, nico_gap: bool, backfill: str | None = None) -> str:
+           active_deals: int, coverage: str, nico_gap: bool, backfill: str | None = None, action_url=None) -> str:
+    """action_url(ref) -> link for a row's "Mark as complete" button; None leaves the buttons out."""
     counts = " · ".join(f"{s.short}: {len(s.today)} today, {len(s.highlights)} deals" for s in sections)
     out = [f'<div style="max-width:760px;margin:0 auto;padding:8px 4px">',
            f'<p style="font:600 18px {FONT};margin:0 0 2px;color:{INK}">Pipeline brief · {_e(f"{today:%a}, {today:%b} {today.day}")}</p>',
            f'<p style="font:13px {FONT};margin:0;color:{MUTED}">{_e(counts)} · {active_deals} deals in the Sheet</p>']
-    out += [render_section(s, today, nico_gap) for s in sections]
+    out += [render_section(s, today, nico_gap, action_url) for s in sections]
     if ndl_rows:
         out.append(f'<p style="margin:24px 0 0;padding:6px 10px;background:#f2f4f7;border-left:3px solid {MUTED};'
                    f'font:600 14px {FONT};color:{INK}">Nico de León · urgent only</p>')
-        out.append(_table(_th("Deal", "20%") + _th("What") + _th("When", "15%") + _th("", "8%"),
+        out.append(_table(_th("Deal", "20%") + _th("What") + _th("When", "13%") + _th("Source", "12%")
+                          + (_th("", "9%") if action_url else ""),
                           ["<tr>" + _td(f"<b>{_e(r.deal)}</b>") + _td(f"{_tag(r.tag)} {_e(r.text)}")
-                           + _td(_muted(_e(r.when))) + _td(_src(r.link)) + "</tr>" for r in ndl_rows]))
+                           + _td(_muted(_e(r.when))) + _td(_src(r.source))
+                           + (_td(_done(r.done, action_url)) if action_url else "") + "</tr>" for r in ndl_rows]))
     out.append(_h("What changed since the last brief", MUTED, len(changes)))
-    out.append(_table(_th("Deal", "20%") + _th("What changed (from the source)") + _th("", "8%"),
+    out.append(_table(_th("Deal", "20%") + _th("What changed (from the source)") + _th("Source", "12%"),
                       ["<tr>" + _td(f"<b>{_e(c.deal)}</b>") + _td(f"{_e(first_sentence(c.text, 100))} {_muted(_e(change_label(c)))}")
-                       + _td(_src(c.link) if c.link or not c.source.startswith("Meeting")
-                             else _muted("calendar event")) + "</tr>" for c in changes])
+                       + _td(_src(f"{c.source} · {_date(c.event)}" if c.event else c.source)) + "</tr>" for c in changes])
                 if changes else _empty("No notable changes."))
     if backfill:
         out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">{_e(backfill)}</p>')
