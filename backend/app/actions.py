@@ -77,7 +77,7 @@ def apply(conn, workspace_id, kind: str, ref: str, action: str, actor: str) -> N
                      (Jsonb({"via": "brief", "by": actor, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}),
                       workspace_id, ref))
     else:
-        conn.execute("update insights set status = 'open', completion = completion - 'via' - 'by' - 'at'"
+        conn.execute("update insights set status = 'open', completion = nullif(completion - 'via' - 'by' - 'at', '{}'::jsonb)"
                      " where workspace_id = %s and id::text = %s and status = 'done' and completion->>'via' = 'brief'",
                      (workspace_id, ref))
 
