@@ -43,5 +43,14 @@ class Settings(BaseSettings):
     # Threads classified per /process/classify call.
     classify_batch_threads: int = 10
 
+    # Founder review is opt-in and uses separate credentials from ingestion.
+    review_enabled: bool = False
+    review_tokens: dict[str, SecretStr] = {}
+    review_allowed_origins: list[str] = ["https://claude.ai"]
+    review_spreadsheet_id: str | None = None
+    review_sheet_tab: str = "Pipeline"
+    review_google_service_account_json: SecretStr | None = None
+    review_build_batch: int = 20
+
 
 settings = Settings()
