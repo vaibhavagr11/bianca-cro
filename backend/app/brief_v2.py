@@ -620,6 +620,50 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
 TAG_COLOR = {"Due now": RED, "Reply needed": BLUE, "We owe": INK, "Customer asked": BLUE,
              "AI recommendation": PURPLE, "Follow up": AMBER, "Confirm status": MUTED, "Clarify next action": AMBER}
 
+# sRGB background/foreground pairs sampled from the pipeline Sheet. Each pair has at least 4.5:1 contrast.
+STAGE_BADGES = {
+    "paused": ("Paused", "#ffcfc8", "#b10202"),
+    "opening": ("Opening", "#bfe1f6", "#0953a8"),
+    "in talks": ("In Talks", "#ffe59f", "#473821"),
+    "proposal": ("Proposal", "#e6cff3", "#5b3286"),
+    "pilot": ("Pilot", "#d4edbb", "#13734b"),
+    "working client": ("Working Client", "#13734b", "#d4edbb"),
+}
+UNKNOWN_STAGE_COLORS = ("#e5e7eb", "#344054")
+
+
+def _stage_badge(stage: str | None) -> str:
+    label = " ".join(stage_short((stage or "").strip()).split())
+    key = label.casefold()
+    label, background, foreground = STAGE_BADGES.get(key, (label, *UNKNOWN_STAGE_COLORS))
+    suffix = key.replace(" ", "-") if key in STAGE_BADGES else "unknown"
+    return (f'<span class="deal-stage deal-stage--{suffix}" style="display:inline-block;margin-top:4px;'
+            f'padding:2px 6px;border-radius:4px;background-color:{background};color:{foreground};'
+            f'font:600 12px/1.4 {FONT};white-space:nowrap">{_e(label)}</span>')
+
+
+def _deal_cell(company: str, stage: str | None) -> str:
+    return f"<b>{_e(company)}</b><br>{_stage_badge(stage)}"
+
+
+def _stage_css() -> str:
+    """Keep both badge colors together in clients supporting dark CSS; inline styles are the fallback.
+
+    The sender accepts an HTML fragment, so do not opt the rest of the email into dark mode with head metadata.
+    Clients that force their own color changes still need inbox checks.
+    """
+    colors = [(key.replace(" ", "-"), background, foreground) for key, (_, background, foreground) in STAGE_BADGES.items()]
+    colors.append(("unknown", *UNKNOWN_STAGE_COLORS))
+
+    def rule(selector: str, background: str, foreground: str) -> str:
+        return f"{selector}{{background-color:{background}!important;color:{foreground}!important}}"
+
+    dark = "".join(rule(f".bianca-brief .deal-stage--{key}", background, foreground)
+                   for key, background, foreground in colors)
+    outlook = "".join(rule(f"[data-ogsc] .bianca-brief .deal-stage--{key},[data-ogsb] .bianca-brief .deal-stage--{key}",
+                           background, foreground) for key, background, foreground in colors)
+    return f"<style>@media (prefers-color-scheme:dark){{{dark}}}{outlook}</style>"
+
 
 def _tag(text: str) -> str:
     c = TAG_COLOR.get(text, MUTED)
@@ -656,7 +700,7 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None) -> 
            f'font:600 14px {FONT};color:{INK}">{_e(s.name)}</p>']
     out.append(_h("Needs you today", RED, len(s.today)))
     out.append(_table(_th("Deal", "20%") + _th("What") + _th("When", "13%") + _th("Source", "12%") + done_th,
-                      ["<tr>" + _td(f"<b>{_e(r.deal)}</b> {_muted(_e(stage_short(r.stage)))}")
+                      ["<tr>" + _td(_deal_cell(r.deal, r.stage))
                        + _td(f"{_tag(r.tag)} {_e(first_sentence(r.text))}") + _td(_muted(_e(r.when))) + _td(_src(r.source))
                        + done_td(r.done) + "</tr>"
                        for r in s.today]) if s.today else _empty("Nothing due now or waiting on your reply."))
@@ -667,7 +711,7 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None) -> 
         for v, m, sit in s.highlights:
             gap = " · Nico's inbox not connected" if nico_gap and v.owner == "NC" else ""
             sit_html = _e(sit.text) if sit else _muted("—")
-            rows.append("<tr>" + _td(f"<b>{_e(v.deal)}</b><br>{_muted(_e(stage_short(v.stage)))}", "width:16%")
+            rows.append("<tr>" + _td(_deal_cell(v.deal, v.stage), "width:16%")
                         + _td(sit_html, "width:30%")
                         + _td(f"{_tag(m.tag)} {_e(first_sentence(m.text))}<br>{_muted(_e(m.when + gap))}")
                         + _td(_src(m.source), "width:12%") + done_td(m.done) + "</tr>")
@@ -680,7 +724,7 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None) -> 
     if s.customers:
         out.append(_h("Customer accounts", AMBER, len(s.customers)))
         out.append(_table(_th("Account", "20%") + _th("Next move") + _th("Source", "12%") + done_th,
-                          ["<tr>" + _td(f"<b>{_e(v.deal)}</b>") + _td(f"{_tag(m.tag)} {_e(first_sentence(m.text))} {_muted(_e(m.when))}")
+                          ["<tr>" + _td(_deal_cell(v.deal, v.stage)) + _td(f"{_tag(m.tag)} {_e(first_sentence(m.text))} {_muted(_e(m.when))}")
                            + _td(_src(m.source)) + done_td(m.done) + "</tr>" for v, m in s.customers]))
 
     out.append(_h("Meetings today & tomorrow", BLUE, len(s.meetings)))
@@ -747,7 +791,7 @@ def render(sections: list[Section], ndl_rows: list[TodayRow], changes: list[Chan
            active_deals: int, coverage: str, nico_gap: bool, backfill: str | None = None, action_url=None) -> str:
     """action_url(ref) -> link for a row's "Mark as complete" button; None leaves the buttons out."""
     counts = " · ".join(f"{s.short}: {len(s.today)} today, {len(s.highlights)} deals" for s in sections)
-    out = [f'<div style="max-width:760px;margin:0 auto;padding:8px 4px">',
+    out = [_stage_css(), f'<div class="bianca-brief" style="max-width:760px;margin:0 auto;padding:8px 4px">',
            f'<p style="font:600 18px {FONT};margin:0 0 2px;color:{INK}">Pipeline brief · {_e(f"{today:%a}, {today:%b} {today.day}")}</p>',
            f'<p style="font:13px {FONT};margin:0;color:{MUTED}">{_e(counts)} · {active_deals} deals in the Sheet</p>']
     out += [render_section(s, today, nico_gap, action_url) for s in sections]
@@ -756,7 +800,7 @@ def render(sections: list[Section], ndl_rows: list[TodayRow], changes: list[Chan
                    f'font:600 14px {FONT};color:{INK}">Nico de León · urgent only</p>')
         out.append(_table(_th("Deal", "20%") + _th("What") + _th("When", "13%") + _th("Source", "12%")
                           + (_th("", "9%") if action_url else ""),
-                          ["<tr>" + _td(f"<b>{_e(r.deal)}</b>") + _td(f"{_tag(r.tag)} {_e(r.text)}")
+                          ["<tr>" + _td(_deal_cell(r.deal, r.stage)) + _td(f"{_tag(r.tag)} {_e(r.text)}")
                            + _td(_muted(_e(r.when))) + _td(_src(r.source))
                            + (_td(_done(r.done, action_url)) if action_url else "") + "</tr>" for r in ndl_rows]))
     out.append(_h("What changed since the last brief", MUTED, len(changes)))
