@@ -1,6 +1,8 @@
 'use strict';
+// Exercise source date labels west of UTC so date-only values cannot shift a day.
+process.env.TZ='America/Chicago';
 
-// Run with the bundled Node runtime. Exercises the actual pure state engine in index.html.
+// Run with the bundled Node runtime. Exercises the demo state engine and rendered company cards.
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -175,6 +177,82 @@ test('State validation rejects malformed saved activity instead of accepting dat
   const state = core.initial();
   state.activity = [null];
   assert.equal(core.valid(state), false, 'Local-storage state with null activity must not reach render().');
+});
+
+function fakePage(savedState){
+  class Element {
+    constructor(){this.textContent='';this.innerHTML='';this.value='';this.hidden=false;this.disabled=false;this.handlers={};}
+    addEventListener(name,handler){this.handlers[name]=handler;}
+    close(){this.open=false;}showModal(){this.open=true;}focus(){}removeAttribute(){}setAttribute(){}replaceChildren(){this.innerHTML='';}
+    querySelectorAll(){return [];}querySelector(){return new Element();}
+  }
+  const elements=new Map(),events={},storage=new Map();
+  if(savedState)storage.set('bianca.pipeline-review.demo.v1',JSON.stringify(savedState));
+  const get=selector=>{if(!elements.has(selector))elements.set(selector,new Element());return elements.get(selector);};
+  get('#owner-filter').value='all';
+  const page=vm.createContext({
+    document:{querySelector:get,querySelectorAll:()=>[],addEventListener:(name,handler)=>{events[name]=handler;}},
+    window:{addEventListener:(name,handler)=>{events['window:'+name]=handler;},scrollTo:()=>{}},
+    localStorage:{getItem:key=>storage.get(key)||null,setItem:(key,value)=>storage.set(key,value)},
+    setTimeout:()=>0,clearTimeout:()=>{}
+  });
+  for(const script of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g))vm.runInContext(script[1],page);
+  return {get,events};
+}
+
+test('Demo navigation and actions contain no Sheet preview or bottom rotation hint',()=>{
+  for(const text of ['sheet-tab','sheet-panel','sheet-rows','Current Next step → Last progress','Approved bullets → Next step'])assert.equal(html.includes(text),false,text);
+  assert.equal(/Sheet preview/i.test(html),false);
+  const page=fakePage();
+  assert.equal(page.get('#pending-count').textContent,6);
+  assert.ok(page.get('#review-list').innerHTML.includes('data-action="approve"'));
+  assert.ok(page.get('#review-list').innerHTML.includes('data-action="edit"'));
+  assert.ok(page.get('#review-list').innerHTML.includes('data-action="ignore"'));
+});
+
+test('Demo sources show every type and date without rendering sample quotes',()=>{
+  const state=core.initial();
+  state.proposals[0].sources=[
+    {type:'Meeting notes',date:'2026-09-28',quote:'Hidden notes quotation.'},
+    {type:'Email',date:'2026-10-06',quote:'Hidden email quotation.'},
+    {type:'Calendar',date:'2026-10-07',quote:'Hidden calendar quotation.'}
+  ];
+  const page=fakePage(state),card=page.get('#review-list').innerHTML;
+  for(const label of ['Notes · Sep 28','Email · Oct 6','Calendar · Oct 7'])assert.ok(card.includes(label),label);
+  for(const source of state.proposals[0].sources)assert.equal(card.includes(source.quote),false);
+  assert.equal(card.includes('View source context'),false);
+});
+
+test('Demo Current Next steps reads the current row with escaped multiline text',()=>{
+  const state=core.initial(),id='pernod-ricard';
+  proposalFor(state,id).nextStep='Outdated proposal context';
+  rowFor(state,id).nextStep='- Current action & details.\n- <img src=x> Follow up.';
+  const card=fakePage(state).get('#review-list').innerHTML;
+  const details=card.match(/<details[^>]*class="current-next-steps"[^>]*>([\s\S]*?)<\/details>/);
+  assert.ok(details,'Current Next steps uses native details.');
+  assert.equal(/\sopen(?:[\s=>])/.test(details[0].slice(0,details[0].indexOf('>'))),false);
+  assert.ok(details[1].includes('<summary>Current Next steps</summary>'));
+  assert.ok(details[1].includes('- Current action &amp; details.\n- &lt;img src=x&gt; Follow up.'));
+  assert.equal(card.includes('Outdated proposal context'),false);
+  assert.equal(card.includes('<img src=x>'),false);
+  assert.ok(/\.current-next-steps-content\{[^}]*white-space:pre-wrap/.test(html));
+});
+
+test('Demo retains the expanded context through filters and closes it when the workspace is reset',()=>{
+  const page=fakePage();
+  page.events.toggle({target:{open:true,matches:()=>true,closest:()=>({dataset:{id:'pernod-ricard'}})}});
+  page.get('#company-search').handlers.input();
+  assert.ok(/<details[^>]*class="current-next-steps"[^>]* open>/.test(page.get('#review-list').innerHTML));
+  page.get('#confirm-reset').onclick();
+  assert.equal(/<details[^>]*class="current-next-steps"[^>]* open>/.test(page.get('#review-list').innerHTML),false);
+});
+
+test('Demo current row with no Next steps shows a clear empty state',()=>{
+  const state=core.initial(),id='pernod-ricard';
+  proposalFor(state,id).nextStep='Older context must not return';rowFor(state,id).nextStep='';
+  const card=fakePage(state).get('#review-list').innerHTML;
+  assert.ok(card.includes('No Next steps are currently noted.'));
+  assert.equal(card.includes('Older context must not return'),false);
 });
 
 process.stdout.write(`\n${passed} passed; ${failed} failed.\n`);

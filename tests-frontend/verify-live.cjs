@@ -1,4 +1,6 @@
 'use strict';
+// Exercise source date labels west of UTC so date-only values cannot shift a day.
+process.env.TZ='America/Chicago';
 const fs=require('node:fs');
 const path=require('node:path');
 const vm=require('node:vm');
@@ -26,6 +28,15 @@ test('Live page starts without sample company data, browser storage, or hardcode
   assert.ok(html.includes('<option value="NDL">Nico · NDL</option>'));
   assert.ok(html.includes('id="pending-count">0'));
   for(const match of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g))new Function(match[1]);
+});
+
+test('Navigation and cards omit the Sheet preview and rotation hint',()=>{
+  assert.equal(/Sheet preview/i.test(html),false);
+  assert.equal(html.includes('sheet-tab'),false);
+  assert.equal(html.includes('sheet-panel'),false);
+  assert.equal(html.includes('sheet-rows'),false);
+  assert.equal(html.includes('Current Next step → Last progress'),false);
+  assert.equal(html.includes('Approved bullets → Next step'),false);
 });
 
 test('MCP structured and text tool envelopes return the actual workspace',()=>{
@@ -195,6 +206,80 @@ test('The actual live UI starts empty and explains missing connector access',()=
   assert.equal(page.get('#sign-in-form').hidden,true);
 });
 
+test('Company cards display source types and dates without source quotes',async()=>{
+  const s=snapshot();
+  s.proposals[0].sources=[
+    {type:'Meeting notes',date:'2026-09-28',quote:'Hidden notes quotation.'},
+    {type:'Email',date:'2026-10-06',quote:'Hidden email quotation.'},
+    {type:'Calendar',date:'2026-10-07',quote:'Hidden calendar quotation.'},
+    {type:'Email',date:'',quote:'Hidden undated quotation.'},
+    {type:'<img src=x>',date:'<script>',quote:'Hidden malicious quotation.'}
+  ];
+  const page=fakePage({callTool:async()=>({structuredContent:s})});
+  await new Promise(resolve=>setImmediate(resolve));
+  const card=page.get('#review-list').innerHTML;
+  for(const label of ['Notes · Sep 28','Email · Oct 6','Calendar · Oct 7','Email · Undated'])assert.ok(card.includes(label),label);
+  for(const source of s.proposals[0].sources)assert.equal(card.includes(source.quote),false);
+  assert.equal(card.includes('View source context'),false);
+  assert.equal(card.includes('<img src=x>'),false);
+  assert.equal(card.includes('<script>'),false);
+});
+
+test('Current Next steps is a collapsed native dropdown using the latest matching company row',async()=>{
+  const s=snapshot();
+  s.proposals[0].nextStep='Outdated proposal context';
+  s.rows.unshift({...s.rows[0],id:'unrelated',company:'Another company',nextStep:'Another company context'});
+  s.rows[1].nextStep='- Current action & details.\n- <img src=x> Follow up.';
+  const page=fakePage({callTool:async()=>({structuredContent:s})});
+  await new Promise(resolve=>setImmediate(resolve));
+  const card=page.get('#review-list').innerHTML;
+  const details=card.match(/<details[^>]*class="current-next-steps"[^>]*>([\s\S]*?)<\/details>/);
+  assert.ok(details,'Current Next steps uses a native details element.');
+  assert.equal(/\sopen(?:[\s=>])/.test(details[0].slice(0,details[0].indexOf('>'))),false);
+  assert.ok(details[1].includes('<summary>Current Next steps</summary>'));
+  assert.ok(details[1].includes('- Current action &amp; details.\n- &lt;img src=x&gt; Follow up.'));
+  assert.equal(card.includes('Outdated proposal context'),false);
+  assert.equal(card.includes('Another company context'),false);
+  assert.equal(card.includes('<img src=x>'),false);
+  assert.ok(/\.current-next-steps-content\{[^}]*white-space:pre-wrap/.test(html),'Current cell line breaks are preserved.');
+});
+
+test('An expanded Current Next steps dropdown survives a card rerender and remains read-only',async()=>{
+  let calls=0;
+  const page=fakePage({callTool:async()=>{calls++;return {structuredContent:snapshot()};}});
+  await new Promise(resolve=>setImmediate(resolve));
+  const details={open:true,matches:selector=>selector==='[data-current-next-steps]',closest:()=>({dataset:{id:'p-1'}})};
+  page.events.toggle({target:details});page.get('#company-search').handlers.input();
+  assert.ok(/<details[^>]*class="current-next-steps"[^>]* open>/.test(page.get('#review-list').innerHTML));
+  details.open=false;page.events.toggle({target:details});page.get('#company-search').handlers.input();
+  assert.equal(/<details[^>]*class="current-next-steps"[^>]* open>/.test(page.get('#review-list').innerHTML),false);
+  assert.equal(calls,1,'Opening context must not send an approval or alter Sheet data.');
+});
+
+test('An empty current row remains empty and does not revive an older proposal Next step',async()=>{
+  const s=snapshot();s.proposals[0].nextStep='Older proposed context';s.rows[0].nextStep='';
+  const page=fakePage({callTool:async()=>({structuredContent:s})});
+  await new Promise(resolve=>setImmediate(resolve));
+  const card=page.get('#review-list').innerHTML;
+  assert.ok(card.includes('No Next steps are currently noted.'));
+  assert.equal(card.includes('Older proposed context'),false);
+});
+
+test('Edit context matches the dropdown current row, including an empty current cell',async()=>{
+  for(const current of ['- Current action & context.\n- Confirm <scope>.','']){
+    const s=snapshot();s.proposals[0].nextStep='Older proposal baseline';s.rows[0].nextStep=current;
+    s.rows.unshift({...s.rows[0],id:'unrelated',company:'Another company',nextStep:'Unrelated context'});
+    const page=fakePage({callTool:async()=>({structuredContent:s})});
+    await new Promise(resolve=>setImmediate(resolve));
+    const article={dataset:{id:'p-1'}},button={dataset:{action:'edit'},closest:()=>article};
+    page.events.click({target:{closest:()=>button}});
+    assert.equal(page.get('#edit-dialog').open,true);
+    assert.equal(page.get('#previous-next-step').textContent,current||'(empty cell)');
+    assert.equal(page.get('#edit-content').value,'- Confirm the scope.','The editor still edits proposed bullets, while the context reflects the current row.');
+    assert.equal(page.get('#review-list').innerHTML.includes('Older proposal baseline'),false);
+  }
+});
+
 test('The hosted page offers in-memory sign-in without calling the service before sign-in',()=>{
   const page=fakePage(undefined,'/review/app');
   assert.equal(page.get('#sign-in-form').hidden,false);
@@ -239,7 +324,8 @@ test('An approval with a stale mirror shows a persistent full-sync notice until 
   assert.equal(page.get('#mirror-sync-notice').hidden,false);
   assert.ok(page.get('#mirror-sync-notice').textContent.includes('pipeline snapshot needs a full sync'));
   assert.ok(page.get('#toast-region').innerHTML.includes('Google Sheet updated. Pipeline snapshot needs a full sync.'));
-  assert.equal(page.get('#sheet-rows').innerHTML.includes('Old progress'),true,'The UI must not fabricate a refreshed cache.');
+  assert.equal(page.get('#pending-count').textContent,0,'A confirmed decision removes its card even when the pipeline mirror needs a sync.');
+  assert.ok(page.get('#activity-list').innerHTML.includes('Confirm the scope.'),'Confirmed approval remains visible in the decision history.');
   await page.get('#refresh-updates').onclick();
   assert.equal(page.get('#mirror-sync-notice').hidden,true);
 });
