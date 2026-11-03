@@ -11,7 +11,7 @@ Both use the approved blue/navy design, the title **Sales Pipeline Updates**, an
 
 Open `/review/app` on the Bianca backend. Enter your assigned reviewer access token in the connection panel. It is held only in this page's memory, is sent in the Authorization header, and is cleared on disconnect or page exit. The live page does not put credentials or company data in localStorage, sessionStorage, a URL, or the HTML source. The page requests only fixed, same-origin `/review/...` routes.
 
-The Pipeline snapshot is the backend's last known view. Approval re-reads the actual Google Sheet before writing; a snapshot is not a promise that no collaborator has edited the sheet since.
+Each card's **Current Next steps** dropdown shows the company's Next step from the backend's latest synced Pipeline row, falling back to the proposal snapshot if that row is unavailable. It preserves the cell's wording and line breaks and shows an explicit empty state. Approval re-reads the actual Google Sheet before writing; synced context may lag a collaborator's latest edit.
 
 ## Claude Enterprise artifact
 
@@ -46,6 +46,9 @@ The artifact should never make a direct request to an external Render endpoint: 
 
 ## Review behavior
 
+- The two views are **To review** and **Activity**. Sheet context is available inside each card rather than a separate Sheet preview tab.
+- Sources appear as type-and-date labels, such as **Notes · Sep 28**, **Email · Oct 6**, and **Calendar · Oct 8**. Source quotations are not displayed.
+- Expand **Current Next steps** on any company card to read its existing Sheet context before reviewing the proposed bullets.
 - Approve sends the displayed company proposal and its expected revision to the server. The card disappears only after a confirmed server decision and a refreshed shared workspace.
 - Edit opens the bullet editor and shows the exact previous Next step. **Save & approve** submits the edited bullets.
 - Ignore records a shared dismissal without writing the sheet. Undo is available in the demo only.

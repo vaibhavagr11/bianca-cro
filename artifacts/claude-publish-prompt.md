@@ -4,6 +4,8 @@ Use this prompt in the actual account after the hosted backend and Bianca Review
 
 > Publish the attached HTML as a private, connector-backed artifact titled **Sales Pipeline Updates** for the Bianca founders. Preserve its approved layout, blue/navy styling, owner options RG / NC / NDL, company cards, bullet editing, and Approve / Edit / Ignore actions.
 >
+> Keep only the **To review** and **Activity** tabs. Show each source as its type and date (for example, **Notes · Sep 28** or **Email · Oct 6**) without quotations. Preserve the **Current Next steps** dropdown on every company card, including multiline cell contents and the empty state. Do not add a Sheet preview tab or the removed cell-movement footer text.
+>
 > Use the **Bianca Review** connector. Discover and validate its real tool names before publishing: `bianca_review_workspace`, `bianca_approve_update`, and `bianca_ignore_update`. Declare these connector capabilities in the artifact. Use only the viewing user's authorized connection.
 >
 > The HTML expects `window.biancaConnector.callTool(name, args)`. Implement that small adapter using the actual native artifact connector API available in this Claude account; do not invent an API signature. Install it before the page scripts initialize, or dispatch `bianca:connector-ready` afterward. Return plain JSON or standard MCP tool-result envelopes. Return failed operations as `isError: true` and include a safe `detail` string and HTTP-style numeric `status`.
