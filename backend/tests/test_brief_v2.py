@@ -1,13 +1,16 @@
 """Regression tests for brief v2. Each mirrors a failure seen in the Oct 28 briefs (v1, then the first v2 draft)."""
 
+import re
 from datetime import date, datetime, timedelta, timezone
+from html.parser import HTMLParser
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.brief import Meeting
 from app.brief_v2 import (
-    ChangeRow, DealView, Item, Note, Unanswered, bucket, build_section, classify_event, completable, deal_status,
-    describe_change,
+    ChangeRow, DealView, Item, Note, TodayRow, Unanswered, _stage_badge, bucket, build_section, classify_event, completable,
+    deal_status, describe_change,
     reply_text, first_sentence, has_request,
     is_new_insight, item_kind, norm, primary_move, render, reply_label, resolve_owner, select_changes, subject,
     to_payload,
@@ -413,6 +416,89 @@ def test_calendar_change_without_a_link_is_named_not_invented():
     html = render([], [], [c], TODAY, 0, "c", False)
     row = html.split("Kick Off proyecto")[1].split("</tr>")[0]
     assert "Meeting · Oct 26" in row and "href" not in row
+
+
+# ---- Sheet status highlights (Nov 3 request)
+
+class _BadgeParser(HTMLParser):
+    def __init__(self, html):
+        super().__init__()
+        self.spans = []
+        self.label = ""
+        self.feed(html)
+
+    def handle_starttag(self, tag, attrs):
+        assert tag == "span"
+        self.spans.append(dict(attrs))
+
+    def handle_data(self, data):
+        self.label += data
+
+
+BADGE_PALETTE = [
+    ("Paused", "#ffcfc8", "#b10202"),
+    ("Opening", "#bfe1f6", "#0953a8"),
+    ("In Talks", "#ffe59f", "#473821"),
+    ("Proposal", "#e6cff3", "#5b3286"),
+    ("Pilot", "#d4edbb", "#13734b"),
+    ("Working Client", "#13734b", "#d4edbb"),
+]
+
+
+def _luminance(hex_color):
+    rgb = [int(hex_color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in rgb]
+    return sum(c * weight for c, weight in zip(linear, (0.2126, 0.7152, 0.0722)))
+
+
+@pytest.mark.parametrize("label,background,foreground", BADGE_PALETTE)
+def test_stage_badges_match_sheet_palette_and_have_readable_text(label, background, foreground):
+    for raw in (label, f"2. {label}", f"  2.  {label.upper().replace(' ', '   ')}  "):
+        parsed = _BadgeParser(_stage_badge(raw))
+        assert len(parsed.spans) == 1 and parsed.label == label
+        styles = dict(part.split(":", 1) for part in parsed.spans[0]["style"].split(";") if part)
+        assert styles["background-color"] == background and styles["color"] == foreground
+        light, dark = sorted((_luminance(styles["color"]), _luminance(styles["background-color"])), reverse=True)
+        assert (light + 0.05) / (dark + 0.05) >= 4.5
+
+
+@pytest.mark.parametrize("stage,expected", [(None, "—"), ("  ", "—"), ("9. On Hold", "On Hold"),
+                                            ('<img src=x onerror="bad()">', '<img src=x onerror="bad()">')])
+def test_missing_and_unknown_stage_badges_are_neutral_and_escape_html(stage, expected):
+    parsed = _BadgeParser(_stage_badge(stage))
+    assert len(parsed.spans) == 1 and parsed.label == expected
+    assert parsed.spans[0]["class"] == "deal-stage deal-stage--unknown"
+    assert "background-color:#e5e7eb;color:#344054" in parsed.spans[0]["style"]
+
+
+def test_dark_mode_rules_preserve_both_badge_colors_without_opting_in_the_whole_email():
+    html = render([], [], [], TODAY, 0, "c", False)
+    css = html.split("<style>", 1)[1].split("</style>", 1)[0]
+    assert "@media (prefers-color-scheme:dark)" in css
+    assert '<meta' not in html and '<div class="bianca-brief"' in html
+    for label, background, foreground in BADGE_PALETTE:
+        suffix = label.lower().replace(" ", "-")
+        for selector in (f".bianca-brief .deal-stage--{suffix}",
+                         f"[data-ogsc] .bianca-brief .deal-stage--{suffix},[data-ogsb] .bianca-brief .deal-stage--{suffix}"):
+            assert selector + "{background-color:" + background + "!important;color:" + foreground + "!important}" in css
+
+
+def test_stage_badges_sit_below_escaped_company_names_in_all_four_company_tables():
+    paused = item("Cedar & Co", due=TODAY, deal_owner="RG", id="paused")
+    opening = item("Harbor Foods", due=TODAY + timedelta(days=2), deal_owner="RG", id="opening")
+    views = [view("Cedar & Co", 0, owner="RG"), view("Harbor Foods", 1, owner="RG")]
+    views += [view(label + " Co", rank, owner="RG") for rank, (label, _, _) in enumerate(BADGE_PALETTE[2:5], start=2)]
+    views += [view("Willow Retail", 5, owner="RG")]
+    s = section("RG", views, [paused, opening])
+    urgent = TodayRow("Nico <Urgent>", "4. Pilot", "Due now", "Review the file", "due today", "Nico DL", None)
+    html = render([s], [urgent], [], TODAY, 7, "c", False, action_url=lambda ref: f"https://x/done?r={ref}")
+    for company, label in (("Cedar &amp; Co", "Paused"), ("Harbor Foods", "Opening"), ("In Talks Co", "In Talks"),
+                           ("Proposal Co", "Proposal"), ("Pilot Co", "Pilot"), ("Willow Retail", "Working Client"),
+                           ("Nico &lt;Urgent&gt;", "Pilot")):
+        cell = re.search(r"<td[^>]*><b>" + re.escape(company) + r"</b><br>(.*?)</td>", html).group(1)
+        assert _BadgeParser(cell).label == label
+    assert "https://x/done?r=insight:paused" in html and "https://x/done?r=insight:opening" in html
+    assert "Notes · Oct 5" in html and ">Source<" in html
 
 
 # ---- plain Source column, no evidence links, "Mark as complete" buttons (Nov 2 request)
