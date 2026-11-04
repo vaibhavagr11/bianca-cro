@@ -19,12 +19,17 @@ go to `Client Context`. Action approval replaces `Last progress` with the exact 
 approved action bullets into `Next step`. Context approval adds distinct reviewed bullets to the existing `Client Context`.
 An empty section leaves its cells unchanged. Ignore never writes to the Sheet. Owners RG, NC, and NDL are supported.
 
+The first review cycle imports only sources dated within the preceding **14 days**. Later daily cycles add new source versions
+to the same pending company card, preserving earlier bullets until Approve, Save & approve, or Ignore. The cutoff is persisted once;
+pending bullets do not expire after 14 days. Clicking a source label highlights only the bullets linked to that exact source version.
+
 The configured default destination is the [Pipeline tab of the designated source-of-truth Sheet](https://docs.google.com/spreadsheets/d/14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw/edit?gid=1869050409#gid=1869050409).
 
 - [Live interface and approved sample-data preview](artifacts/README.md)
 - [Deployment, Claude Enterprise connector, and n8n setup](docs/gsheet-updates.md)
+- [Daily n8n workflow and scheduling setup](n8n/README.md)
 
-This feature is disabled by default. It requires migrations `012_sheet_review.sql` and `013_sheet_review_columns.sql`, a configured Google service account,
+This feature is disabled by default. It requires migrations through `014_review_daily_lineage.sql`, a configured Google service account,
 and separate founder review credentials. Committing this code does not connect or modify a production Sheet or Claude account.
 
 ## Run the backend locally
