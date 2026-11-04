@@ -5,15 +5,18 @@
 The founder interface preserves the approved Bianca layout, title **Sales Pipeline Updates**, and owners Ramiro (`RG`),
 Nico Casaux (`NC`), and Nico de León (`NDL`). One card holds the context and next actions for one pipeline company.
 
-- **Approve** writes the reviewed bullet list to that company's `Next step` cell.
-- **Edit → Save & approve** writes the founder's edited bullets instead.
-- Both replace `Last progress` with the **exact previous `Next step`**, including an empty cell. The previous Last progress
-  is overwritten, not appended; before/after values remain in the backend decision audit.
+- **Next Step** contains next steps, commitments, and blockers; **Client Context** contains customer needs, buying signals, and objections. Routing uses the stored insight type, not the wording of an editable bullet.
+- **Approve** sends both reviewed lists. **Edit → Save & approve** uses separate editors for the founder's changes.
+- If action bullets are present, they replace `Next step` and its **exact previous value replaces `Last progress`**, including an empty old Next step. The previous Last progress is overwritten, not appended.
+- If context bullets are present, they are added to existing `Client Context`, deduplicating equivalent bullet lines. The existing text is preserved. An empty approved section leaves its corresponding cells unchanged, so context-only approval never rotates action cells.
+- Before/after values for all three cells and the exact destination are stored in the durable audit.
 - **Ignore** dismisses the card for all founders without writing any Sheet cell. It remains in the activity history.
 
 `artifacts/sales-pipeline-updates.html` is the live app. It starts without company data and requires a configured connector
 or authenticated access on the hosted backend. `sales-pipeline-updates-demo.html` is the separate fictional-data preview.
 Real company data and credentials are never written to browser storage. Server records are shared by all reviewers.
+
+The default destination is [the designated Pipeline tab](https://docs.google.com/spreadsheets/d/14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw/edit?gid=1869050409#gid=1869050409): spreadsheet `14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw`, tab `Pipeline`, numeric sheet ID `1869050409`. Overrides must deliberately name another authorized environment, including its sheet ID. The service checks the numeric tab ID as well as the title.
 
 ## How it connects
 
@@ -45,10 +48,10 @@ note, or scheduled/cancelled meeting was recorded and ask the founder to review 
 ## Deploy the backend
 
 1. Check out this branch and install the locked Python dependencies with `uv sync` in `backend/`.
-2. Apply migrations with `uv run python -m scripts.migrate`. This adds proposals, durable decisions, and consumed-source receipts.
+2. Apply migrations with `uv run python -m scripts.migrate`. Migration 012 adds proposals, durable decisions, and consumed-source receipts; migration 013 adds Client Context, typed destination lists, and durable target binding.
    Existing domain tables and the new tables retain RLS with backend-only access.
 3. Enable the Google Sheets API in the service account's Google Cloud project. Share the intended spreadsheet with that
-   service-account email as **Editor**. The application only reads the configured tab and writes the two review cells.
+   service-account email as **Editor**. The application reads the configured tab and writes only changed values among Client Context, Last progress, and Next step.
 4. Configure server secrets and settings below, then set `REVIEW_ENABLED=true`. Set `PUBLIC_BASE_URL` to the real HTTPS backend.
    Never place the ingest token, founder tokens, or service-account JSON in an artifact or committed file.
 5. Open `/review/app` on the backend for the same-origin hosted version. Sign in with an assigned founder token; it is held
@@ -58,14 +61,22 @@ note, or scheduled/cancelled meeting was recorded and ask the founder to review 
 | --- | --- |
 | `REVIEW_ENABLED` | Defaults to `false`; gates all review and publish routes. |
 | `REVIEW_TOKENS` | JSON mapping of `RG`, `NC`, `NDL` to **distinct**, random bearer tokens of at least 32 characters. Configure only enabled reviewers. |
-| `REVIEW_SPREADSHEET_ID` | The intended source-of-truth spreadsheet ID from its Google URL. |
+| `REVIEW_SPREADSHEET_ID` | Defaults to `14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw`; check existing environment overrides. |
 | `REVIEW_SHEET_TAB` | Exact tab name, default `Pipeline`. |
+| `REVIEW_SHEET_ID` | Numeric tab ID, default `1869050409`; validates that the named tab is the intended destination. |
+| `REVIEW_CLIENT_CONTEXT_MODE` | Default `append`, matching the approved behavior: preserve context and add distinct bullets. `replace` is an explicit deployment override, not the founders' selected default. |
 | `REVIEW_GOOGLE_SERVICE_ACCOUNT_JSON` | Full service-account credential as one JSON environment secret. |
 | `REVIEW_BUILD_BATCH` | Changed companies per build call, default `20`; repeat while `done=false`. |
 | `REVIEW_ALLOWED_ORIGINS` | Explicit Origin allowlist, default `["https://claude.ai"]`; the configured backend origin is also accepted. Server MCP calls may omit Origin. |
 
 Generate separate tokens with `python -c "import secrets; print(secrets.token_urlsafe(48))"` and store them securely.
 The existing `INGEST_TOKEN` remains for n8n's ingestion/build endpoints. It cannot authorize a founder decision.
+
+### Upgrade from the original review format
+
+Deploy the API, live HTML, connector schema, and migration 013 together. After migration, sync the **full Pipeline tab including Client Context from the new target spreadsheet**, then run `/review/build` until `done=true` to rebuild old pending cards from typed source insights. Do not infer a category from old flat text. Existing `REVIEW_SPREADSHEET_ID` environment values override the new code default and must be updated deliberately.
+
+Old `bullets`-only approval requests are rejected; the new payload requires `next_step_bullets` and `client_context_bullets`, either of which may be empty while the combined request must be nonempty. Old applying requests without typed routing/target binding require operator reconciliation. They are never replayed into a new destination. New intents bind spreadsheet ID, tab name, and numeric tab ID; changing configuration cannot silently redirect an in-flight write.
 
 ## Connect the Enterprise Artifact
 
@@ -117,7 +128,7 @@ In n8n:
 3. If one branch fails, retry **that branch only**: `/brief/build?version=v2` or `/review/build`. Repeating `/process/publish`
    builds another brief and advances its history again; do not use it as the retry for a failed review build.
 4. Continue the full Pipeline-sheet sync on its usual schedule; a successful approval also refreshes the backend mirror when
-   its reviewed baseline is still current. If `mirror_refreshed=false`, trigger the existing **full** pipeline sync before relying
+   its reviewed baseline is still current. The mirror now includes Client Context. If `mirror_refreshed=false`, trigger the existing **full** pipeline sync before relying
    on its cache. Never send a partial pipeline snapshot: the existing ingest treats absent companies as removed.
 
 You can choose `version=v1` explicitly if the live email workflow still uses v1. Review generation remains independent.
@@ -127,9 +138,9 @@ No n8n workflow or production email settings are changed merely by committing th
 
 The server scopes every lookup to the configured workspace, verifies the card revision, and serializes decisions for that
 proposal. It resolves the current Sheet row by normalized `Empresa` and resolves `Last progress`/`Next step` by their headers
-on every attempt. Missing/duplicate companies or headers, formulas in review cells, and changed reviewed values stop the write.
-Fixed before/after values and the request hash are committed **before** the Google write is attempted. Both cells are written as literal
-strings in a single atomic `spreadsheets.batchUpdate` and then read back. Other cells and formatting are untouched.
+on every attempt, together with `Client Context`. Missing/duplicate companies or headers, a mismatched numeric tab ID, formulas in review cells, and changed reviewed values stop the write.
+Fixed before/after values and the request hash are committed **before** the Google write is attempted. Changed cells are written as literal
+strings in a single atomic `spreadsheets.batchUpdate` and then read back across all three review cells. Only changed cells are included in the write; other cells and formatting are untouched.
 
 If a response is lost, the card remains `applying`, with the exact retry payload. Retry that saved approval: the writer recognizes
 the desired final cell values and never rotates them a second time. Another founder cannot replace that in-flight decision.
@@ -158,6 +169,6 @@ node tests-frontend/verify-demo.cjs
 ```
 
 Tests use dummy database credentials and mocked Google/Claude connections. They cover review transport/auth, source receipts,
-revision changes, NDL, exact cell replacement, Ignore, durable retries, stale data, moved headers/rows, literal writes, and
+revision changes, NDL, typed category routing, context append/deduplication, context-only preservation of action cells, exact cell replacement, Ignore, durable retries/target binding, stale data, moved headers/rows, literal writes, and
 frontend error recovery. Live Google credentials, the production database, and the Enterprise runtime bridge are not exercised
 by these tests. Browser appearance needs verification in the deployment environment.
