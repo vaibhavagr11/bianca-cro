@@ -1,12 +1,13 @@
 """Review semantics, stable evidence, batching and durable external-write recovery. No live I/O."""
 
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
 
 import pytest
 
 from app import review_service as review
+from app.review_content import bullet_id, source_id
 from app.review_sheets import SheetConflict, SheetWriteUncertain
 
 
@@ -33,13 +34,21 @@ def insight(**overrides):
 
 
 def proposal(**overrides):
-    return {"id": PROPOSAL, "workspace_id": WORKSPACE, "company_id": COMPANY, "opportunity_id": OPPORTUNITY,
-            "company_name": "Pernod Ricard", "owner_code": "NDL", "stage": "4. Pilot", "country": "ARG",
-            "bullets": ["Send the pilot checklist."], "next_step_bullets": ["Send the pilot checklist."],
-            "client_context_bullets": [], "routing_version": 1, "snapshot_client_context": "", "sources": [], "source_versions": [review.source_version(record())],
-            "snapshot_last_progress": "Pilot terms agreed.", "snapshot_next_step": "Ask for the signed agreement.",
-            "revision": 1, "status": "pending", "created_at": NOW, "updated_at": NOW,
-            "removed_at": None, **overrides}
+    version = review.source_version(record())
+    source = {"id": source_id(record()), "recordId": RECORD, "source": "gmail", "externalId": "message-1",
+              "version": version["version"], "type": "Email", "date": "2026-11-02", "quote": insight()["quote"],
+              "quotes": [insight()["quote"]]}
+    value = {"id": PROPOSAL, "workspace_id": WORKSPACE, "company_id": COMPANY, "opportunity_id": OPPORTUNITY,
+             "company_name": "Pernod Ricard", "owner_code": "NDL", "stage": "4. Pilot", "country": "ARG",
+             "bullets": ["Send the pilot checklist."], "next_step_bullets": ["Send the pilot checklist."],
+             "client_context_bullets": [], "routing_version": 1, "snapshot_client_context": "", "sources": [source],
+             "source_versions": [version], "observed_source_versions": [version], "lineage_version": 1,
+             "bullet_lineage": {"nextStep": [{"bulletId": bullet_id("nextStep", "Send the pilot checklist."),
+                                               "text": "Send the pilot checklist.", "sourceIds": [source["id"]]}], "clientContext": []},
+             "snapshot_last_progress": "Pilot terms agreed.", "snapshot_next_step": "Ask for the signed agreement.",
+             "revision": 1, "status": "pending", "created_at": NOW, "updated_at": NOW, "removed_at": None}
+    value.update(overrides)
+    return value
 
 
 def test_source_identity_survives_reextraction_and_mailbox_aliases_but_not_real_calendar_changes():
@@ -52,7 +61,7 @@ def test_source_identity_survives_reextraction_and_mailbox_aliases_but_not_real_
 
 
 def test_existing_insight_wording_owner_and_due_date_are_preserved_and_quoted():
-    bullets, _, sources = review.proposal_content([record()], [insight()])
+    bullets, _, sources, _ = review.proposal_content([record()], [insight()])
     assert bullets == ["We owe: Send the pilot checklist. (owner: Nicolás de León) — due 2026-11-05"]
     assert sources[0]["quote"] == insight()["quote"]
     assert sources[0]["date"] == "2026-11-02"
@@ -61,7 +70,7 @@ def test_existing_insight_wording_owner_and_due_date_are_preserved_and_quoted():
 
 def test_old_thread_context_is_not_repeated_when_only_a_new_message_needs_review():
     new_message = record(body="Thanks, that works.")
-    bullets, _, _ = review.proposal_content([new_message], [insight(source_record_ids=["older-record", RECORD])])
+    bullets, _, _, _ = review.proposal_content([new_message], [insight(source_record_ids=["older-record", RECORD])])
     assert len(bullets) == 1
     assert bullets[0].startswith("Commercial email recorded")
     assert "We owe" not in bullets[0]
@@ -69,26 +78,26 @@ def test_old_thread_context_is_not_repeated_when_only_a_new_message_needs_review
 
 def test_calendar_title_only_cannot_become_a_buying_signal_or_completed_meeting():
     meeting = record(source="calendar", body="", subject="Pilot purchase approved", occurred_at="2026-11-05T12:00:00Z")
-    bullets, _, _ = review.proposal_content([meeting], [insight(type="buying_signal", quote="Pilot purchase approved",
+    bullets, _, _, _ = review.proposal_content([meeting], [insight(type="buying_signal", quote="Pilot purchase approved",
                                                            text="Customer approved the purchase.")])
     assert bullets == ["Meeting scheduled (2026-11-05): Pilot purchase approved. Review the agenda and confirm any next actions."]
     assert "Buying signal:" not in bullets[0]
 
 
 def test_cancelled_calendar_record_has_explicit_factual_fallback():
-    bullets, _, sources = review.proposal_content([record(source="calendar", meta={"status": "cancelled"})], [])
+    bullets, _, sources, _ = review.proposal_content([record(source="calendar", meta={"status": "cancelled"})], [])
     assert bullets[0].startswith("Meeting cancelled (2026-11-02)")
     assert sources[0]["type"] == "Calendar"
 
 
 def test_completed_or_unverifiable_insights_are_not_presented_as_open_actions():
     for change in ({"status": "done"}, {"status": "possibly_done"}, {"quote": "This sentence is invented."}):
-        bullets, _, _ = review.proposal_content([record()], [insight(**change)])
+        bullets, _, _, _ = review.proposal_content([record()], [insight(**change)])
         assert all(not b.startswith("We owe:") for b in bullets)
 
 
 def test_duplicate_insights_do_not_duplicate_bullets_and_no_four_deal_selector_is_used():
-    bullets, _, _ = review.proposal_content([record()], [insight(), insight(id="new-insight-uuid")])
+    bullets, _, _, _ = review.proposal_content([record()], [insight(), insight(id="new-insight-uuid")])
     assert len(bullets) == 1
 
 
@@ -162,7 +171,7 @@ class DecisionConnection:
         if q.startswith("insert into review_decisions"):
             keys = ["workspace_id", "proposal_id", "actor", "action", "revision", "idempotency_key", "request_hash",
                     "bullets", "before_cells", "after_cells", "edited", "status",
-                    "next_step_bullets", "client_context_bullets", "routing_version", "sheet_target"]
+                    "next_step_bullets", "client_context_bullets", "routing_version", "sheet_target", "bullet_lineage", "lineage_version"]
             item = {key: copy.deepcopy(value.obj if hasattr(value, "obj") else value) for key, value in zip(keys, params)}
             item.update(id=f"decision-{len(self.data['intents']) + 1}", created_at=NOW, completed_at=None, error=None, write_attempts=0)
             self.data["intents"].append(item)
@@ -191,7 +200,8 @@ class DecisionConnection:
                 p.update(status="ignored", decided_by=params[0], decided_at=NOW)
             if "status = 'approved'" in q:
                 p.update(status="approved", bullets=params[0].obj, next_step_bullets=params[1].obj,
-                         client_context_bullets=params[2].obj, decided_by=params[3], decided_at=NOW)
+                         client_context_bullets=params[2].obj, bullet_lineage=params[3].obj, lineage_version=params[4],
+                         decided_by=params[5], decided_at=NOW)
             return Result([])
         if q.startswith("insert into review_source_receipts"):
             self.data["receipts"].append(params)
@@ -416,29 +426,57 @@ class BuildConnection:
                        "company_name": f"Company {i:02}", "owner_code": "NDL", "stage": "2. In Talks",
                        "country": "ARG", "last_progress": "Old progress", "next_step": "Old next step", "client_context": ""}
                       for i in range(count)]
-        self.proposals = {}
-        self.receipts = []
+        self.proposals, self.receipts, self.exclusions = {}, [], []
+        self.records = {deal["company_id"]: [record(external_id=deal["company_id"], company_id=deal["company_id"])]
+                        for deal in self.deals}
+        self.unlinked_records = []
         self.records_enabled = True
+        self.queue_state = None
+        self.now = NOW
+        self.timezone = "America/Argentina/Buenos_Aires"
+        self.insights = None
 
     def execute(self, sql, params=()):
         q = " ".join(sql.split())
         if "pg_advisory_xact_lock" in q:
             return Result([])
+        if q.startswith("select now()"):
+            return Result([{"now": self.now, "timezone": self.timezone}])
+        if q.startswith("select * from review_queue_state"):
+            return Result([copy.deepcopy(self.queue_state)] if self.queue_state else [])
+        if q.startswith("insert into review_queue_state"):
+            self.queue_state = dict(zip(["workspace_id", "initialized_at", "bootstrap_cutoff", "cycle_for_date", "cycle_started_at"], params))
+            self.queue_state.update(bootstrap_completed=False, cycle_completed_at=None, last_completed_on=None)
+            return Result([copy.deepcopy(self.queue_state)])
+        if q.startswith("update review_queue_state"):
+            if "cycle_completed_at = now()" in q:
+                self.queue_state.update(cycle_completed_at=self.now, last_completed_on=self.queue_state["cycle_for_date"], bootstrap_completed=True)
+            else:
+                self.queue_state.update(cycle_for_date=params[0], cycle_started_at=params[1], cycle_completed_at=None)
+            return Result([copy.deepcopy(self.queue_state)])
+        if q.startswith("insert into review_bootstrap_exclusions"):
+            self.exclusions.extend({"workspace_id": params[0], **row} for row in params[1].obj)
+            return Result([])
+        if q.startswith("select source, external_id, version from review_bootstrap_exclusions"):
+            return Result(copy.deepcopy(self.exclusions))
         if q.startswith("select o.id as opportunity_id"):
             return Result(copy.deepcopy(self.deals))
         if q.startswith("select company_id, source"):
             return Result(self.receipts)
         if q.startswith("select * from review_proposals"):
             item = self.proposals.get(params[1])
-            return Result([copy.deepcopy(item)] if item else [])
-        if q.startswith("select * from source_records"):
-            return Result([record(external_id=params[1])] if self.records_enabled else [])
+            return Result([copy.deepcopy(item)] if item and item["status"] in ("pending", "applying") else [])
+        if q.startswith("select * from source_records") or q.startswith("select source, external_id, content_hash"):
+            material = ([r for values in self.records.values() for r in values] + self.unlinked_records
+                        if len(params) == 2 else self.records.get(params[1], []) if self.records_enabled else [])
+            return Result(copy.deepcopy([r for r in material if review._instant(r["created_at"]) <= params[-1]]))
         if q.startswith("select * from insights"):
-            return Result([insight()])
+            return Result(copy.deepcopy(self.insights if self.insights is not None else [insight()]))
         if q.startswith("insert into review_proposals"):
             keys = ["workspace_id", "company_id", "opportunity_id", "company_name", "owner_code", "stage", "country",
                     "bullets", "sources", "source_versions", "snapshot_last_progress", "snapshot_next_step",
-                    "snapshot_client_context", "next_step_bullets", "client_context_bullets", "routing_version"]
+                    "snapshot_client_context", "next_step_bullets", "client_context_bullets", "routing_version",
+                    "observed_source_versions", "bullet_lineage", "lineage_version"]
             item = {k: copy.deepcopy(v.obj if hasattr(v, "obj") else v) for k, v in zip(keys, params)}
             item.update(id="proposal-" + params[1], status="pending", revision=1)
             self.proposals[params[1]] = item
@@ -450,7 +488,7 @@ class BuildConnection:
                 return Result([])
             keys = ["company_name", "owner_code", "stage", "country", "bullets", "sources", "source_versions",
                     "snapshot_last_progress", "snapshot_next_step", "snapshot_client_context",
-                    "next_step_bullets", "client_context_bullets", "routing_version"]
+                    "next_step_bullets", "client_context_bullets", "routing_version", "observed_source_versions", "bullet_lineage", "lineage_version"]
             item = next(p for p in self.proposals.values() if p["id"] == params[-1])
             item.update({k: copy.deepcopy(v.obj if hasattr(v, "obj") else v) for k, v in zip(keys, params)})
             item["revision"] += 1
@@ -485,7 +523,7 @@ def test_pending_card_revision_tracks_changed_sheet_baseline_without_losing_new_
     conn = BuildConnection(1)
     review.build_proposals(conn, WORKSPACE)
     conn.deals[0]["next_step"] = "A fresh manually edited baseline"
-    result = review.build_proposals(conn, WORKSPACE)
+    result = review.build_proposals(conn, WORKSPACE, force=True)
     assert result["updated"] == 1
     assert conn.proposals["company-0"]["revision"] == 2
     assert conn.proposals["company-0"]["snapshot_next_step"] == conn.deals[0]["next_step"]
@@ -497,17 +535,18 @@ def test_applying_card_is_never_rebuilt_while_external_result_is_unknown(monkeyp
     review.build_proposals(conn, WORKSPACE)
     before = copy.deepcopy(conn.proposals["company-0"])
     conn.proposals["company-0"]["status"] = "applying"
-    assert review.build_proposals(conn, WORKSPACE)["applying"] == 1
+    assert review.build_proposals(conn, WORKSPACE, force=True)["applying"] == 1
     assert conn.proposals["company-0"]["revision"] == before["revision"]
 
 
-def test_reclassified_or_relinked_sources_withdraw_stale_pending_card_without_consuming_them(monkeypatch):
+def test_reclassified_or_relinked_sources_retain_pending_historical_snapshot_until_a_decision(monkeypatch):
     monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
     conn = BuildConnection(1)
     review.build_proposals(conn, WORKSPACE)
     conn.records_enabled = False
-    review.build_proposals(conn, WORKSPACE)
-    assert conn.proposals["company-0"]["status"] == "superseded"
+    review.build_proposals(conn, WORKSPACE, force=True)
+    assert conn.proposals["company-0"]["status"] == "pending"
+    assert conn.proposals["company-0"]["observed_source_versions"] == []
     assert not conn.receipts
 
 
@@ -563,7 +602,7 @@ def test_insight_categories_route_to_separate_columns_without_inference_from_tex
         insight(type="next_step", text="Send the checklist.", quote="Send the checklist.", owner_side="bianca", owner_name=None, due_date=None),
         insight(type="commitment", text="Share data.", quote="We will share data.", owner_side="customer", owner_name=None, due_date=None),
     ]
-    next_steps, context, sources = review.proposal_content([material], facts)
+    next_steps, context, sources, lineage = review.proposal_content([material], facts)
     assert len(next_steps) == len(context) == 3
     assert "Blocker: Customer need: legal approval is missing." in next_steps
     assert "Customer need: We owe: reporting capability is needed." in context
@@ -571,7 +610,8 @@ def test_insight_categories_route_to_separate_columns_without_inference_from_tex
     assert any(x.startswith("Objection:") for x in context)
     assert "We owe: Send the checklist." in next_steps
     assert "Customer next step: Share data." in next_steps
-    assert len(sources) == 6
+    assert len(sources) == 1
+    assert len(lineage["nextStep"]) == len(lineage["clientContext"]) == 3
 
 
 def test_context_only_approval_preserves_both_action_cells_and_appends_context(service):
@@ -664,7 +704,7 @@ def test_builder_rebuilds_legacy_pending_cards_from_typed_sources_and_captures_c
     old = conn.proposals["company-0"]
     old.update(routing_version=0, next_step_bullets=[], client_context_bullets=[])
     conn.deals[0]["client_context"] = "Current synced context"
-    assert review.build_proposals(conn, WORKSPACE)["updated"] == 1
+    assert review.build_proposals(conn, WORKSPACE, force=True)["updated"] == 1
     result = conn.proposals["company-0"]
     assert result["routing_version"] == 1
     assert result["next_step_bullets"] == ["We owe: Send the pilot checklist. (owner: Nicolás de León) — due 2026-11-05"]
@@ -778,3 +818,253 @@ def test_explicit_replace_configuration_still_preserves_action_cells(service, mo
     approve([], client_context_bullets=["New context"])
     assert sheets.client_context == "- New context"
     assert (sheets.last_progress, sheets.next_step) == before
+
+
+def dated_record(number, occurred, *, created=NOW, **overrides):
+    return record(id=f"66666666-6666-6666-6666-{number:012d}", external_id=f"dated-{number}",
+                  occurred_at=occurred, created_at=created, body=f"New commercial item {number}.",
+                  content_hash=f"content-{number}", **overrides)
+
+
+def test_initial_window_is_inclusive_14_days_and_excludes_future_and_undated_versions(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
+    conn = BuildConnection(1)
+    cutoff = NOW - timedelta(days=14)
+    conn.records["company-0"] = [dated_record(1, cutoff - timedelta(microseconds=1)),
+                                  dated_record(2, cutoff), dated_record(3, NOW),
+                                  dated_record(4, NOW + timedelta(microseconds=1)), dated_record(5, None)]
+    result = review.build_proposals(conn, WORKSPACE)
+    assert result["bootstrap"] == {"initializedAt": NOW.isoformat(), "cutoff": cutoff.isoformat(),
+                                    "days": 14, "completed": True}
+    assert {s["externalId"] for s in conn.proposals["company-0"]["sources"]} == {"dated-2", "dated-3"}
+    assert {e["external_id"] for e in conn.exclusions} == {"dated-1", "dated-4", "dated-5"}
+    assert not conn.receipts, "Bootstrap exclusions must never be fabricated founder decisions."
+
+
+def test_initial_exclusions_survive_restart_and_do_not_reappear_on_later_daily_runs(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
+    conn = BuildConnection(1)
+    conn.records["company-0"] = [dated_record(1, NOW - timedelta(days=90))]
+    assert review.build_proposals(conn, WORKSPACE)["created"] == 0
+    resumed = copy.deepcopy(conn)  # All persisted state survives a different process instance.
+    resumed.now = NOW + timedelta(days=20)
+    assert review.build_proposals(resumed, WORKSPACE)["created"] == 0
+    assert not resumed.proposals
+    assert resumed.queue_state["bootstrap_cutoff"] == NOW - timedelta(days=14)
+    assert len(resumed.exclusions) == 1
+
+
+def test_unclassified_unlinked_initial_old_sources_remain_excluded_when_linked_later(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
+    conn = BuildConnection(1)
+    conn.records["company-0"] = []
+    unlinked = dated_record(1, NOW - timedelta(days=60), status="failed", company_id=None)
+    conn.unlinked_records = [unlinked]
+    review.build_proposals(conn, WORKSPACE)
+    conn.now += timedelta(days=1)
+    conn.records["company-0"] = [{**unlinked, "company_id": "company-0", "status": "classified"}]
+    conn.unlinked_records = []
+    assert review.build_proposals(conn, WORKSPACE)["created"] == 0
+    assert not conn.proposals
+
+
+def test_same_day_is_skipped_but_new_information_is_collected_the_next_day(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
+    conn = BuildConnection(1)
+    review.build_proposals(conn, WORKSPACE)
+    before = copy.deepcopy(conn.proposals["company-0"])
+    arrived = NOW + timedelta(hours=1)
+    conn.records["company-0"].append(dated_record(9, arrived, created=arrived))
+    conn.now = arrived
+    assert review.build_proposals(conn, WORKSPACE)["skipped"] is True
+    assert conn.proposals["company-0"] == before
+    conn.now = NOW + timedelta(days=1)
+    assert review.build_proposals(conn, WORKSPACE)["updated"] == 1
+    assert len(conn.proposals["company-0"]["next_step_bullets"]) == 2
+
+
+def test_daily_gate_uses_workspace_calendar_day_not_utc_date(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
+    conn = BuildConnection(1)
+    conn.now = NOW.replace(hour=23)
+    assert review.build_proposals(conn, WORKSPACE)["forDate"] == "2026-11-02"
+    conn.now = (NOW + timedelta(days=1)).replace(hour=1)
+    assert review.build_proposals(conn, WORKSPACE)["skipped"] is True
+    conn.now = (NOW + timedelta(days=1)).replace(hour=3)
+    result = review.build_proposals(conn, WORKSPACE)
+    assert result["skipped"] is False and result["forDate"] == "2026-11-03"
+
+
+def test_bootstrap_batches_keep_the_original_boundary_when_resumed_after_midnight(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
+    conn = BuildConnection(23)
+    first = review.build_proposals(conn, WORKSPACE)
+    assert not first["done"] and not first["bootstrap"]["completed"]
+    anchor = conn.queue_state["initialized_at"]
+    conn.now += timedelta(days=1)
+    second = review.build_proposals(conn, WORKSPACE)
+    assert second["created"] == 3 and second["done"]
+    assert second["forDate"] == "2026-11-02"
+    assert conn.queue_state["initialized_at"] == anchor
+    assert conn.queue_state["last_completed_on"].isoformat() == "2026-11-02"
+    assert review.build_proposals(conn, WORKSPACE)["forDate"] == "2026-11-03"
+
+
+def test_new_late_arriving_old_items_are_allowed_after_the_initial_import(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
+    conn = BuildConnection(1)
+    conn.records["company-0"] = []
+    review.build_proposals(conn, WORKSPACE)
+    conn.now += timedelta(days=1)
+    conn.records["company-0"] = [dated_record(9, NOW - timedelta(days=120), created=conn.now)]
+    result = review.build_proposals(conn, WORKSPACE)
+    assert result["created"] == 1
+    assert conn.proposals["company-0"]["sources"][0]["externalId"] == "dated-9"
+
+
+def test_real_content_change_to_an_excluded_initial_record_is_new_information(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
+    conn = BuildConnection(1)
+    old = dated_record(1, NOW - timedelta(days=90))
+    conn.records["company-0"] = [old]
+    review.build_proposals(conn, WORKSPACE)
+    conn.now += timedelta(days=1)
+    conn.records["company-0"] = [{**old, "body": "A newly corrected commercial note.", "content_hash": "new-real-content"}]
+    assert review.build_proposals(conn, WORKSPACE)["created"] == 1
+    current = conn.proposals["company-0"]["source_versions"][0]
+    assert current != {key: conn.exclusions[0][key] for key in ("source", "external_id", "version")}
+
+
+def test_pending_bullets_survive_more_than_14_days_and_grow_without_new_fallbacks_for_old_records(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
+    conn = BuildConnection(1)
+    review.build_proposals(conn, WORKSPACE)
+    old = copy.deepcopy(conn.proposals["company-0"])
+    conn.now += timedelta(days=30)
+    conn.insights = []  # An old action's extraction status changing must not drop the reviewed snapshot.
+    conn.records["company-0"].append(dated_record(9, conn.now, created=conn.now))
+    assert review.build_proposals(conn, WORKSPACE)["updated"] == 1
+    pending = conn.proposals["company-0"]
+    assert pending["next_step_bullets"][:len(old["next_step_bullets"])] == old["next_step_bullets"]
+    assert len(pending["next_step_bullets"]) == len(old["next_step_bullets"]) + 1
+    assert pending["bullet_lineage"]["nextStep"][0] == old["bullet_lineage"]["nextStep"][0]
+    assert review.build_proposals(conn, WORKSPACE)["skipped"] is True
+
+
+def test_force_rebuild_adds_newly_extracted_insights_without_resetting_initial_history_policy(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
+    conn = BuildConnection(1)
+    conn.insights = []
+    conn.records["company-0"].append(dated_record(1, NOW - timedelta(days=90)))
+    review.build_proposals(conn, WORKSPACE)
+    before = copy.deepcopy(conn.proposals["company-0"])
+    conn.insights = [insight()]
+    conn.now += timedelta(hours=1)
+    assert review.build_proposals(conn, WORKSPACE, force=True)["updated"] == 1
+    current = conn.proposals["company-0"]
+    assert before["next_step_bullets"][0] in current["next_step_bullets"]
+    assert any(text.startswith("We owe:") for text in current["next_step_bullets"])
+    assert len(conn.exclusions) == 1
+    assert all(source["externalId"] != "dated-1" for source in current["sources"])
+    assert conn.queue_state["initialized_at"] == NOW
+
+
+def test_accumulated_changed_source_versions_keep_distinct_lineage_and_consume_all_versions_on_approval(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
+    conn = BuildConnection(1)
+    review.build_proposals(conn, WORKSPACE)
+    original = copy.deepcopy(conn.proposals["company-0"]["sources"][0])
+    conn.now += timedelta(days=1)
+    conn.records["company-0"][0].update(body="The pilot scope has been corrected.", content_hash="new-scope")
+    review.build_proposals(conn, WORKSPACE)
+    pending = conn.proposals["company-0"]
+    assert len(pending["sources"]) == len(pending["source_versions"]) == 2
+    assert len(pending["observed_source_versions"]) == 1
+    assert pending["sources"][0] == original
+    assert pending["sources"][0]["id"] != pending["sources"][1]["id"]
+    item = {**copy.deepcopy(pending), "id": PROPOSAL, "workspace_id": WORKSPACE,
+            "company_id": COMPANY, "opportunity_id": OPPORTUNITY, "removed_at": None}
+    store = Store(item)
+    store.source_record = conn.records["company-0"][0]
+    sheets = FakeSheets(store)
+    monkeypatch.setattr(review, "settings", SimpleNamespace(
+        review_spreadsheet_id="test-sheet", review_sheet_tab="Pipeline", review_sheet_id=1869050409,
+        review_client_context_mode="append", review_build_batch=20))
+    monkeypatch.setattr(review.db, "connect", store.connect)
+    monkeypatch.setattr(review, "SheetsClient", lambda: sheets)
+    monkeypatch.setattr(review, "_mirror_approval", lambda *args: True)
+    result = review.decide(WORKSPACE, PROPOSAL, "RG", "approve", pending["revision"], "accumulated-key-1")
+    assert result["status"] == "approved"
+    assert len(store.data["receipts"]) == 2
+    assert result["activity"]["bulletLineage"]["nextStep"] == [
+        {**node, "origin": "source"} for node in pending["bullet_lineage"]["nextStep"]]
+
+
+def test_unreviewed_card_is_retained_when_a_source_is_no_longer_current_but_history_is_not_reassigned(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
+    conn = BuildConnection(1)
+    review.build_proposals(conn, WORKSPACE)
+    old = copy.deepcopy(conn.proposals["company-0"])
+    conn.now += timedelta(days=1)
+    conn.records_enabled = False
+    review.build_proposals(conn, WORKSPACE)
+    pending = conn.proposals["company-0"]
+    assert pending["next_step_bullets"] == old["next_step_bullets"]
+    assert pending["sources"] == old["sources"]
+    assert pending["observed_source_versions"] == []
+    assert pending["status"] == "pending"
+
+
+def test_legacy_pending_lineage_is_rebuilt_or_withdrawn_by_initial_window(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
+    conn = BuildConnection(1)
+    conn.proposals["company-0"] = proposal(id="legacy-card", company_id="company-0", lineage_version=0)
+    conn.records["company-0"] = [dated_record(1, NOW - timedelta(days=90))]
+    review.build_proposals(conn, WORKSPACE)
+    assert conn.proposals["company-0"]["status"] == "superseded"
+    assert len(conn.exclusions) == 1
+
+
+def test_corrupt_lineage_can_be_rebuilt_from_current_sources_without_fabricating_edges(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
+    conn = BuildConnection(1)
+    review.build_proposals(conn, WORKSPACE)
+    conn.proposals["company-0"]["bullet_lineage"]["nextStep"][0]["sourceIds"] = ["unknown-source"]
+    assert review.build_proposals(conn, WORKSPACE, force=True)["updated"] == 1
+    current = conn.proposals["company-0"]
+    assert review.validate_lineage(current["next_step_bullets"], current["client_context_bullets"],
+                                   current["sources"], current["bullet_lineage"])
+
+
+def test_pending_without_lineage_cannot_create_a_new_decision(service):
+    store, sheets = service
+    store.data["proposal"]["lineage_version"] = 0
+    with pytest.raises(review.ReviewConflict, match="predates source lineage"):
+        approve()
+    with pytest.raises(review.ReviewConflict, match="predates source lineage"):
+        review.decide(WORKSPACE, PROPOSAL, "RG", "ignore", 1, "legacy-lineage-ignore")
+    assert not store.data["intents"] and "sheet-read" not in store.events
+
+
+def test_pre_lineage_typed_applying_intent_remains_recoverable_without_reassigning_sources(service):
+    store, sheets = service
+    sheets.uncertain = True
+    with pytest.raises(review.ReviewUnavailable):
+        approve()
+    store.data["proposal"].update(lineage_version=0, bullet_lineage={"nextStep": [], "clientContext": []})
+    store.data["intents"][0].update(lineage_version=0, bullet_lineage={"nextStep": [], "clientContext": []})
+    before = (sheets.last_progress, sheets.next_step)
+    assert approve()["status"] == "approved"
+    assert (sheets.last_progress, sheets.next_step) == before
+    assert store.data["proposal"]["lineage_version"] == 0
+
+
+def test_edited_text_has_no_false_source_edges_in_the_durable_decision_audit(service):
+    store, sheets = service
+    result = approve(["A founder-authored action."], client_context_bullets=["Founder-authored customer context."])
+    lineage = result["activity"]["bulletLineage"]
+    assert result["activity"]["lineageVersion"] == 1
+    for destination in ("nextStep", "clientContext"):
+        assert lineage[destination][0]["sourceIds"] == []
+        assert lineage[destination][0]["origin"] == "founder_edit"
+    assert store.data["intents"][0]["bullet_lineage"] == lineage

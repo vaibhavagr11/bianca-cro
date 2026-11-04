@@ -181,16 +181,50 @@ def test_shell_contains_live_ui_and_demo_is_separate():
 
 
 def test_build_requires_ingest_credential(monkeypatch):
-    monkeypatch.setattr(review_api, "_build", lambda: {"done": True})
+    monkeypatch.setattr(review_api, "_build", lambda force=False: {"done": True})
     assert client.post("/review/build", headers=HEADERS).status_code == 401
     assert client.post("/review/build", headers={"X-Ingest-Token": "test-token"}).json() == {"done": True}
+
+
+def test_force_rebuild_is_explicit_ingest_only_and_forwarded(monkeypatch):
+    calls = []
+    monkeypatch.setattr(review_api, "_build", lambda force=False: calls.append(force) or {"done": True})
+    assert client.post("/review/build?force=true", headers=HEADERS).status_code == 401
+    assert client.post("/review/build", headers={"X-Ingest-Token": "test-token"}).status_code == 200
+    assert client.post("/review/build?force=true", headers={"X-Ingest-Token": "test-token"}).status_code == 200
+    assert calls == [False, True]
+
+
+def test_daily_review_requires_completed_upstream_processing_and_never_builds_brief(monkeypatch):
+    class Conn:
+        row = ("done", False)
+        def execute(self, *args): return self
+        def fetchone(self): return self.row
+    conn = Conn()
+    @contextmanager
+    def connect(): yield conn
+    monkeypatch.setattr(review_api.db, "connect", connect)
+    monkeypatch.setattr(review_api, "_workspace_id", lambda c: "workspace")
+    builds = []
+    monkeypatch.setattr(review_api, "_build", lambda: builds.append(True) or {"done": True, "skipped": True})
+    monkeypatch.setattr(review_api.brief_api, "build_brief", lambda *a: pytest.fail("must not build another brief"))
+    assert client.post("/review/daily", headers=HEADERS).status_code == 401
+    for row in (None, ("classify", False), ("timed_out", False), ("done", True)):
+        conn.row = row
+        assert client.post("/review/daily", headers={"X-Ingest-Token": "test-token"}).status_code == 409
+    assert builds == []
+    conn.row = ("done", False)
+    result = client.post("/review/daily", headers={"X-Ingest-Token": "test-token"})
+    assert result.json() == {"done": True, "skipped": True}
+    assert builds == [True]
 
 
 def test_publish_keeps_independent_results_and_rejects_timed_out(monkeypatch):
     class Conn:
         stage = "done"
+        pending = False
         def execute(self, *args): return self
-        def fetchone(self): return (self.stage,)
+        def fetchone(self): return (self.stage, self.pending)
     conn = Conn()
     @contextmanager
     def connect(): yield conn
@@ -204,4 +238,6 @@ def test_publish_keeps_independent_results_and_rejects_timed_out(monkeypatch):
     assert response.json()["brief"]["ok"] is False
     assert "provider text" not in response.text
     conn.stage = "timed_out"
+    assert client.post("/process/publish", headers={"X-Ingest-Token": "test-token"}).status_code == 409
+    conn.stage, conn.pending = "done", True
     assert client.post("/process/publish", headers={"X-Ingest-Token": "test-token"}).status_code == 409
