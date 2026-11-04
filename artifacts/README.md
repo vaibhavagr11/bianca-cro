@@ -47,7 +47,8 @@ The artifact should never make a direct request to an external Render endpoint: 
 ## Review behavior
 
 - The two views are **To review** and **Activity**. Sheet context is available inside each card rather than a separate Sheet preview tab.
-- Sources appear as type-and-date labels, such as **Notes · Sep 28**, **Email · Oct 6**, and **Calendar · Oct 8**. Source quotations are not displayed.
+- Sources appear as type-and-date buttons, such as **Notes · Sep 28**, **Email · Oct 6**, and **Calendar · Oct 8**. Click a button to highlight the exact supporting bullets across both sections; click again to clear it, or choose another source. Source quotations are not displayed.
+- Source relationships come from stored per-bullet lineage, not shared labels, dates, or positions guessed by the client. Identical bullets can highlight for more than one supporting source. Separate same-day emails remain distinct buttons. Keyboard users can activate the native buttons, and the selected state/match count is announced.
 - Expand **Current Next steps** or **Current Client Context** to read the existing Sheet values before reviewing the proposed bullets.
 - **Next Step** receives next steps, commitments, and blockers. **Client Context** receives customer needs, buying signals, and objections. Categories are routed from stored insight types, never inferred from editable text prefixes.
 - Approve sends both explicit bullet lists and the expected proposal revision to the server. The card disappears only after a confirmed server decision and a refreshed shared workspace.
@@ -59,7 +60,19 @@ The artifact should never make a direct request to an external Render endpoint: 
 - If the Google Sheet is updated but its backend mirror is not refreshed, the page explicitly shows **Pipeline snapshot needs a full sync**. The notice remains until the snapshot matches the approved after-values or `rows.lastSyncedAt` confirms a later full Pipeline sync. Recent activity carries `mirror_refreshed` so an unresolved notice is restored when reopening the workspace; only the latest approval per company is considered.
 - Refresh retrieves shared decisions from other founders. There is no four-company brief limit on the review queue.
 
-The default Sheet is `14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw`, tab `Pipeline`, sheet ID `1869050409`. Deployment variables override defaults and must be checked before enabling writes. Apply migration 013, sync the full tab including Client Context, and rebuild pending proposals before publishing this client. The old flat `bullets` approval format is rejected. Historical applying approvals without typed routing require operator reconciliation; they are never automatically retargeted to the new Sheet. Every new durable approval binds its spreadsheet, tab title, and sheet ID.
+## Initial window and daily accumulation
+
+The first successful review cycle takes a persistent snapshot with a cutoff exactly 14 days before initialization. It includes source occurrence timestamps inside that inclusive interval. Undated and future-dated baseline items are excluded from that initial import; their original versions are recorded as exclusions so they cannot reappear as backlog on day two. This does not delete source records or change the daily brief's ingestion.
+
+Subsequent cycles have no rolling 14-day filter. New records and changed content versions can join the company card, including a late-arriving older item that was not part of the original excluded snapshot. Existing unreviewed bullets and their evidence snapshots are retained even when they are more than 14 days old. The normal builder checks once per workspace calendar day, with resumable batches and safe same-day retry skips. It never resets this state on page refresh or server restart.
+
+Approve, Save & approve, and Ignore close the pending card and consume the accumulated source versions. Later genuinely new information starts a new card. Editing alone does not close it. A newer build changes the revision, so an old editor must reload before submitting.
+
+The scheduler is external n8n, not a browser timer. Use the existing daily `/process/publish` path or the [included daily review workflow](../n8n/README.md). The browser's Refresh reads saved updates; it does not trigger ingestion or a build.
+
+The default Sheet is `14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw`, tab `Pipeline`, sheet ID `1869050409`. Deployment variables override defaults and must be checked before enabling writes. Apply migrations through 014, sync the full tab including Client Context, and rebuild pending proposals before publishing this client. An operator can intentionally request `/review/build?force=true` for a same-day upgrade/repair; normal schedules must not use force. It never resets bootstrap exclusions.
+
+The old flat `bullets` approval format is rejected. Pending cards without accurate lineage must be rebuilt; the client never invents source mappings. Previously saved typed applying approvals remain retryable even if tracing is unavailable. Approvals predating typed routing still require operator reconciliation. Every new durable approval binds its spreadsheet, tab title, and sheet ID. A founder's edited wording is marked as a manual edit unless it exactly matches an original bullet in the same destination, so changed text is never falsely attributed to an original source.
 
 ## Frontend verification
 

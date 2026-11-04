@@ -19,7 +19,8 @@ dialog{border:1px solid #d8e0ef;border-radius:12px;box-shadow:0 22px 90px #182d5
 @media print{.toolbar,.actions,.demo-caption,.tabbar,.page-footer,.toast-region{display:none}.site-header{border:0}.review-card{break-inside:avoid;box-shadow:none}.page{padding-top:10px}}
 
 .sync-notice{margin-top:18px;padding:12px 15px;border-left:2px solid #dfc874;background:#fffbef;color:#7a6d47;font-size:12px;line-height:1.7}.connection-actions{display:flex;gap:15px;align-items:center;flex-wrap:wrap}.connection-panel{margin-top:20px;background:#fff;border:1px solid var(--bianca-line);border-radius:8px;padding:21px 23px}.connection-panel h2{font-size:17px}.connection-panel>p{font-size:13px;line-height:1.7;color:var(--bianca-muted);margin-top:9px}.connection-panel form{margin-top:18px;max-width:530px}.connection-panel label{display:block;font-size:12px;font-weight:650;margin-bottom:8px}.sign-in-controls{display:flex;gap:9px}.sign-in-controls input{min-width:0;flex:1;border:1px solid #bdccef;border-radius:6px;padding:10px 12px;font-size:14px;color:var(--bianca-navy);background:#fcfdff}.approval-note{font-size:12px;line-height:1.7;color:#7a6d47;background:#fffbef;border-left:2px solid #dfc874;padding:9px 12px;margin:14px 0}.card-error{margin-top:14px}@media(max-width:650px){.demo-caption{flex-wrap:wrap}.connection-panel{padding:18px}.sign-in-controls{flex-wrap:wrap}.sign-in-controls input{font-size:16px;min-width:180px}}
-.context-editor-label{margin-top:22px}.empty-group{font-size:12px;color:#8b97ad;margin:10px 0 17px;line-height:1.7}.legacy-note{margin-top:16px}.editor{min-height:140px}</style>
+.context-editor-label{margin-top:22px}.empty-group{font-size:12px;color:#8b97ad;margin:10px 0 17px;line-height:1.7}.legacy-note{margin-top:16px}.editor{min-height:140px}.source-label{cursor:pointer}.source-label:hover:not(:disabled){border-color:#9cb3ff;background:#eaf0ff}.source-label[aria-pressed=true]{background:#315efb;color:#fff;border-color:#315efb;box-shadow:0 0 0 2px #dbe5ff}.source-label:disabled{cursor:default;opacity:.7}.bullet-list li.source-highlight{background:#eaf0ff;border-left:3px solid #315efb;border-radius:3px;padding:7px 10px;margin-left:-10px;color:#14234a}.source-trace-status{font-size:11px;line-height:1.7;color:#6a7b9d;margin-top:9px}.source-trace-unavailable{color:#8b7650}.source-label:focus-visible{outline:3px solid #829cff;outline-offset:3px}@media print{.source-label[aria-pressed=true]{color:#14234a;background:#eaf0ff}}
+</style>
 </head>
 <body>
 <header class="site-header"><div class="header-inner"><a class="brand" href="#" aria-label="Bianca sales pipeline updates home"><span class="brand-mark" aria-hidden="true"></span>bianca</a><div class="header-right"><span class="workspace-label"><span class="workspace-dot" aria-hidden="true"></span>Founders’ workspace</span><div class="people" aria-label="Ramiro Godfrid, Nico Casaux and Nico de León"><span class="avatar">RG</span><span class="avatar">NC</span><span class="avatar">NDL</span></div></div></div></header>
@@ -89,6 +90,34 @@ const BiancaLive = (() => {
     };
   }
   const bulletArray=value=>Array.isArray(value)&&value.every(b=>typeof b==='string'&&Boolean(b.trim()));
+
+  function trace(proposal,display=proposal){
+    const text=v=>typeof v==='string'?v:'',idOK=v=>typeof v==='string'&&/^[A-Za-z0-9._:-]{1,160}$/.test(v);
+    const raw=Array.isArray(proposal.sources)?proposal.sources:[];
+    const sources=raw.map(s=>({id:text(s?.id),type:text(s?.type),date:text(s?.date),subject:text(s?.subject),recordId:text(s?.recordId),version:text(s?.version)}));
+    const unavailable=()=>({available:false,sources,lineage:{nextStep:[],clientContext:[]}});
+    if(proposal.lineageVersion!==1)return unavailable();
+    const byId=new Map(),unique=[];
+    for(const source of sources){
+      if(!idOK(source.id))return unavailable();
+      if(byId.has(source.id)){if(JSON.stringify(byId.get(source.id))!==JSON.stringify(source))return unavailable();continue;}
+      byId.set(source.id,source);unique.push(source);
+    }
+    const lineage={nextStep:[],clientContext:[]},ids=new Set();
+    for(const [destination,field] of [['nextStep','nextStepBullets'],['clientContext','clientContextBullets']]){
+      const bullets=display[field],edges=proposal.bulletLineage?.[destination];
+      if(!Array.isArray(bullets)||!Array.isArray(edges)||edges.length!==bullets.length)return unavailable();
+      for(let i=0;i<bullets.length;i++){
+        const edge=edges[i];
+        if(!edge||!idOK(edge.bulletId)||ids.has(edge.bulletId)||edge.text!==bullets[i]||!Array.isArray(edge.sourceIds))return unavailable();
+        const sourceIds=[...new Set(edge.sourceIds)];
+        if(sourceIds.some(id=>!idOK(id)||!byId.has(id))||(!sourceIds.length&&edge.origin!=='founder_edit'))return unavailable();
+        ids.add(edge.bulletId);lineage[destination].push({bulletId:edge.bulletId,text:edge.text,sourceIds,origin:edge.origin==='founder_edit'?'founder_edit':'source'});
+      }
+    }
+    return {available:true,sources:unique,lineage};
+  }
+
   function groups(value){
     if(!value||Array.isArray(value)||!bulletArray(value.nextStepBullets)||!bulletArray(value.clientContextBullets)||!value.nextStepBullets.length&&!value.clientContextBullets.length)throw new ReviewError('Add at least one bullet in Next Step or Client Context before approving.');
     for(const items of [value.nextStepBullets,value.clientContextBullets])if(items.length>200||items.some(b=>b.trim().length>4000||/[\r\n\u0000]/.test(b))||items.map(b=>'- '+b.trim()).join('\n').length>45000)throw new ReviewError('Shorten the update to fit the sheet cell.');
@@ -102,7 +131,8 @@ const BiancaLive = (() => {
       if(typeof p?.id!=='string'||typeof p.company!=='string'||!Number.isInteger(p.revision)||!['pending','applying','approved','ignored'].includes(p.status))throw new ReviewError('A company update could not be read. Refresh or contact your workspace administrator.');
       const supported=p.routingVersion===1;
       if(supported&&(!bulletArray(p.nextStepBullets)||!bulletArray(p.clientContextBullets)))throw new ReviewError('A company update could not be read. Refresh or contact your workspace administrator.');
-      const copy={...p,...cells(p),routingVersion:supported?1:0,nextStepBullets:supported?[...p.nextStepBullets]:[],clientContextBullets:supported?[...p.clientContextBullets]:[],owner:cell(p.owner),stage:cell(p.stage),country:cell(p.country),sources:Array.isArray(p.sources)?p.sources.map(s=>({type:cell(s?.type),date:cell(s?.date)})):[]};
+      const copy={...p,...cells(p),routingVersion:supported?1:0,nextStepBullets:supported?[...p.nextStepBullets]:[],clientContextBullets:supported?[...p.clientContextBullets]:[],owner:cell(p.owner),stage:cell(p.stage),country:cell(p.country),sources:Array.isArray(p.sources)?p.sources:[]};
+      const traced=trace(copy);copy.sources=traced.sources;copy.lineageAvailable=traced.available;copy.bulletLineage=traced.lineage;
       delete copy.bullets;
       if(!supported){copy.error=p.error||'This older update needs a proposal rebuild before it can be reviewed. Ask your workflow owner to rebuild the review queue.';delete copy.retry;}
       else if(p.retry){const r=p.retry;if(typeof r.idempotency_key!=='string'||!Number.isInteger(r.revision)||!bulletArray(r.next_step_bullets)||!bulletArray(r.client_context_bullets)||!r.next_step_bullets.length&&!r.client_context_bullets.length)throw new ReviewError('This approval needs an administrator to check its saved result.');copy.retry={idempotency_key:r.idempotency_key,revision:r.revision,next_step_bullets:[...r.next_step_bullets],client_context_bullets:[...r.client_context_bullets]};}
@@ -119,6 +149,7 @@ const BiancaLive = (() => {
       if(busy.has(id))throw new ReviewError('This company update is already being saved.');
       const p=state.proposals.find(x=>x.id===id);if(!p)throw new ReviewError('This update is no longer in the review queue. Refresh to see the latest changes.',409);
       if(p.routingVersion!==1)throw new ReviewError(p.error||'Rebuild this older proposal before reviewing it.',409);
+      if(p.status==='pending'&&action==='approve'&&!p.lineageAvailable)throw new ReviewError('Rebuild this proposal to restore its source links before approving.',409);
       if(!['approve','ignore'].includes(action))throw new ReviewError('Unsupported Bianca operation.');
       if(!['pending','applying'].includes(p.status))throw new ReviewError('This update has already been reviewed. Refresh to see the latest changes.',409);
       if(p.status==='applying'&&(action!=='approve'||!p.retry))throw new ReviewError('An approval is still being confirmed. Refresh or ask your administrator to check it.',409);
@@ -142,7 +173,7 @@ const BiancaLive = (() => {
     }
     return {refresh,decide,pendingIntent,get state(){return state;},isBusy:id=>busy.has(id)};
   }
-  return {TOOLS,ReviewError,parseBullets,groups,unwrap,connectorTransport,restTransport,workspace,createClient};
+  return {TOOLS,ReviewError,parseBullets,groups,trace,unwrap,connectorTransport,restTransport,workspace,createClient};
 })();
 
 </script>
@@ -154,7 +185,7 @@ const BiancaLive = (() => {
   const ownerName=code=>({RG:'Ramiro',NC:'Nico',NDL:'Nico'}[code]||code||'Unassigned');
   const sourceType=type=>({'meeting notes':'Notes',notes:'Notes',email:'Email',calendar:'Calendar'}[String(type).toLowerCase()]||String(type||'Source'));
   function sourceDate(date){const value=String(date||'').trim(),match=/^(\d{4})-(\d{2})-(\d{2})(?:T.*)?$/.exec(value);if(match){const year=Number(match[1]),month=Number(match[2]),day=Number(match[3]),parsed=new Date(Date.UTC(year,month-1,day));if(parsed.getUTCFullYear()===year&&parsed.getUTCMonth()===month-1&&parsed.getUTCDate()===day)return ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][month-1]+' '+day;}return value||'Undated';}
-  const expandedNextSteps=new Set();
+  const expandedNextSteps=new Set(),activeSources=new Map();
   const hosted=location.pathname.replace(/\/$/,'')==='/review/app'&&(location.protocol==='https:'||(location.protocol==='http:'&&['localhost','127.0.0.1','[::1]'].includes(location.hostname)));
   let client=null,token='',editingId=null,editingRevision=null,toastTimer,loaded=false,refreshing=false,session=0;
   let state={proposals:[],rows:[],activity:[]};
@@ -164,7 +195,7 @@ const BiancaLive = (() => {
   function toast(message){clearTimeout(toastTimer);$('#toast-region').innerHTML=`<div class="toast"><span>${esc(message)}</span><button type="button" class="toast-close" aria-label="Dismiss notification">×</button></div>`;$('.toast-close').onclick=()=>$('#toast-region').replaceChildren();announce(message);toastTimer=setTimeout(()=>$('#toast-region').replaceChildren(),12000);}
   function setTab(id,focus=false){document.querySelectorAll('[role=tab]').forEach(tab=>{const selected=tab.id===id;tab.setAttribute('aria-selected',String(selected));tab.tabIndex=selected?0:-1;$('#'+tab.getAttribute('aria-controls')).hidden=!selected;if(selected&&focus)tab.focus();});}
   function connectionError(message){setText('#connection-error',message);$('#connection-error').hidden=false;setText('#connection-status','Connection needed');$('#connection-panel').hidden=false;announce(message);}
-  function attach(transport){const attachedSession=++session;loaded=false;state={proposals:[],rows:[],activity:[]};mirrorPending.clear();expandedNextSteps.clear();render();client=BiancaLive.createClient(transport,{onChange:next=>{if(attachedSession!==session)return;state=next;loaded=true;render();}});}
+  function attach(transport){const attachedSession=++session;loaded=false;state={proposals:[],rows:[],activity:[]};mirrorPending.clear();expandedNextSteps.clear();activeSources.clear();render();client=BiancaLive.createClient(transport,{onChange:next=>{if(attachedSession!==session)return;state=next;loaded=true;render();}});}
   async function refresh(){
     if(refreshing)return;
     if(!client&&window.biancaConnector?.callTool)attach(BiancaLive.connectorTransport(window.biancaConnector));
@@ -194,6 +225,7 @@ const BiancaLive = (() => {
     setText('#mirror-sync-notice',companies.length?`Google Sheet updated for ${companies.join(', ')}. The pipeline snapshot needs a full sync. Ask your workflow owner to sync the full Pipeline tab, then refresh this page.`:'');
   }
   function render(){
+    sweepSourceSelections();
     updateMirrorNotice();
     setText('#context-help',state.clientContextMode==='replace'?'One bullet per line. Approved bullets replace Client Context. Leave empty to keep that cell unchanged.':'One bullet per line. Approved context is added to the existing Client Context without repeating identical bullets. Leave empty to keep that cell unchanged.');
     const pending=state.proposals.filter(p=>['pending','applying'].includes(p.status));setText('#pending-count',pending.length);setText('#activity-count',state.activity.length);
@@ -208,11 +240,36 @@ ${esc(a.after.clientContext)}`:''}</div></details>`:''}</div><time class="activi
   }
   function currentCell(p,field){const row=state.rows.find(r=>r.company===p.company);return row?row[field]:p[field];}
   const currentNextStep=p=>currentCell(p,'nextStep');
+
+  function displayTrace(p){const displayed=p.status==='applying'&&p.retry?{nextStepBullets:p.retry.next_step_bullets,clientContextBullets:p.retry.client_context_bullets}:p;return BiancaLive.trace(p,displayed);}
+  function traceCount(data,id){return [...data.lineage.nextStep,...data.lineage.clientContext].filter(edge=>edge.sourceIds.includes(id)).length;}
+  function sweepSourceSelections(){for(const [id,sourceId] of activeSources){const p=state.proposals.find(p=>p.id===id&&['pending','applying'].includes(p.status));const data=p&&displayTrace(p);if(!data?.available||!data.sources.some(s=>s.id===sourceId)||!traceCount(data,sourceId))activeSources.delete(id);}}
+  function traceMessage(p,data){
+    if(!data.available)return p.status==='applying'?'Source tracing is unavailable for this saved approval. Its original request can still be retried.':'Source tracing is unavailable for this older update. Rebuild the review queue to restore accurate links.';
+    if(![...data.lineage.nextStep,...data.lineage.clientContext].some(edge=>edge.sourceIds.length))return 'These founder-edited bullets have no source attribution.';
+    const selected=activeSources.get(p.id),source=data.sources.find(s=>s.id===selected);
+    if(!source)return 'Select a source to highlight the bullets it supports.';
+    const count=traceCount(data,selected);return `${count} ${count===1?'bullet':'bullets'} highlighted from ${sourceType(source.type)} · ${sourceDate(source.date)}.`;
+  }
+  function bulletList(p,items,destination,data){
+    if(!items.length)return `<p class="empty-group">No suggested ${destination==='nextStep'?'Next Step':'Client Context'} changes.</p>`;
+    const selected=activeSources.get(p.id);
+    return `<ul class="bullet-list" data-destination="${destination}">${items.map((bullet,index)=>{const edge=data.available?data.lineage[destination][index]:null,highlight=selected&&edge?.sourceIds.includes(selected);return `<li${edge?` data-bullet-id="${esc(edge.bulletId)}"`:''}${highlight?' class="source-highlight"':''}>${esc(bullet)}</li>`;}).join('')}</ul>`;
+  }
+  function sourceControls(p,data){return `<ul class="source-list" aria-label="Sources">${data.sources.map((source,index)=>{const available=data.available&&Boolean(traceCount(data,source.id)),label=`${sourceType(source.type)} · ${sourceDate(source.date)}`,identity=source.subject||`Source ${index+1}`;return `<li><button type="button" class="source-label" data-action="source" data-source-id="${esc(source.id)}" data-source-unavailable="${!available}" aria-pressed="${available&&activeSources.get(p.id)===source.id?'true':'false'}" aria-label="${esc('Highlight bullets from '+label+' — '+identity+' (source '+(index+1)+')')}" title="${esc(identity)}"${available?'':' disabled'}>${esc(label)}</button></li>`;}).join('')}</ul><p class="source-trace-status${data.available?'':' source-trace-unavailable'}">${esc(traceMessage(p,data))}</p>`;}
+  function selectSource(id,sourceId){
+    const p=state.proposals.find(p=>p.id===id&&['pending','applying'].includes(p.status));if(!p)return;
+    const data=displayTrace(p);if(!data.available||!data.sources.some(s=>s.id===sourceId)||!traceCount(data,sourceId))return;
+    if(activeSources.get(id)===sourceId)activeSources.delete(id);else activeSources.set(id,sourceId);
+    render();announce(activeSources.has(id)?traceMessage(p,data):`Source highlighting cleared for ${p.company}.`);
+    const article=[...document.querySelectorAll('article[data-id]')].find(el=>el.dataset.id===id);
+    [...(article?.querySelectorAll('[data-action=source]')||[])].find(button=>button.dataset.sourceId===sourceId)?.focus();
+  }
   function card(p){
     const type=p.stage.includes('Pilot')?'pilot':p.stage.includes('Talks')?'talks':p.stage.includes('client')?'client':'';
-    const applying=p.status==='applying',legacy=p.routingVersion!==1;
+    const applying=p.status==='applying',legacy=p.routingVersion!==1,data=displayTrace(p),lineageBlocked=!applying&&!legacy&&!data.available;
     const nextBullets=applying&&p.retry?p.retry.next_step_bullets:p.nextStepBullets,contextBullets=applying&&p.retry?p.retry.client_context_bullets:p.clientContextBullets;
-    return `<article class="review-card" data-id="${esc(p.id)}" aria-labelledby="title-${esc(p.id)}"><div class="card-top"><div><h2 class="company-title" id="title-${esc(p.id)}">${esc(p.company)}</h2><div class="company-meta"><span class="owner-inline"><span class="owner-mini" aria-hidden="true">${esc(p.owner||'—')}</span>${esc(ownerName(p.owner))}</span>${p.country?`<span class="meta-separator">·</span><span>${esc(p.country)}</span>`:''}<span class="meta-separator">·</span><span>${p.sources.length} ${p.sources.length===1?'source':'sources'}</span></div></div>${p.stage?`<span class="stage ${type}">${esc(p.stage.replace(/^\d\.\s*/,''))}</span>`:''}</div><div class="suggestion-label">Next Step · actions and blockers</div>${nextBullets.length?`<ul class="bullet-list">${nextBullets.map(b=>`<li>${esc(b)}</li>`).join('')}</ul>`:'<p class="empty-group">No suggested Next Step changes.</p>'}<div class="suggestion-label">Client Context · needs, signals, and objections</div>${contextBullets.length?`<ul class="bullet-list">${contextBullets.map(b=>`<li>${esc(b)}</li>`).join('')}</ul>`:'<p class="empty-group">No suggested Client Context changes.</p>'}${legacy?`<p class="approval-note legacy-note" role="status">${esc(p.error)}</p>`:''}${applying&&!legacy?`<p class="approval-note" role="status">${esc(p.error||'This approval has a saved write request. Retry checks that same request; it will not move the cells twice.')}</p>`:''}<ul class="source-list" aria-label="Sources">${p.sources.map(s=>`<li class="source-label">${esc(sourceType(s.type))} · ${esc(sourceDate(s.date))}</li>`).join('')}</ul><details class="current-next-steps" data-current-next-steps${expandedNextSteps.has(p.id)?' open':''}><summary>Current Next steps</summary><div class="current-next-steps-content">${esc(currentNextStep(p))||'No Next steps are currently noted.'}</div></details><details class="current-next-steps" data-current-client-context data-context-field="clientContext"${expandedNextSteps.has(p.id+':context')?' open':''}><summary>Current Client Context</summary><div class="current-next-steps-content">${esc(currentCell(p,'clientContext'))||'No Client Context is currently noted.'}</div></details><div class="card-footer"><div class="actions">${legacy?'<button type="button" class="primary" disabled>Rebuild required</button>':applying?`<button type="button" class="primary" data-action="retry" ${p.retry?'':'disabled'}>Retry approval<span class="sr-only"> ${esc(p.company)}</span></button>`:`<button type="button" class="primary" data-action="approve"><span class="approve-check" aria-hidden="true">✓</span>Approve<span class="sr-only"> ${esc(p.company)}</span></button><button type="button" class="secondary" data-action="edit">Edit<span class="sr-only"> ${esc(p.company)}</span></button><button type="button" class="quiet" data-action="ignore">Ignore<span class="sr-only"> ${esc(p.company)}</span></button>`}</div></div><p class="validation card-error" role="alert" hidden></p></article>`;
+    return `<article class="review-card" data-id="${esc(p.id)}" aria-labelledby="title-${esc(p.id)}"><div class="card-top"><div><h2 class="company-title" id="title-${esc(p.id)}">${esc(p.company)}</h2><div class="company-meta"><span class="owner-inline"><span class="owner-mini" aria-hidden="true">${esc(p.owner||'—')}</span>${esc(ownerName(p.owner))}</span>${p.country?`<span class="meta-separator">·</span><span>${esc(p.country)}</span>`:''}<span class="meta-separator">·</span><span>${p.sources.length} ${p.sources.length===1?'source':'sources'}</span></div></div>${p.stage?`<span class="stage ${type}">${esc(p.stage.replace(/^\d\.\s*/,''))}</span>`:''}</div><div class="suggestion-label">Next Step · actions and blockers</div>${bulletList(p,nextBullets,'nextStep',data)}<div class="suggestion-label">Client Context · needs, signals, and objections</div>${bulletList(p,contextBullets,'clientContext',data)}${legacy?`<p class="approval-note legacy-note" role="status">${esc(p.error)}</p>`:''}${applying&&!legacy?`<p class="approval-note" role="status">${esc(p.error||'This approval has a saved write request. Retry checks that same request; it will not move the cells twice.')}</p>`:''}${sourceControls(p,data)}<details class="current-next-steps" data-current-next-steps${expandedNextSteps.has(p.id)?' open':''}><summary>Current Next steps</summary><div class="current-next-steps-content">${esc(currentNextStep(p))||'No Next steps are currently noted.'}</div></details><details class="current-next-steps" data-current-client-context data-context-field="clientContext"${expandedNextSteps.has(p.id+':context')?' open':''}><summary>Current Client Context</summary><div class="current-next-steps-content">${esc(currentCell(p,'clientContext'))||'No Client Context is currently noted.'}</div></details><div class="card-footer"><div class="actions">${legacy?'<button type="button" class="primary" data-review-blocked="true" disabled>Rebuild required</button>':lineageBlocked?'<button type="button" class="primary" data-review-blocked="true" disabled>Rebuild required</button><button type="button" class="quiet" data-action="ignore">Ignore</button>':applying?`<button type="button" class="primary" data-action="retry" ${p.retry?'':'disabled'}>Retry approval<span class="sr-only"> ${esc(p.company)}</span></button>`:`<button type="button" class="primary" data-action="approve"><span class="approve-check" aria-hidden="true">✓</span>Approve<span class="sr-only"> ${esc(p.company)}</span></button><button type="button" class="secondary" data-action="edit">Edit<span class="sr-only"> ${esc(p.company)}</span></button><button type="button" class="quiet" data-action="ignore">Ignore<span class="sr-only"> ${esc(p.company)}</span></button>`}</div></div><p class="validation card-error" role="alert" hidden></p></article>`;
   }
   function focusNext(id){const el=[...document.querySelectorAll('article[data-id]')].find(x=>x.dataset.id===id);const next=el?.nextElementSibling?.dataset.id||el?.previousElementSibling?.dataset.id;return()=>{const target=next?[...document.querySelectorAll('article[data-id]')].find(x=>x.dataset.id===next)?.querySelector('button'):$('#review-list button');target?.focus();};}
   async function decide(id,action,bullets,fromEditor=false){
@@ -229,10 +286,11 @@ ${esc(a.after.clientContext)}`:''}</div></details>`:''}</div><time class="activi
       if(fromEditor){setText('#edit-error',message);$('#edit-error').hidden=false;}
       else {const current=[...document.querySelectorAll('article[data-id]')].find(x=>x.dataset.id===id)?.querySelector('.card-error');if(current){current.textContent=message;current.hidden=false;}toast(message);}
       setText('#connection-status','Refresh needed');
-    }finally{if(startedSession!==session)return;$('#save-approve').disabled=false;const current=[...document.querySelectorAll('article[data-id]')].find(x=>x.dataset.id===id);current?.querySelectorAll('button').forEach(b=>b.disabled=false);}
+    }finally{if(startedSession!==session)return;$('#save-approve').disabled=false;const current=[...document.querySelectorAll('article[data-id]')].find(x=>x.dataset.id===id);current?.querySelectorAll('button').forEach(b=>b.disabled=b.dataset?.sourceUnavailable==='true'||b.dataset?.reviewBlocked==='true');}
   }
-  function openEditor(id){const p=state.proposals.find(p=>p.id===id);if(!p||p.status!=='pending'||p.routingVersion!==1)return;editingId=id;editingRevision=p.revision;setText('#edit-title',`Edit ${p.company}`);$('#edit-content').value=p.nextStepBullets.map(b=>'- '+b).join('\n');$('#edit-client-context').value=p.clientContextBullets.map(b=>'- '+b).join('\n');setText('#previous-next-step',currentNextStep(p)||'(empty cell)');setText('#previous-client-context',currentCell(p,'clientContext')||'(empty cell)');$('#edit-error').hidden=true;$('#edit-content').removeAttribute('aria-invalid');$('#edit-dialog').showModal();$('#edit-content').focus();}
+  function openEditor(id){const p=state.proposals.find(p=>p.id===id);if(!p||p.status!=='pending'||p.routingVersion!==1||!p.lineageAvailable)return;editingId=id;editingRevision=p.revision;setText('#edit-title',`Edit ${p.company}`);$('#edit-content').value=p.nextStepBullets.map(b=>'- '+b).join('\n');$('#edit-client-context').value=p.clientContextBullets.map(b=>'- '+b).join('\n');setText('#previous-next-step',currentNextStep(p)||'(empty cell)');setText('#previous-client-context',currentCell(p,'clientContext')||'(empty cell)');$('#edit-error').hidden=true;$('#edit-content').removeAttribute('aria-invalid');$('#edit-dialog').showModal();$('#edit-content').focus();}
   document.addEventListener('click',event=>{const button=event.target.closest('[data-action]');if(!button)return;const action=button.dataset.action,id=button.closest('[data-id]')?.dataset.id;
+    if(action==='source'){selectSource(id,button.dataset.sourceId);return;}
     if(action==='approve')decide(id,'approve',state.proposals.find(p=>p.id===id));
     else if(action==='retry')decide(id,'approve',undefined);
     else if(action==='edit')openEditor(id);
@@ -249,12 +307,12 @@ ${esc(a.after.clientContext)}`:''}</div></details>`:''}</div><time class="activi
   $('#refresh-updates').onclick=refresh;
   $('#sign-in-form').hidden=!hosted;
   $('#sign-in-form').addEventListener('submit',async event=>{event.preventDefault();token=$('#access-token').value.trim();$('#access-token').value='';if(!token){connectionError('Enter your workspace access token.');return;}attach(BiancaLive.restTransport(fetch.bind(window),()=>token));await refresh();});
-  $('#disconnect').onclick=()=>{session++;refreshing=false;$('#refresh-updates').disabled=false;token='';client=null;loaded=false;state={proposals:[],rows:[],activity:[]};mirrorPending.clear();expandedNextSteps.clear();$('#connection-panel').hidden=false;$('#edit-dialog').close();setText('#connection-status','Connection needed');setText('#last-refreshed','');render();announce('Disconnected. Company data cleared from this page.');};
+  $('#disconnect').onclick=()=>{session++;refreshing=false;$('#refresh-updates').disabled=false;token='';client=null;loaded=false;state={proposals:[],rows:[],activity:[]};mirrorPending.clear();expandedNextSteps.clear();activeSources.clear();$('#connection-panel').hidden=false;$('#edit-dialog').close();setText('#connection-status','Connection needed');setText('#last-refreshed','');render();announce('Disconnected. Company data cleared from this page.');};
   $('#company-search').addEventListener('input',()=>{render();announce($('#results-count').textContent);});$('#owner-filter').addEventListener('change',()=>{render();announce($('#results-count').textContent);});
   document.querySelectorAll('[role=tab]').forEach(tab=>{tab.onclick=()=>setTab(tab.id);tab.onkeydown=event=>{const tabs=[...document.querySelectorAll('[role=tab]')],i=tabs.indexOf(tab);let n;if(event.key==='ArrowRight')n=(i+1)%tabs.length;else if(event.key==='ArrowLeft')n=(i+tabs.length-1)%tabs.length;else if(event.key==='Home')n=0;else if(event.key==='End')n=tabs.length-1;else return;event.preventDefault();setTab(tabs[n].id,true);};});
   $('.brand').onclick=event=>{event.preventDefault();setTab('review-tab',true);window.scrollTo({top:0,behavior:'smooth'});};
   window.addEventListener('bianca:connector-ready',()=>{client=null;token='';refresh();});
-  window.addEventListener('pagehide',()=>{session++;token='';client=null;loaded=false;state={proposals:[],rows:[],activity:[]};mirrorPending.clear();expandedNextSteps.clear();$('#edit-dialog').close();$('#connection-panel').hidden=false;setText('#connection-status','Connection needed');setText('#last-refreshed','');render();});
+  window.addEventListener('pagehide',()=>{session++;token='';client=null;loaded=false;state={proposals:[],rows:[],activity:[]};mirrorPending.clear();expandedNextSteps.clear();activeSources.clear();$('#edit-dialog').close();$('#connection-panel').hidden=false;setText('#connection-status','Connection needed');setText('#last-refreshed','');render();});
   render();if(window.biancaConnector?.callTool)refresh();
 })();
 
