@@ -72,31 +72,74 @@ def test_mcp_tools_are_narrow_and_include_review_version():
     tools = rpc("tools/list").json()["result"]["tools"]
     assert {t["name"] for t in tools} == {"bianca_review_workspace", "bianca_approve_update", "bianca_ignore_update"}
     approval = next(t for t in tools if t["name"] == "bianca_approve_update")
-    assert set(approval["inputSchema"]["required"]) == {"proposal_id", "revision", "idempotency_key", "bullets"}
+    assert set(approval["inputSchema"]["required"]) == {
+        "proposal_id", "revision", "idempotency_key", "next_step_bullets", "client_context_bullets"}
     assert "actor" not in approval["inputSchema"]["properties"]
 
 
 def test_rest_approval_and_mcp_share_authenticated_decision_handler(monkeypatch):
     calls = []
     def decision(proposal_id, actor, action, payload):
-        calls.append((proposal_id, actor, action, payload.bullets))
+        calls.append((proposal_id, actor, action, payload.next_step_bullets, payload.client_context_bullets))
         return {"status": "approved", "proposalId": proposal_id}
     monkeypatch.setattr(review_api, "_decision", decision)
     proposal_id = str(uuid4())
-    body = {"revision": 2, "idempotency_key": KEY, "bullets": ["Confirm the pilot date."]}
+    body = {"revision": 2, "idempotency_key": KEY, "next_step_bullets": ["Confirm the pilot date."],
+            "client_context_bullets": ["Customer need: Expand retailer coverage."]}
     assert client.post(f"/review/proposals/{proposal_id}/approve", json=body, headers=HEADERS).status_code == 200
     r = rpc("tools/call", {"name": "bianca_approve_update", "arguments": {"proposal_id": proposal_id, **body}})
     assert r.json()["result"]["isError"] is False
-    assert calls == [(proposal_id, "NDL", "approve", ["Confirm the pilot date."])] * 2
+    assert calls == [(proposal_id, "NDL", "approve", ["Confirm the pilot date."],
+                      ["Customer need: Expand retailer coverage."])] * 2
 
 
 def test_client_cannot_spoof_actor_or_send_empty_approval(monkeypatch):
     monkeypatch.setattr(review_api, "_decision", lambda *a: pytest.fail("must not decide"))
     proposal_id = uuid4()
-    body = {"revision": 1, "idempotency_key": KEY, "bullets": ["A valid item."]}
+    body = {"revision": 1, "idempotency_key": KEY, "next_step_bullets": ["A valid item."],
+            "client_context_bullets": []}
     assert client.post(f"/review/proposals/{proposal_id}/approve", json={**body, "actor": "RG"}, headers=HEADERS).status_code == 422
-    assert client.post(f"/review/proposals/{proposal_id}/approve", json={**body, "bullets": ["  "]}, headers=HEADERS).status_code == 422
+    assert client.post(f"/review/proposals/{proposal_id}/approve", json={**body, "next_step_bullets": ["  "]}, headers=HEADERS).status_code == 422
     assert client.post(f"/review/proposals/{proposal_id}/approve", json={**body, "revision": 0}, headers=HEADERS).status_code == 422
+
+
+def test_legacy_flat_bullets_and_missing_destination_are_rejected(monkeypatch):
+    monkeypatch.setattr(review_api, "_decision", lambda *a: pytest.fail("must not decide"))
+    route = f"/review/proposals/{uuid4()}/approve"
+    legacy = {"revision": 1, "idempotency_key": KEY, "bullets": ["Customer need: More coverage."]}
+    assert client.post(route, json=legacy, headers=HEADERS).status_code == 422
+    partial = {"revision": 1, "idempotency_key": KEY, "next_step_bullets": ["Send scope."]}
+    assert client.post(route, json=partial, headers=HEADERS).status_code == 422
+    assert client.post(route, json={**partial, "next_step_bullets": [], "client_context_bullets": []},
+                       headers=HEADERS).status_code == 422
+
+
+@pytest.mark.parametrize("actions,context", [(["Send scope."], []), ([], ["Customer need: More coverage."])])
+def test_single_destination_approval_is_valid_and_forwarded(monkeypatch, actions, context):
+    calls = []
+    monkeypatch.setattr(review_api, "_workspace_id", lambda conn: "workspace")
+    @contextmanager
+    def connect():
+        yield object()
+    monkeypatch.setattr(review_api.db, "connect", connect)
+    def decide(*args):
+        calls.append(args)
+        return {"status": "approved"}
+    monkeypatch.setattr(review_service, "decide", decide)
+    proposal_id = str(uuid4())
+    body = {"revision": 2, "idempotency_key": KEY, "next_step_bullets": actions,
+            "client_context_bullets": context}
+    assert client.post(f"/review/proposals/{proposal_id}/approve", json=body, headers=HEADERS).status_code == 200
+    assert calls == [("workspace", proposal_id, "NDL", "approve", 2, KEY, actions, context)]
+
+
+def test_both_destinations_have_independent_text_limits(monkeypatch):
+    monkeypatch.setattr(review_api, "_decision", lambda *a: pytest.fail("must not decide"))
+    route = f"/review/proposals/{uuid4()}/approve"
+    body = {"revision": 1, "idempotency_key": KEY, "next_step_bullets": [], "client_context_bullets": []}
+    for field in ("next_step_bullets", "client_context_bullets"):
+        assert client.post(route, json={**body, field: ["x" * 4001]}, headers=HEADERS).status_code == 422
+        assert client.post(route, json={**body, field: ["x" * 4000] * 12}, headers=HEADERS).status_code == 422
 
 
 def test_mcp_conflict_is_a_tool_error_not_false_success(monkeypatch):

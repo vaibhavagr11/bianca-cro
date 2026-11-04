@@ -21,7 +21,7 @@ def cell(value):
 
 
 def document(rows=None, title="Pipeline", sheet_id=123, headers=None):
-    headers = headers or ["Empresa", "Owner", "Last progress", "Next step", "Status"]
+    headers = headers or ["Empresa", "Owner", "Last progress", "Next step", "Status", "Client Context"]
     rows = rows if rows is not None else [["Campari", "RG", "Old progress", "Previous next step", "4. Pilot"]]
     return {"sheets": [{"properties": {"title": title, "sheetId": sheet_id},
                         "data": [{"rowData": [{"values": [cell(v) for v in r]} for r in [headers, *rows]]}]}]}
@@ -56,15 +56,17 @@ class Transport:
 
 def client(data=None, **kwargs):
     transport = Transport(data or document())
-    return SheetsClient(spreadsheet_id="test-sheet", credentials=Credentials(), transport=transport, **kwargs), transport
+    return SheetsClient(spreadsheet_id="test-sheet", credentials=Credentials(), transport=transport,
+                        **{"sheet_id": 123, **kwargs}), transport
 
 
 def approve(api, **kwargs):
+    kwargs = {"expected_client_context": "", "new_client_context": "", **kwargs}
     return api.apply_update("Campari", "Old progress", "Previous next step", "Previous next step", "- Approved update", **kwargs)
 
 
 def test_resolves_company_and_columns_after_sheet_reordering():
-    data = document(headers=["Next step", "Empresa", "Status", "Last progress", "Owner"],
+    data = document(headers=["Next step", "Empresa", "Status", "Last progress", "Owner", "Client Context"],
                     rows=[["Other next", "Other company", "4. Pilot", "Other last", "NC"],
                           ["Previous next step", "Cámpári  ", "4. Pilot", "Old progress", "RG"]])
     api, transport = client(data)
@@ -107,13 +109,13 @@ def test_approval_uses_current_row_position_not_a_cached_number():
 
 def test_literal_formula_like_content_is_never_executed():
     api, transport = client()
-    api.apply_update("Campari", "Old progress", "Previous next step", "Previous next step", '=HYPERLINK("https://example.com")')
+    api.apply_update("Campari", "Old progress", "Previous next step", "Previous next step", '=HYPERLINK("https://example.com")', expected_client_context='', new_client_context='')
     assert transport.data["sheets"][0]["data"][0]["rowData"][1]["values"][3] == cell('=HYPERLINK("https://example.com")')
 
 
 def test_empty_old_next_step_replaces_last_progress_with_empty_text():
     api, transport = client(document(rows=[["Campari", "RG", "Old progress", {}, "4. Pilot"]]))
-    row = api.apply_update("Campari", "Old progress", "", "", "- New next step")
+    row = api.apply_update("Campari", "Old progress", "", "", "- New next step", expected_client_context="", new_client_context="")
     assert row.last_progress == ""
     assert row.next_step == "- New next step"
 
@@ -206,7 +208,7 @@ def test_credential_refresh_is_injected_and_uses_a_bounded_request():
             self.valid, self.token = True, "refreshed-private-token"
 
     transport = Transport(document())
-    api = SheetsClient(spreadsheet_id="test-sheet", credentials=Expired(), transport=transport, timeout=500)
+    api = SheetsClient(spreadsheet_id="test-sheet", credentials=Expired(), transport=transport, timeout=500, sheet_id=123)
     api.read_company("Campari")
     assert transport.calls[0][2]["Authorization"] == "Bearer refreshed-private-token"
     assert transport.calls[0][4] == 60
@@ -215,7 +217,91 @@ def test_credential_refresh_is_injected_and_uses_a_bounded_request():
 def test_nontext_and_oversized_approval_values_never_reach_google():
     api, transport = client()
     with pytest.raises(SheetError, match="text"):
-        api.apply_update("Campari", "Old progress", "Previous next step", None, "- Next")
+        api.apply_update("Campari", "Old progress", "Previous next step", None, "- Next", expected_client_context="", new_client_context="")
     with pytest.raises(SheetError, match="50,000"):
-        api.apply_update("Campari", "Old progress", "Previous next step", "Previous next step", "x" * 50001)
+        api.apply_update("Campari", "Old progress", "Previous next step", "Previous next step", "x" * 50001, expected_client_context="", new_client_context="")
     assert transport.calls == []
+
+
+def test_routed_approval_updates_three_cells_and_preserves_unrelated_cells():
+    api, transport = client(document(rows=[["Campari", "RG", "Old progress", "Previous next step", "4. Pilot", "Existing context"]]))
+    row = approve(api, expected_client_context="Existing context", new_client_context="Existing context\n- New customer need")
+    assert row.client_context == "Existing context\n- New customer need"
+    post = next(call for call in transport.calls if call[0] == "POST")
+    assert len(post[3]["requests"]) == 3
+    assert {request["updateCells"]["range"]["startColumnIndex"] for request in post[3]["requests"]} == {2, 3, 5}
+    assert transport.data["sheets"][0]["data"][0]["rowData"][1]["values"][4] == cell("4. Pilot")
+
+
+def test_context_only_approval_writes_one_cell_without_rotating_next_step():
+    api, transport = client()
+    row = api.apply_update("Campari", "Old progress", "Previous next step", "Old progress", "Previous next step",
+                           expected_client_context="", new_client_context="- Customer need: Better reporting.")
+    post = next(call for call in transport.calls if call[0] == "POST")
+    assert len(post[3]["requests"]) == 1
+    assert post[3]["requests"][0]["updateCells"]["range"]["startColumnIndex"] == 5
+    assert (row.last_progress, row.next_step) == ("Old progress", "Previous next step")
+
+
+def test_context_conflict_rejects_action_write_too():
+    api, transport = client(document(rows=[["Campari", "RG", "Old progress", "Previous next step", "4. Pilot", "Human changed context"]]))
+    with pytest.raises(SheetConflict, match="changed since"):
+        approve(api, expected_client_context="Prior context", new_client_context="Prior context\n- New context")
+    assert all(call[0] == "GET" for call in transport.calls)
+
+
+def test_completed_three_cell_retry_does_not_append_or_rotate_again():
+    api, transport = client(document(rows=[["Campari", "RG", "Previous next step", "- Approved update", "4. Pilot", "Original\n- New context"]]))
+    row = approve(api, expected_client_context="Original", new_client_context="Original\n- New context")
+    assert row.client_context == "Original\n- New context"
+    assert [call[0] for call in transport.calls] == ["GET"]
+
+
+def test_moved_context_column_is_resolved_case_insensitively():
+    api, transport = client(document(headers=[" CLIENT CONTEXT ", "Next Step", "Empresa", "LAST PROGRESS"],
+                                     rows=[["Keep original", "Previous next step", "Campari", "Old progress"]]))
+    row = approve(api, expected_client_context="Keep original", new_client_context="- Approved client context")
+    assert (row.client_context_col, row.next_step_col, row.last_progress_col) == (0, 1, 3)
+    assert row.client_context == "- Approved client context"
+    post = next(call for call in transport.calls if call[0] == "POST")
+    assert {request["updateCells"]["range"]["startColumnIndex"] for request in post[3]["requests"]} == {0, 1, 3}
+
+
+def test_matching_tab_name_with_wrong_gid_is_rejected_before_write():
+    api, transport = client(document(sheet_id=999))
+    with pytest.raises(SheetConflict, match="tab ID"):
+        approve(api)
+    assert [call[0] for call in transport.calls] == ["GET"]
+
+
+def test_default_target_matches_the_authorized_pipeline_sheet():
+    api = SheetsClient(credentials=Credentials(), transport=Transport(document()))
+    assert api.spreadsheet_id == "14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw"
+    assert api.sheet_tab == "Pipeline"
+    assert api.sheet_id == 1869050409
+
+
+def test_missing_client_context_header_is_not_silently_ignored():
+    api, transport = client(document(headers=["Empresa", "Owner", "Last progress", "Next step"]))
+    with pytest.raises(SheetConflict, match="Client Context"):
+        approve(api)
+    assert all(call[0] == "GET" for call in transport.calls)
+
+
+@pytest.mark.parametrize("context", [
+    {"userEnteredValue": {"formulaValue": '=A1'}, "effectiveValue": {"stringValue": "Rendered"}},
+    {"userEnteredValue": {"numberValue": 42}},
+])
+def test_invalid_context_cell_stops_the_entire_approval(context):
+    api, transport = client(document(rows=[["Campari", "RG", "Old progress", "Previous next step", "4. Pilot", context]]))
+    with pytest.raises(SheetConflict):
+        approve(api)
+    assert all(call[0] == "GET" for call in transport.calls)
+
+
+def test_literal_context_is_written_as_string_and_not_evaluated():
+    api, transport = client()
+    row = approve(api, new_client_context='=HYPERLINK("https://example.com")')
+    assert row.client_context == '=HYPERLINK("https://example.com")'
+    context_cell = transport.data["sheets"][0]["data"][0]["rowData"][1]["values"][5]
+    assert context_cell == cell('=HYPERLINK("https://example.com")')

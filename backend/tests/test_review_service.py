@@ -35,7 +35,8 @@ def insight(**overrides):
 def proposal(**overrides):
     return {"id": PROPOSAL, "workspace_id": WORKSPACE, "company_id": COMPANY, "opportunity_id": OPPORTUNITY,
             "company_name": "Pernod Ricard", "owner_code": "NDL", "stage": "4. Pilot", "country": "ARG",
-            "bullets": ["Send the pilot checklist."], "sources": [], "source_versions": [review.source_version(record())],
+            "bullets": ["Send the pilot checklist."], "next_step_bullets": ["Send the pilot checklist."],
+            "client_context_bullets": [], "routing_version": 1, "snapshot_client_context": "", "sources": [], "source_versions": [review.source_version(record())],
             "snapshot_last_progress": "Pilot terms agreed.", "snapshot_next_step": "Ask for the signed agreement.",
             "revision": 1, "status": "pending", "created_at": NOW, "updated_at": NOW,
             "removed_at": None, **overrides}
@@ -51,7 +52,7 @@ def test_source_identity_survives_reextraction_and_mailbox_aliases_but_not_real_
 
 
 def test_existing_insight_wording_owner_and_due_date_are_preserved_and_quoted():
-    bullets, sources = review.proposal_content([record()], [insight()])
+    bullets, _, sources = review.proposal_content([record()], [insight()])
     assert bullets == ["We owe: Send the pilot checklist. (owner: Nicolás de León) — due 2026-11-05"]
     assert sources[0]["quote"] == insight()["quote"]
     assert sources[0]["date"] == "2026-11-02"
@@ -60,7 +61,7 @@ def test_existing_insight_wording_owner_and_due_date_are_preserved_and_quoted():
 
 def test_old_thread_context_is_not_repeated_when_only_a_new_message_needs_review():
     new_message = record(body="Thanks, that works.")
-    bullets, _ = review.proposal_content([new_message], [insight(source_record_ids=["older-record", RECORD])])
+    bullets, _, _ = review.proposal_content([new_message], [insight(source_record_ids=["older-record", RECORD])])
     assert len(bullets) == 1
     assert bullets[0].startswith("Commercial email recorded")
     assert "We owe" not in bullets[0]
@@ -68,26 +69,26 @@ def test_old_thread_context_is_not_repeated_when_only_a_new_message_needs_review
 
 def test_calendar_title_only_cannot_become_a_buying_signal_or_completed_meeting():
     meeting = record(source="calendar", body="", subject="Pilot purchase approved", occurred_at="2026-11-05T12:00:00Z")
-    bullets, _ = review.proposal_content([meeting], [insight(type="buying_signal", quote="Pilot purchase approved",
+    bullets, _, _ = review.proposal_content([meeting], [insight(type="buying_signal", quote="Pilot purchase approved",
                                                            text="Customer approved the purchase.")])
     assert bullets == ["Meeting scheduled (2026-11-05): Pilot purchase approved. Review the agenda and confirm any next actions."]
     assert "Buying signal:" not in bullets[0]
 
 
 def test_cancelled_calendar_record_has_explicit_factual_fallback():
-    bullets, sources = review.proposal_content([record(source="calendar", meta={"status": "cancelled"})], [])
+    bullets, _, sources = review.proposal_content([record(source="calendar", meta={"status": "cancelled"})], [])
     assert bullets[0].startswith("Meeting cancelled (2026-11-02)")
     assert sources[0]["type"] == "Calendar"
 
 
 def test_completed_or_unverifiable_insights_are_not_presented_as_open_actions():
     for change in ({"status": "done"}, {"status": "possibly_done"}, {"quote": "This sentence is invented."}):
-        bullets, _ = review.proposal_content([record()], [insight(**change)])
+        bullets, _, _ = review.proposal_content([record()], [insight(**change)])
         assert all(not b.startswith("We owe:") for b in bullets)
 
 
 def test_duplicate_insights_do_not_duplicate_bullets_and_no_four_deal_selector_is_used():
-    bullets, _ = review.proposal_content([record()], [insight(), insight(id="new-insight-uuid")])
+    bullets, _, _ = review.proposal_content([record()], [insight(), insight(id="new-insight-uuid")])
     assert len(bullets) == 1
 
 
@@ -160,7 +161,8 @@ class DecisionConnection:
             return Result([copy.deepcopy(i) for i in self.data["intents"] if i["idempotency_key"] == params[1]])
         if q.startswith("insert into review_decisions"):
             keys = ["workspace_id", "proposal_id", "actor", "action", "revision", "idempotency_key", "request_hash",
-                    "bullets", "before_cells", "after_cells", "edited", "status"]
+                    "bullets", "before_cells", "after_cells", "edited", "status",
+                    "next_step_bullets", "client_context_bullets", "routing_version", "sheet_target"]
             item = {key: copy.deepcopy(value.obj if hasattr(value, "obj") else value) for key, value in zip(keys, params)}
             item.update(id=f"decision-{len(self.data['intents']) + 1}", created_at=NOW, completed_at=None, error=None, write_attempts=0)
             self.data["intents"].append(item)
@@ -188,7 +190,8 @@ class DecisionConnection:
             if "status = 'ignored'" in q:
                 p.update(status="ignored", decided_by=params[0], decided_at=NOW)
             if "status = 'approved'" in q:
-                p.update(status="approved", bullets=params[0].obj, decided_by=params[1], decided_at=NOW)
+                p.update(status="approved", bullets=params[0].obj, next_step_bullets=params[1].obj,
+                         client_context_bullets=params[2].obj, decided_by=params[3], decided_at=NOW)
             return Result([])
         if q.startswith("insert into review_source_receipts"):
             self.data["receipts"].append(params)
@@ -201,30 +204,32 @@ class FakeSheets:
         self.store = store
         self.last_progress = store.data["proposal"]["snapshot_last_progress"]
         self.next_step = store.data["proposal"]["snapshot_next_step"]
+        self.client_context = store.data["proposal"]["snapshot_client_context"]
         self.calls = []
         self.uncertain = False
         self.conflict_on_write = False
 
     def read_company(self, company):
         self.store.events.append("sheet-read")
-        return SimpleNamespace(last_progress=self.last_progress, next_step=self.next_step)
+        return SimpleNamespace(last_progress=self.last_progress, next_step=self.next_step, client_context=self.client_context)
 
-    def apply_update(self, company, old_last, old_next, new_last, new_next):
+    def apply_update(self, company, old_last, old_next, new_last, new_next, *, expected_client_context, new_client_context):
         self.store.events.append("sheet-write")
         # Approval must be durably recorded before leaving the process for Google.
         saved = self.store.data["intents"][-1]
         assert saved["status"] == "applying"
-        assert saved["before_cells"] == {"lastProgress": old_last, "nextStep": old_next}
-        assert saved["after_cells"] == {"lastProgress": new_last, "nextStep": new_next}
-        self.calls.append((company, old_last, old_next, new_last, new_next))
+        assert saved["before_cells"] == {"lastProgress": old_last, "nextStep": old_next, "clientContext": expected_client_context}
+        assert saved["after_cells"] == {"lastProgress": new_last, "nextStep": new_next, "clientContext": new_client_context}
+        self.calls.append((company, old_last, old_next, new_last, new_next, expected_client_context, new_client_context))
         if self.conflict_on_write:
             raise SheetConflict("changed")
-        current, before, after = (self.last_progress, self.next_step), (old_last, old_next), (new_last, new_next)
+        current, before, after = ((self.last_progress, self.next_step, self.client_context),
+                                  (old_last, old_next, expected_client_context), (new_last, new_next, new_client_context))
         if current == after:
             return self.read_company(company)
         if current != before:
             raise SheetConflict("changed")
-        self.last_progress, self.next_step = after
+        self.last_progress, self.next_step, self.client_context = after
         if self.uncertain:
             self.uncertain = False
             raise SheetWriteUncertain("write response lost")
@@ -235,6 +240,9 @@ class FakeSheets:
 def service(monkeypatch):
     store = Store()
     sheets = FakeSheets(store)
+    monkeypatch.setattr(review, "settings", SimpleNamespace(
+        review_spreadsheet_id="14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw",
+        review_sheet_tab="Pipeline", review_sheet_id=1869050409, review_client_context_mode="append", review_build_batch=20))
     monkeypatch.setattr(review.db, "connect", store.connect)
     monkeypatch.setattr(review, "SheetsClient", lambda: sheets)
     monkeypatch.setattr(review, "_mirror_approval", lambda *args: True)
@@ -242,7 +250,7 @@ def service(monkeypatch):
 
 
 def approve(bullets=None, **kwargs):
-    return review.decide(WORKSPACE, PROPOSAL, "NDL", "approve", 1, "approval-key-1", bullets=bullets, **kwargs)
+    return review.decide(WORKSPACE, PROPOSAL, "NDL", "approve", 1, "approval-key-1", next_step_bullets=bullets, **kwargs)
 
 
 def test_approval_replaces_last_progress_exactly_and_updates_only_after_confirmed_write(service):
@@ -254,7 +262,7 @@ def test_approval_replaces_last_progress_exactly_and_updates_only_after_confirme
     assert sheets.next_step == "- Send the pilot checklist."
     assert store.data["proposal"]["status"] == "approved"
     assert result["activity"]["actor"] == "NDL"
-    assert result["activity"]["before"] == {"lastProgress": old_last, "nextStep": old_next}
+    assert result["activity"]["before"] == {"lastProgress": old_last, "nextStep": old_next, "clientContext": ""}
     assert len(store.data["receipts"]) == 1
     assert store.events.index("commit", 1) < store.events.index("sheet-write")
 
@@ -326,7 +334,7 @@ def test_uncertain_write_retains_fixed_intent_and_same_key_retry_recovers_withou
     assert not store.data["receipts"]
     assert sheets.last_progress == old_next
     with pytest.raises(review.ReviewConflict):
-        review.decide(WORKSPACE, PROPOSAL, "NC", "approve", 1, "different-key", bullets=["Edited next action."])
+        review.decide(WORKSPACE, PROPOSAL, "NC", "approve", 1, "different-key", next_step_bullets=["Edited next action."])
     result = approve(["Edited next action."])
     assert result["status"] == "approved"
     assert sheets.last_progress == old_next
@@ -406,7 +414,7 @@ class BuildConnection:
     def __init__(self, count):
         self.deals = [{"opportunity_id": f"opportunity-{i}", "company_id": f"company-{i}",
                        "company_name": f"Company {i:02}", "owner_code": "NDL", "stage": "2. In Talks",
-                       "country": "ARG", "last_progress": "Old progress", "next_step": "Old next step"}
+                       "country": "ARG", "last_progress": "Old progress", "next_step": "Old next step", "client_context": ""}
                       for i in range(count)]
         self.proposals = {}
         self.receipts = []
@@ -429,7 +437,8 @@ class BuildConnection:
             return Result([insight()])
         if q.startswith("insert into review_proposals"):
             keys = ["workspace_id", "company_id", "opportunity_id", "company_name", "owner_code", "stage", "country",
-                    "bullets", "sources", "source_versions", "snapshot_last_progress", "snapshot_next_step"]
+                    "bullets", "sources", "source_versions", "snapshot_last_progress", "snapshot_next_step",
+                    "snapshot_client_context", "next_step_bullets", "client_context_bullets", "routing_version"]
             item = {k: copy.deepcopy(v.obj if hasattr(v, "obj") else v) for k, v in zip(keys, params)}
             item.update(id="proposal-" + params[1], status="pending", revision=1)
             self.proposals[params[1]] = item
@@ -440,7 +449,8 @@ class BuildConnection:
                 item["status"] = "superseded"
                 return Result([])
             keys = ["company_name", "owner_code", "stage", "country", "bullets", "sources", "source_versions",
-                    "snapshot_last_progress", "snapshot_next_step"]
+                    "snapshot_last_progress", "snapshot_next_step", "snapshot_client_context",
+                    "next_step_bullets", "client_context_bullets", "routing_version"]
             item = next(p for p in self.proposals.values() if p["id"] == params[-1])
             item.update({k: copy.deepcopy(v.obj if hasattr(v, "obj") else v) for k, v in zip(keys, params)})
             item["revision"] += 1
@@ -509,16 +519,17 @@ def test_mirror_refresh_recomputes_pipeline_hash_and_only_updates_reviewed_cells
             if sql.startswith("select o.*"):
                 return Result([{"id": OPPORTUNITY, "name": "Pernod Ricard", "country": "ARG", "owner_code": "NDL",
                                 "stage": "4. Pilot", "primary_buyer": "Commercial", "contacts_text": "Tomás",
-                                "last_progress": "Old progress", "next_step": "Old next step", "removed_at": None}])
+                                "last_progress": "Old progress", "next_step": "Old next step", "client_context": "", "removed_at": None}])
             self.writes.append((sql, params))
             return Result([{"id": "sync-run"}]) if "returning id" in sql else Result([])
     conn = MirrorConnection()
-    assert review._mirror_approval(conn, proposal(), {"lastProgress": "Old progress", "nextStep": "Old next step"},
-                                   {"lastProgress": "Old next step", "nextStep": "- Confirm launch."}) is True
+    assert review._mirror_approval(conn, proposal(), {"lastProgress": "Old progress", "nextStep": "Old next step", "clientContext": ""},
+                                   {"lastProgress": "Old next step", "nextStep": "- Confirm launch.", "clientContext": ""}) is True
     sql, values = conn.writes[0]
     assert sql.startswith("update opportunities set last_progress")
     assert values[:2] == ("Old next step", "- Confirm launch.")
-    assert len(values[2]) == 64
+    assert values[2] is None
+    assert len(values[3]) == 64
     assert any("opportunity_changes" in query for query, _ in conn.writes)
 
 
@@ -528,8 +539,8 @@ def test_mirror_refresh_never_overwrites_a_newer_pipeline_sync():
             assert sql.startswith("select o.*"), "No UPDATE may run when the cached row already changed."
             return Result([{"last_progress": "Newer progress", "next_step": "A newer synced next step", "removed_at": None}])
     assert review._mirror_approval(ChangedMirror(), proposal(),
-                                  {"lastProgress": "Old progress", "nextStep": "Old next step"},
-                                  {"lastProgress": "Old next step", "nextStep": "- Confirm launch."}) is False
+                                  {"lastProgress": "Old progress", "nextStep": "Old next step", "clientContext": ""},
+                                  {"lastProgress": "Old next step", "nextStep": "- Confirm launch.", "clientContext": ""}) is False
 
 
 def test_removed_company_cannot_be_approved(service):
@@ -539,3 +550,231 @@ def test_removed_company_cannot_be_approved(service):
         approve()
     assert not sheets.calls
     assert not store.data["intents"]
+
+
+def test_insight_categories_route_to_separate_columns_without_inference_from_text():
+    text = "The customer requires reporting. They asked about pricing. Security review is a concern. Legal approval blocks the rollout. Send the checklist. We will share data."
+    material = record(body=text)
+    facts = [
+        insight(type="need", text="We owe: reporting capability is needed.", quote="The customer requires reporting.", owner_side=None, owner_name=None, due_date=None),
+        insight(type="buying_signal", text="Pricing discussion is underway.", quote="They asked about pricing.", owner_side=None, owner_name=None, due_date=None),
+        insight(type="objection", text="Security review is a concern.", quote="Security review is a concern.", owner_side=None, owner_name=None, due_date=None),
+        insight(type="blocker", text="Customer need: legal approval is missing.", quote="Legal approval blocks the rollout.", owner_side=None, owner_name=None, due_date=None),
+        insight(type="next_step", text="Send the checklist.", quote="Send the checklist.", owner_side="bianca", owner_name=None, due_date=None),
+        insight(type="commitment", text="Share data.", quote="We will share data.", owner_side="customer", owner_name=None, due_date=None),
+    ]
+    next_steps, context, sources = review.proposal_content([material], facts)
+    assert len(next_steps) == len(context) == 3
+    assert "Blocker: Customer need: legal approval is missing." in next_steps
+    assert "Customer need: We owe: reporting capability is needed." in context
+    assert any(x.startswith("Buying signal:") for x in context)
+    assert any(x.startswith("Objection:") for x in context)
+    assert "We owe: Send the checklist." in next_steps
+    assert "Customer next step: Share data." in next_steps
+    assert len(sources) == 6
+
+
+def test_context_only_approval_preserves_both_action_cells_and_appends_context(service):
+    store, sheets = service
+    sheets.client_context = store.data["proposal"]["snapshot_client_context"] = "Original customer context.\n"
+    before = (sheets.last_progress, sheets.next_step)
+    result = approve([], client_context_bullets=["Customer need: expand reporting."])
+    assert (sheets.last_progress, sheets.next_step) == before
+    assert sheets.client_context == "Original customer context.\n- Customer need: expand reporting."
+    assert result["activity"]["before"]["clientContext"] == "Original customer context.\n"
+    assert result["activity"]["after"]["clientContext"] == sheets.client_context
+    assert store.data["intents"][0]["next_step_bullets"] == []
+    assert store.data["intents"][0]["client_context_bullets"] == ["Customer need: expand reporting."]
+
+
+def test_action_only_approval_preserves_existing_client_context(service):
+    store, sheets = service
+    sheets.client_context = store.data["proposal"]["snapshot_client_context"] = "  Existing client context.\n"
+    approve(["Confirm launch readiness."], client_context_bullets=[])
+    assert sheets.client_context == "  Existing client context.\n"
+    assert sheets.next_step == "- Confirm launch readiness."
+
+
+def test_context_append_preserves_exact_existing_text_and_deduplicates_bullet_markers():
+    existing = "  • Customer need: Daily reports.  \r\n* Buying signal: PRICING requested.\n"
+    assert review._append_context(existing, ["customer need: daily reports.", "Buying signal: Pricing requested.",
+                                              "Objection: Security review.", " objection:   security review. "]) == (
+        existing + "- Objection: Security review.")
+    assert review._append_context("- Same context", ["same context"]) == "- Same context"
+    assert review._append_context("", ["One context", "one context"]) == "- One context"
+
+
+def test_mixed_approval_audits_both_destinations_and_deduplicates_context_on_uncertain_retry(service):
+    store, sheets = service
+    sheets.client_context = store.data["proposal"]["snapshot_client_context"] = "- Original need"
+    old_next = sheets.next_step
+    sheets.uncertain = True
+    with pytest.raises(review.ReviewUnavailable):
+        approve(["Send scope."], client_context_bullets=["Original need", "Buying signal: Pilot requested."])
+    after = (sheets.last_progress, sheets.next_step, sheets.client_context)
+    assert after == (old_next, "- Send scope.", "- Original need\n- Buying signal: Pilot requested.")
+    assert store.data["intents"][0]["sheet_target"] == {
+        "spreadsheet_id": review.settings.review_spreadsheet_id,
+        "sheet_tab": "Pipeline", "sheet_id": 1869050409}
+    assert approve(["Send scope."], client_context_bullets=["Original need", "Buying signal: Pilot requested."])["status"] == "approved"
+    assert (sheets.last_progress, sheets.next_step, sheets.client_context) == after
+    assert sheets.calls[0] == sheets.calls[1]
+    assert store.data["intents"][0]["write_attempts"] == 2
+
+
+def test_context_payload_changes_cannot_reuse_a_durable_key(service):
+    store, sheets = service
+    approve([], client_context_bullets=["Customer need: Forecasting."])
+    with pytest.raises(review.ReviewConflict, match="different decision"):
+        approve([], client_context_bullets=["Customer need: Distribution."])
+    assert len(sheets.calls) == 1
+
+
+def test_changed_sheet_configuration_blocks_recovery_before_any_google_call(service, monkeypatch):
+    store, sheets = service
+    sheets.uncertain = True
+    with pytest.raises(review.ReviewUnavailable):
+        approve(["Send scope."], client_context_bullets=["Customer need: Reporting."])
+    calls_before = len(store.events)
+    monkeypatch.setattr(review.settings, "review_spreadsheet_id", "another-target")
+    with pytest.raises(review.ReviewConflict, match="different Sheet configuration"):
+        approve(["Send scope."], client_context_bullets=["Customer need: Reporting."])
+    assert all(event not in ("sheet-read", "sheet-write") for event in store.events[calls_before:])
+    assert store.data["proposal"]["status"] == "applying"
+
+
+def test_legacy_pending_and_applying_proposals_never_write_or_consume_sources(service):
+    store, sheets = service
+    for status in ("pending", "applying"):
+        store.data["proposal"].update(routing_version=0, status=status)
+        with pytest.raises(review.ReviewConflict, match="predates column routing"):
+            approve(["An action."])
+        with pytest.raises(review.ReviewConflict, match="predates column routing"):
+            review.decide(WORKSPACE, PROPOSAL, "RG", "ignore", 1, "legacy-ignore-key")
+    assert not store.data["intents"]
+    assert not store.data["receipts"]
+    assert not sheets.calls
+    assert "sheet-read" not in store.events
+
+
+def test_builder_rebuilds_legacy_pending_cards_from_typed_sources_and_captures_context(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
+    conn = BuildConnection(1)
+    review.build_proposals(conn, WORKSPACE)
+    old = conn.proposals["company-0"]
+    old.update(routing_version=0, next_step_bullets=[], client_context_bullets=[])
+    conn.deals[0]["client_context"] = "Current synced context"
+    assert review.build_proposals(conn, WORKSPACE)["updated"] == 1
+    result = conn.proposals["company-0"]
+    assert result["routing_version"] == 1
+    assert result["next_step_bullets"] == ["We owe: Send the pilot checklist. (owner: Nicolás de León) — due 2026-11-05"]
+    assert result["snapshot_client_context"] == "Current synced context"
+    assert result["revision"] == 2
+
+
+def test_empty_or_oversized_context_decisions_fail_before_intent_and_write(service):
+    store, sheets = service
+    with pytest.raises(ValueError, match="at least one"):
+        approve([], client_context_bullets=[])
+    sheets.client_context = store.data["proposal"]["snapshot_client_context"] = "x" * 49_999
+    with pytest.raises(ValueError, match="resulting Client Context"):
+        approve([], client_context_bullets=["New context"])
+    assert not store.data["intents"]
+    assert not sheets.calls
+
+
+def test_unchanged_large_context_does_not_block_action_only_approval(service):
+    store, sheets = service
+    sheets.client_context = store.data["proposal"]["snapshot_client_context"] = "x" * 49_000
+    approve(["An action."], client_context_bullets=[])
+    assert sheets.client_context == "x" * 49_000
+
+
+def test_changed_client_context_is_a_stale_baseline_even_when_action_cells_match(service):
+    store, sheets = service
+    sheets.client_context = "A newer human context edit"
+    with pytest.raises(review.ReviewConflict, match="Sheet row changed"):
+        approve(["An action."], client_context_bullets=[])
+    assert not store.data["intents"]
+    assert not sheets.calls
+
+
+@pytest.mark.parametrize("sheet_id", [None, -1, True, "1869050409"])
+def test_unpinned_sheet_target_blocks_new_approvals_before_google_or_intent(service, monkeypatch, sheet_id):
+    store, sheets = service
+    monkeypatch.setattr(review.settings, "review_sheet_id", sheet_id)
+    with pytest.raises(review.ReviewUnavailable, match="numeric REVIEW_SHEET_ID"):
+        approve(["An action."])
+    assert not store.data["intents"]
+    assert "sheet-read" not in store.events
+    assert not sheets.calls
+
+
+def test_workspace_recovery_exposes_exact_split_payload_and_not_legacy_or_redirected_retry(service):
+    store, sheets = service
+    sheets.uncertain = True
+    with pytest.raises(review.ReviewUnavailable):
+        approve(["Edited action."], client_context_bullets=["Customer need: Updated context."])
+
+    class WorkspaceConnection:
+        def execute(self, sql, params=()):
+            if sql.startswith("select p.*"):
+                return Result([copy.deepcopy(store.data["proposal"])])
+            if sql.startswith("select idempotency_key"):
+                return Result([copy.deepcopy(store.data["intents"][0])])
+            if sql.startswith("select o.*"):
+                return Result([])
+            if sql.startswith("select d.*"):
+                return Result([])
+            raise AssertionError(sql)
+
+    view = review.workspace_view(WorkspaceConnection(), WORKSPACE)
+    proposal_view = view["proposals"][0]
+    assert proposal_view["retry"] == {"idempotency_key": "approval-key-1", "revision": 1,
+                                       "next_step_bullets": ["Edited action."],
+                                       "client_context_bullets": ["Customer need: Updated context."]}
+    assert proposal_view["nextStepBullets"] == ["Edited action."]
+    assert proposal_view["clientContextBullets"] == ["Customer need: Updated context."]
+    assert "bullets" not in proposal_view
+    assert view["routingVersion"] == 1
+    assert view["clientContextMode"] == "append"
+    store.data["intents"][0]["sheet_target"]["sheet_id"] = 999
+    redirected = review.workspace_view(WorkspaceConnection(), WORKSPACE)["proposals"][0]
+    assert "retry" not in redirected
+    assert "different Sheet configuration" in redirected["error"]
+    store.data["proposal"]["routing_version"] = 0
+    legacy = review.workspace_view(WorkspaceConnection(), WORKSPACE)["proposals"][0]
+    assert "retry" not in legacy
+    assert "predates column routing" in legacy["error"]
+
+
+def test_context_mirror_updates_tracked_value_and_logs_its_change():
+    class ContextMirror:
+        def __init__(self):
+            self.writes = []
+        def execute(self, sql, params=()):
+            if sql.startswith("select o.*"):
+                return Result([{"id": OPPORTUNITY, "name": "Pernod Ricard", "country": "ARG", "owner_code": "NDL",
+                                "stage": "4. Pilot", "primary_buyer": "Commercial", "contacts_text": "Tomás",
+                                "last_progress": "Old progress", "next_step": "Old next step", "client_context": "Old context",
+                                "removed_at": None}])
+            self.writes.append((sql, params))
+            return Result([{"id": "sync-run"}]) if "returning id" in sql else Result([])
+    conn = ContextMirror()
+    before = {"lastProgress": "Old progress", "nextStep": "Old next step", "clientContext": "Old context"}
+    after = {**before, "clientContext": "Old context\n- New context"}
+    assert review._mirror_approval(conn, proposal(), before, after)
+    assert conn.writes[0][1][:3] == ("Old progress", "Old next step", "Old context\n- New context")
+    changes = [params for sql, params in conn.writes if "insert into opportunity_changes" in sql]
+    assert len(changes) == 1
+    assert changes[0][3:] == ("client_context", "Old context", "Old context\n- New context")
+
+
+def test_explicit_replace_configuration_still_preserves_action_cells(service, monkeypatch):
+    store, sheets = service
+    sheets.client_context = store.data["proposal"]["snapshot_client_context"] = "Old context"
+    monkeypatch.setattr(review.settings, "review_client_context_mode", "replace")
+    before = (sheets.last_progress, sheets.next_step)
+    approve([], client_context_bullets=["New context"])
+    assert sheets.client_context == "- New context"
+    assert (sheets.last_progress, sheets.next_step) == before
