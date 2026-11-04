@@ -11,8 +11,9 @@ const context=vm.createContext({crypto:{randomUUID:()=> 'new-key'}});
 vm.runInContext(coreScript+'\n;globalThis.BiancaLive=BiancaLive;',context);
 const core=context.BiancaLive;
 const json=value=>JSON.parse(JSON.stringify(value));
+const approve=(client,nextStepBullets)=>client.decide('p-1','approve',{nextStepBullets,clientContextBullets:[]});
 function snapshot(status='pending'){
-  return {proposals:[{id:'p-1',company:'A real company',owner:'NDL',stage:'4. Pilot',country:'ARG',bullets:['Confirm the scope.'],sources:[{type:'Email',date:'Nov 2',quote:'Please confirm the scope.'}],lastProgress:'Old progress',nextStep:'Old next step',revision:2,status}],rows:[{id:'r-1',company:'A real company',owner:'NDL',stage:'4. Pilot',lastProgress:'Old progress',nextStep:'Old next step',revision:0}],activity:[]};
+  return {proposals:[{id:'p-1',company:'A real company',owner:'NDL',stage:'4. Pilot',country:'ARG',routingVersion:1,nextStepBullets:['Confirm the scope.'],clientContextBullets:[],sources:[{type:'Email',date:'Nov 2',quote:'Please confirm the scope.'}],lastProgress:'Old progress',nextStep:'Old next step',revision:2,status}],rows:[{id:'r-1',company:'A real company',owner:'NDL',stage:'4. Pilot',lastProgress:'Old progress',nextStep:'Old next step',revision:0}],activity:[]};
 }
 const completed=()=>({proposals:[],rows:[{id:'r-1',company:'A real company',owner:'NDL',stage:'4. Pilot',lastProgress:'Old next step',nextStep:'- Confirm the scope.',revision:1}],activity:[{id:'a-1',proposalId:'p-1',company:'A real company',kind:'approved',edited:false,at:'2026-11-02T20:00:00Z',before:{lastProgress:'Old progress',nextStep:'Old next step'},after:{lastProgress:'Old next step',nextStep:'- Confirm the scope.'}}]});
 let passed=0,failed=0;
@@ -59,7 +60,7 @@ test('REST transport uses only same-origin routes and places credentials in the 
   const fetcher=async(url,options)=>{calls.push({url,options});return {ok:true,status:200,json:async()=>snapshot()};};
   const transport=core.restTransport(fetcher,()=> 'founder-access-secret');
   await transport(core.TOOLS.workspace,{});
-  await transport(core.TOOLS.approve,{proposal_id:'id/unsafe',revision:3,idempotency_key:'intent-1',bullets:['One action']});
+  await transport(core.TOOLS.approve,{proposal_id:'id/unsafe',revision:3,idempotency_key:'intent-1',next_step_next_step_bullets:['One action'],client_context_bullets:[],client_context_bullets:[]});
   assert.equal(calls[0].url,'/review/workspace');
   assert.equal(calls[0].options.headers.Authorization,'Bearer founder-access-secret');
   assert.equal(calls[0].options.cache,'no-store');
@@ -67,7 +68,7 @@ test('REST transport uses only same-origin routes and places credentials in the 
   assert.equal(calls[0].options.redirect,'error');
   assert.equal(calls[1].url,'/review/proposals/id%2Funsafe/approve');
   assert.equal(calls[1].options.body.includes('founder-access-secret'),false);
-  assert.deepEqual(JSON.parse(calls[1].options.body),{revision:3,idempotency_key:'intent-1',bullets:['One action']});
+  assert.deepEqual(JSON.parse(calls[1].options.body),{revision:3,idempotency_key:'intent-1',next_step_next_step_bullets:['One action'],client_context_bullets:[],client_context_bullets:[]});
 });
 
 test('REST authentication, conflicts, and uncertain network responses are surfaced',async()=>{
@@ -82,7 +83,7 @@ test('Workspace validation accepts every company without the brief four-card cap
   const value=snapshot();value.proposals=Array.from({length:12},(_,i)=>({...value.proposals[0],id:'p-'+i}));
   assert.equal(core.workspace(value).proposals.length,12);
   assert.throws(()=>core.workspace({proposals:[],rows:[]}),/incomplete workspace/);
-  const bad=snapshot();bad.proposals[0].bullets=[null];assert.throws(()=>core.workspace(bad),/could not be read/);
+  const bad=snapshot();bad.proposals[0].nextStepBullets=[null];assert.throws(()=>core.workspace(bad),/could not be read/);
 });
 
 test('Approval waits for a confirmed write and a fresh shared snapshot before changing UI state',async()=>{
@@ -93,7 +94,7 @@ test('Approval waits for a confirmed write and a fresh shared snapshot before ch
   };
   const client=core.createClient(transport,{onChange:s=>changes.push(json(s)),makeKey:()=> 'intent-1'});
   await client.refresh();const before=JSON.stringify(client.state);
-  const save=client.decide('p-1','approve',['Confirm the scope.']);
+  const save=approve(client,['Confirm the scope.']);
   assert.equal(JSON.stringify(client.state),before);
   assert.equal(client.isBusy('p-1'),true);
   assert.equal(changes.length,1);
@@ -107,46 +108,46 @@ test('An unsuccessful approval keeps the card and reuses its exact idempotency k
   let fail=true;const writes=[];
   const transport=async(name,args)=>{if(name===core.TOOLS.workspace)return snapshot();writes.push(json(args));if(fail){fail=false;throw Error('Network interrupted');}return {status:'approved'};};
   const client=core.createClient(transport,{makeKey:()=> 'stable-key'});await client.refresh();
-  await assert.rejects(client.decide('p-1','approve',['Edited action.']),/Network interrupted/);
+  await assert.rejects(approve(client,['Edited action.']),/Network interrupted/);
   assert.equal(client.state.proposals[0].id,'p-1');assert.equal(client.state.rows[0].nextStep,'Old next step');
-  await client.decide('p-1','approve',['Edited action.']);
+  await approve(client,['Edited action.']);
   assert.deepEqual(writes[0],writes[1]);assert.equal(writes[0].idempotency_key,'stable-key');
 });
 
 test('An uncertain request cannot be changed into a different edit without a refresh',async()=>{
   const client=core.createClient(async name=>{if(name===core.TOOLS.workspace)return snapshot();throw Error('Unknown outcome');},{makeKey:()=> 'stable-key'});
-  await client.refresh();await assert.rejects(client.decide('p-1','approve',['Original edit.']));
-  await assert.rejects(client.decide('p-1','approve',['Different edit.']),/previous request may still be saving/);
+  await client.refresh();await assert.rejects(approve(client,['Original edit.']));
+  await assert.rejects(approve(client,['Different edit.']),/previous request may still be saving/);
   await assert.rejects(client.decide('p-1','ignore'),/previous request may still be saving/);
 });
 
 test('A fresh pending revision allows another review after a rejected old request',async()=>{
   let revision=2,key=0;const writes=[];
   const client=core.createClient(async(name,args)=>{if(name===core.TOOLS.workspace){const s=snapshot();s.proposals[0].revision=revision;return s;}writes.push(json(args));throw new core.ReviewError('Sheet changed',409);},{makeKey:()=> 'key-'+(++key)});
-  await client.refresh();await assert.rejects(client.decide('p-1','approve',['First edit.']));revision=3;await client.refresh();
-  await assert.rejects(client.decide('p-1','approve',['New edit.']),/Sheet changed/);
+  await client.refresh();await assert.rejects(approve(client,['First edit.']));revision=3;await client.refresh();
+  await assert.rejects(approve(client,['New edit.']),/Sheet changed/);
   assert.equal(writes[1].revision,3);assert.notEqual(writes[0].idempotency_key,writes[1].idempotency_key);
 });
 
 test('Applying approvals recover the durable original payload even after a new page load',async()=>{
-  const s=snapshot('applying');s.proposals[0].retry={idempotency_key:'durable-key',revision:1,bullets:['The originally approved edit.']};const writes=[];
+  const s=snapshot('applying');s.proposals[0].retry={idempotency_key:'durable-key',revision:1,next_step_bullets:['The originally approved edit.'],client_context_bullets:[]};const writes=[];
   const client=core.createClient(async(name,args)=>{if(name===core.TOOLS.workspace)return s;writes.push(json(args));return {status:'approved'};});
-  await client.refresh();await client.decide('p-1','approve',['A replacement edit must not be sent.']);
-  assert.deepEqual(writes,[{proposal_id:'p-1',idempotency_key:'durable-key',revision:1,bullets:['The originally approved edit.']}]);
+  await client.refresh();await approve(client,['A replacement edit must not be sent.']);
+  assert.deepEqual(writes,[{proposal_id:'p-1',idempotency_key:'durable-key',revision:1,next_step_bullets:['The originally approved edit.'],client_context_bullets:[]}]);
   await assert.rejects(client.decide('p-1','ignore'),/still being confirmed/);
 });
 
 test('An applying approval missing its durable retry record cannot cause a new write',async()=>{
   let writes=0;
   const client=core.createClient(async name=>{if(name===core.TOOLS.workspace)return snapshot('applying');writes++;});await client.refresh();
-  await assert.rejects(client.decide('p-1','approve',['One action']),/still being confirmed/);assert.equal(writes,0);
+  await assert.rejects(approve(client,['One action']),/still being confirmed/);assert.equal(writes,0);
 });
 
 test('Double clicks cannot send concurrent approval requests',async()=>{
   let resolveWrite,writes=0;
   const client=core.createClient(async name=>{if(name===core.TOOLS.workspace)return snapshot();writes++;return new Promise(resolve=>{resolveWrite=resolve;});});await client.refresh();
-  const first=client.decide('p-1','approve',['Confirm the scope.']);
-  await assert.rejects(client.decide('p-1','approve',['Confirm the scope.']),/already being saved/);assert.equal(writes,1);
+  const first=approve(client,['Confirm the scope.']);
+  await assert.rejects(approve(client,['Confirm the scope.']),/already being saved/);assert.equal(writes,1);
   resolveWrite({status:'approved'});await first;
 });
 
@@ -161,13 +162,13 @@ test('Ignore is a server decision with no approval bullets or local sheet change
 test('A saved decision with a failed refresh is reported without fabricating a local result',async()=>{
   let reads=0;
   const client=core.createClient(async name=>{if(name===core.TOOLS.workspace){if(++reads>1)throw Error('View unavailable');return snapshot();}return {status:'approved'};});await client.refresh();
-  await assert.rejects(client.decide('p-1','approve',['Confirm the scope.']),/decision was saved, but the latest view could not load/);
+  await assert.rejects(approve(client,['Confirm the scope.']),/decision was saved, but the latest view could not load/);
   assert.equal(client.state.proposals.length,1);assert.equal(client.state.rows[0].nextStep,'Old next step');
 });
 
 test('Blank edited approvals never reach the connector',async()=>{
   let writes=0;const client=core.createClient(async name=>{if(name===core.TOOLS.workspace)return snapshot();writes++;});await client.refresh();
-  await assert.rejects(client.decide('p-1','approve',core.parseBullets(' \n - \n • ')),/at least one bullet/);assert.equal(writes,0);
+  await assert.rejects(approve(client,core.parseBullets(' \n - \n • ')),/at least one bullet/);assert.equal(writes,0);
 });
 
 
@@ -248,7 +249,7 @@ test('An expanded Current Next steps dropdown survives a card rerender and remai
   let calls=0;
   const page=fakePage({callTool:async()=>{calls++;return {structuredContent:snapshot()};}});
   await new Promise(resolve=>setImmediate(resolve));
-  const details={open:true,matches:selector=>selector==='[data-current-next-steps]',closest:()=>({dataset:{id:'p-1'}})};
+  const details={open:true,matches:selector=>selector.includes('[data-current-next-steps]'),closest:()=>({dataset:{id:'p-1'}})};
   page.events.toggle({target:details});page.get('#company-search').handlers.input();
   assert.ok(/<details[^>]*class="current-next-steps"[^>]* open>/.test(page.get('#review-list').innerHTML));
   details.open=false;page.events.toggle({target:details});page.get('#company-search').handlers.input();
@@ -300,7 +301,7 @@ test('A response arriving after disconnect cannot repopulate the page with compa
 
 test('Applying cards show the backend reconciliation message as escaped text',async()=>{
   const s=snapshot('applying');
-  s.proposals[0].retry={idempotency_key:'durable-key',revision:2,bullets:['Confirm the scope.']};
+  s.proposals[0].retry={idempotency_key:'durable-key',revision:2,next_step_bullets:['Confirm the scope.'],client_context_bullets:[]};
   s.proposals[0].error='An operator must reconcile the Sheet before retrying. <img src=x>';
   const page=fakePage({callTool:async()=>({structuredContent:s})});
   await new Promise(resolve=>setImmediate(resolve));
@@ -353,6 +354,146 @@ test('A newer successful mirror supersedes an older failed approval for the same
   const page=fakePage({callTool:async()=>({structuredContent:s})});
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(page.get('#mirror-sync-notice').hidden,true);
+});
+
+
+test('New routing never guesses destination from legacy flat bullet text',async()=>{
+  const s=snapshot();s.proposals[0].routingVersion=0;s.proposals[0].bullets=['Customer need: Do not route this as an action.'];
+  delete s.proposals[0].nextStepBullets;delete s.proposals[0].clientContextBullets;
+  let writes=0;
+  const client=core.createClient(async(name)=>{if(name===core.TOOLS.workspace)return s;writes++;});
+  await client.refresh();
+  assert.deepEqual(json(client.state.proposals[0].nextStepBullets),[]);
+  await assert.rejects(client.decide('p-1','approve',{nextStepBullets:['A guessed action'],clientContextBullets:[]}),/rebuild/i);
+  await assert.rejects(client.decide('p-1','ignore'),/rebuild/i);
+  assert.equal(writes,0);
+  const page=fakePage({callTool:async()=>({structuredContent:s})});
+  await new Promise(resolve=>setImmediate(resolve));
+  const card=page.get('#review-list').innerHTML;
+  assert.ok(card.includes('Rebuild required'));
+  assert.equal(card.includes('data-action="approve"'),false);
+  assert.equal(card.includes('Do not route this as an action.'),false);
+});
+
+test('A typed proposal with missing groups fails closed rather than flattening old bullets',()=>{
+  const s=snapshot();s.proposals[0].bullets=['Legacy'];delete s.proposals[0].clientContextBullets;
+  assert.throws(()=>core.workspace(s),/could not be read/);
+});
+
+test('Approval sends independently reviewed destination groups and no flat bullets field',async()=>{
+  const calls=[];
+  const client=core.createClient(async(name,args)=>{if(name===core.TOOLS.workspace)return snapshot();calls.push(json(args));return {status:'approved'};},{makeKey:()=> 'grouped-key'});
+  await client.refresh();
+  await client.decide('p-1','approve',{nextStepBullets:[' Blocker: Data missing. '],clientContextBullets:[' Customer need: Retail reporting. ']});
+  assert.deepEqual(calls,[{proposal_id:'p-1',revision:2,idempotency_key:'grouped-key',next_step_bullets:['Blocker: Data missing.'],client_context_bullets:['Customer need: Retail reporting.']}]);
+  assert.equal('bullets' in calls[0],false);
+});
+
+test('Context-only and Next-Step-only reviews retain their empty opposite group',async()=>{
+  for(const update of [{nextStepBullets:[],clientContextBullets:['Objection: Timing.']},{nextStepBullets:['Send the scope.'],clientContextBullets:[]}]){
+    const calls=[];
+    const client=core.createClient(async(name,args)=>{if(name===core.TOOLS.workspace)return snapshot();calls.push(json(args));return {status:'approved'};});
+    await client.refresh();await client.decide('p-1','approve',update);
+    assert.deepEqual(calls[0].next_step_bullets,update.nextStepBullets);
+    assert.deepEqual(calls[0].client_context_bullets,update.clientContextBullets);
+    assert.equal(client.state.rows[0].nextStep,'Old next step','The client never invents a Sheet rotation without a backend snapshot.');
+  }
+});
+
+test('Flat, empty, malformed, or oversized groups never reach a write tool',async()=>{
+  let writes=0;
+  const client=core.createClient(async(name)=>{if(name===core.TOOLS.workspace)return snapshot();writes++;});
+  await client.refresh();
+  for(const update of [['Flat bullet'],{nextStepBullets:[],clientContextBullets:[]},{nextStepBullets:['A valid action'],clientContextBullets:[null]},{nextStepBullets:['x'.repeat(4001)],clientContextBullets:[]},{nextStepBullets:['A bullet\nwith two lines'],clientContextBullets:[]}]){
+    await assert.rejects(client.decide('p-1','approve',update));
+  }
+  assert.equal(writes,0);
+});
+
+test('An uncertain review preserves both groups and rejects a changed Client Context on retry',async()=>{
+  const writes=[];let fail=true;
+  const client=core.createClient(async(name,args)=>{if(name===core.TOOLS.workspace)return snapshot();writes.push(json(args));if(fail){fail=false;throw Error('Unknown outcome');}return {status:'approved'};},{makeKey:()=> 'context-stable-key'});
+  await client.refresh();
+  const update={nextStepBullets:[],clientContextBullets:['Customer need: Reporting.']};
+  await assert.rejects(client.decide('p-1','approve',update));
+  await assert.rejects(client.decide('p-1','approve',{nextStepBullets:[],clientContextBullets:['Different context.']}),/previous request may still/);
+  await client.decide('p-1','approve',update);
+  assert.deepEqual(writes[0],writes[1]);
+  assert.equal(writes[1].client_context_bullets[0],'Customer need: Reporting.');
+});
+
+test('Applying recovery reuses both durable groups after a new page load',async()=>{
+  const s=snapshot('applying');s.proposals[0].retry={idempotency_key:'saved-context-key',revision:1,next_step_bullets:[],client_context_bullets:['Originally approved context.']};
+  const writes=[];
+  const client=core.createClient(async(name,args)=>{if(name===core.TOOLS.workspace)return s;writes.push(json(args));return {status:'approved'};});
+  await client.refresh();await client.decide('p-1','approve',{nextStepBullets:['Do not send this new action.'],clientContextBullets:[]});
+  assert.deepEqual(writes,[{proposal_id:'p-1',idempotency_key:'saved-context-key',revision:1,next_step_bullets:[],client_context_bullets:['Originally approved context.']}]);
+});
+
+test('Cards show separate destination sections and read-only current Client Context',async()=>{
+  const s=snapshot();s.proposals[0].clientContextBullets=['Customer need: Retail expansion.'];s.proposals[0].clientContext='Older proposal context';
+  s.rows[0].clientContext='- Current context & details.\n- <img src=x> Escaped.';
+  const page=fakePage({callTool:async()=>({structuredContent:s})});
+  await new Promise(resolve=>setImmediate(resolve));
+  const card=page.get('#review-list').innerHTML;
+  assert.ok(card.includes('Next Step · actions and blockers'));
+  assert.ok(card.includes('Client Context · needs, signals, and objections'));
+  assert.ok(card.includes('<summary>Current Client Context</summary>'));
+  assert.ok(card.includes('- Current context &amp; details.\n- &lt;img src=x&gt; Escaped.'));
+  assert.equal(card.includes('Older proposal context'),false);
+  assert.equal(card.includes('<img src=x>'),false);
+});
+
+test('Editor submits two independently editable destination groups, including context-only approval',async()=>{
+  const s=snapshot();s.proposals[0].clientContextBullets=['Customer need: Existing suggestion.'];s.rows[0].clientContext='Current Sheet context';
+  const writes=[];
+  const page=fakePage({callTool:async(name,args)=>{if(name===core.TOOLS.workspace)return {structuredContent:s};writes.push(json(args));return {structuredContent:{status:'approved'}};}});
+  await new Promise(resolve=>setImmediate(resolve));
+  const article={dataset:{id:'p-1'}},button={dataset:{action:'edit'},closest:()=>article};
+  page.events.click({target:{closest:()=>button}});
+  assert.equal(page.get('#previous-client-context').textContent,'Current Sheet context');
+  assert.equal(page.get('#edit-client-context').value,'- Customer need: Existing suggestion.');
+  page.get('#edit-content').value='';
+  page.get('#edit-client-context').value='- Customer need: Manually edited context.';
+  page.get('#edit-form').handlers.submit({preventDefault(){}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(writes.length,1);
+  assert.deepEqual(writes[0].next_step_bullets,[]);
+  assert.deepEqual(writes[0].client_context_bullets,['Customer need: Manually edited context.']);
+});
+
+test('A blank current Client Context stays blank and has a clear empty state',async()=>{
+  const s=snapshot();s.proposals[0].clientContext='Older context';s.rows[0].clientContext='';
+  const page=fakePage({callTool:async()=>({structuredContent:s})});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.ok(page.get('#review-list').innerHTML.includes('No Client Context is currently noted.'));
+  assert.equal(page.get('#review-list').innerHTML.includes('Older context'),false);
+});
+
+test('Mirror recovery includes Client Context, not just the action cells',async()=>{
+  const s=completed();s.activity[0].mirror_refreshed=false;s.activity[0].after.clientContext='Newly approved context';s.rows[0].clientContext='Old context';
+  const page=fakePage({callTool:async()=>({structuredContent:s})});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(page.get('#mirror-sync-notice').hidden,false);
+});
+
+test('Context-only activity identifies Client Context without claiming Next Step changed',async()=>{
+  const s=completed();s.activity[0].before.clientContext='Old context';s.activity[0].after.clientContext='Old context\n- New context';
+  s.activity[0].after.nextStep=s.activity[0].before.nextStep;
+  s.activity[0].after.lastProgress=s.activity[0].before.lastProgress;
+  const page=fakePage({callTool:async()=>({structuredContent:s})});
+  await new Promise(resolve=>setImmediate(resolve));
+  const activity=page.get('#activity-list').innerHTML;
+  assert.ok(activity.includes('<strong>Client Context</strong>'));
+  assert.equal(activity.includes('<strong>Next Step</strong>'),false);
+});
+
+
+test('A configured context replacement policy is stated honestly in the live editor',async()=>{
+  const s=snapshot();s.clientContextMode='replace';
+  const page=fakePage({callTool:async()=>({structuredContent:s})});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.ok(page.get('#context-help').textContent.includes('replace Client Context'));
 });
 
 (async()=>{for(const t of tests){try{await t.fn();passed++;process.stdout.write('PASS '+t.name+'\n');}catch(error){failed++;process.stdout.write('FAIL '+t.name+'\n  '+error.stack+'\n');}}process.stdout.write(`\n${passed} passed; ${failed} failed.\n`);process.exitCode=failed?1:0;})();

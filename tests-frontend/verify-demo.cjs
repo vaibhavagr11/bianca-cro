@@ -18,6 +18,7 @@ const json = value => JSON.parse(JSON.stringify(value));
 const rowFor = (state, id) => state.rows.find(row => row.id === id);
 const proposalFor = (state, id) => state.proposals.find(proposal => proposal.id === id);
 const at = '2026-11-02T20:30:00.000Z';
+const approve=(state,id,nextStepBullets,at)=>core.approve(state,id,{nextStepBullets,clientContextBullets:[]},at);
 let passed = 0;
 let failed = 0;
 function test(name, run) {
@@ -38,12 +39,12 @@ test('Approval exactly replaces Last progress with previous Next step', () => {
   const before = core.initial();
   const id = 'pernod-ricard';
   const oldRow = rowFor(before, id);
-  const after = core.approve(before, id, proposalFor(before, id).bullets, at);
+  const after = core.approve(before, id, proposalFor(before, id), at);
   const updated = rowFor(after, id);
   assert.equal(updated.lastProgress, oldRow.nextStep);
   assert.notEqual(updated.lastProgress, oldRow.lastProgress);
   assert.equal(updated.lastProgress.includes(oldRow.lastProgress), false, 'Old Last progress must not be appended.');
-  assert.equal(updated.nextStep, proposalFor(before, id).bullets.map(b => '- ' + b).join('\n'));
+  assert.equal(updated.nextStep, proposalFor(before, id).nextStepBullets.map(b => '- ' + b).join('\n'));
   assert.equal(updated.revision, 1);
   assert.equal(proposalFor(after, id).status, 'approved');
   assert.equal(proposalFor(after, id).edited, false);
@@ -52,7 +53,7 @@ test('Approval exactly replaces Last progress with previous Next step', () => {
 test('Approval preserves every unrelated row and proposal', () => {
   const before = core.initial();
   const id = 'campari';
-  const after = core.approve(before, id, ['Send the agreed field list.'], at);
+  const after = approve(before, id, ['Send the agreed field list.'], at);
   assert.deepEqual(json(after.rows.filter(r => r.id !== id)), json(before.rows.filter(r => r.id !== id)));
   assert.deepEqual(json(after.proposals.filter(p => p.id !== id)), json(before.proposals.filter(p => p.id !== id)));
 });
@@ -60,7 +61,7 @@ test('Approval preserves every unrelated row and proposal', () => {
 test('Approval does not mutate its input workspace', () => {
   const before = core.initial();
   const snapshot = JSON.stringify(before);
-  core.approve(before, 'campari', ['A manually approved next step.'], at);
+  approve(before, 'campari', ['A manually approved next step.'], at);
   assert.equal(JSON.stringify(before), snapshot);
 });
 
@@ -68,7 +69,7 @@ test('Manual edits accept common bullet markers, preserve wording, and write one
   const before = core.initial();
   const edited = core.parseBullets('  • Confirm the pilot scope.\r\n\r\n* Send the checklist.\n1. Book the kickoff.\n2) Include Tomás and Elaine.  ');
   assert.deepEqual(json(edited), ['Confirm the pilot scope.', 'Send the checklist.', 'Book the kickoff.', 'Include Tomás and Elaine.']);
-  const after = core.approve(before, 'pernod-ricard', edited, at);
+  const after = approve(before, 'pernod-ricard', edited, at);
   assert.equal(rowFor(after, 'pernod-ricard').nextStep, '- Confirm the pilot scope.\n- Send the checklist.\n- Book the kickoff.\n- Include Tomás and Elaine.');
   assert.equal(proposalFor(after, 'pernod-ricard').edited, true);
   assert.equal(after.activity[0].edited, true);
@@ -77,16 +78,16 @@ test('Manual edits accept common bullet markers, preserve wording, and write one
 test('Edited approval keeps an exact audit snapshot of overwritten and written cells', () => {
   const before = core.initial();
   const oldRow = rowFor(before, 'campari');
-  const after = core.approve(before, 'campari', ['Confirm the import date.'], at);
-  assert.deepEqual(json(after.activity[0].before), {lastProgress: oldRow.lastProgress, nextStep: oldRow.nextStep});
-  assert.deepEqual(json(after.activity[0].after), {lastProgress: oldRow.nextStep, nextStep: '- Confirm the import date.'});
+  const after = approve(before, 'campari', ['Confirm the import date.'], at);
+  assert.deepEqual(json(after.activity[0].before), {lastProgress: oldRow.lastProgress, nextStep: oldRow.nextStep,clientContext:oldRow.clientContext});
+  assert.deepEqual(json(after.activity[0].after), {lastProgress: oldRow.nextStep, nextStep: '- Confirm the import date.',clientContext:oldRow.clientContext});
   assert.equal(after.activity[0].at, at);
 });
 
 test('Repeated approval is idempotent and cannot rotate the sheet twice', () => {
   const initial = core.initial();
-  const once = core.approve(initial, 'campari', ['First approved wording.'], at);
-  const twice = core.approve(once, 'campari', ['Different duplicate wording.'], '2026-11-02T20:31:00.000Z');
+  const once = approve(initial, 'campari', ['First approved wording.'], at);
+  const twice = approve(once, 'campari', ['Different duplicate wording.'], '2026-11-02T20:31:00.000Z');
   assert.equal(twice, once);
   assert.equal(twice.activity.length, 1);
   assert.equal(rowFor(twice, 'campari').revision, 1);
@@ -96,7 +97,7 @@ test('Repeated approval is idempotent and cannot rotate the sheet twice', () => 
 test('An empty previous Next step replaces Last progress with an empty cell', () => {
   const initial = core.initial();
   rowFor(initial, 'koala-eco').nextStep = '';
-  const after = core.approve(initial, 'koala-eco', ['Send the onboarding checklist.'], at);
+  const after = approve(initial, 'koala-eco', ['Send the onboarding checklist.'], at);
   assert.equal(rowFor(after, 'koala-eco').lastProgress, '');
   assert.equal(after.activity[0].after.lastProgress, '');
 });
@@ -105,7 +106,7 @@ test('Blank edits and malformed bullet arrays cannot be approved', () => {
   const before = core.initial();
   const snapshot = JSON.stringify(before);
   for (const bullets of [core.parseBullets(' \n - \n • \n * '), [], [''], ['   '], ['Valid', ' '], [null], 'A string']) {
-    assert.throws(() => core.approve(before, 'campari', bullets, at), /at least one bullet/);
+    assert.throws(() => approve(before, 'campari', bullets, at), /at least one bullet/);
   }
   assert.equal(JSON.stringify(before), snapshot);
 });
@@ -139,26 +140,26 @@ test('Undo ignore cannot revert an approved company', () => {
   const ignored = core.ignore(before, 'farmater', at);
   const actionId = ignored.activity[0].id;
   const restored = core.undoIgnore(ignored, actionId);
-  const approved = core.approve(restored, 'farmater', ['Deliver the guide.'], at);
+  const approved = approve(restored, 'farmater', ['Deliver the guide.'], at);
   assert.equal(core.undoIgnore(approved, actionId), approved);
   assert.equal(proposalFor(approved, 'farmater').status, 'approved');
 });
 
 test('Approving an ignored company or ignoring an approved company makes no changes', () => {
   const ignored = core.ignore(core.initial(), 'farmater', at);
-  assert.equal(core.approve(ignored, 'farmater', ['Unexpected content.'], at), ignored);
-  const approved = core.approve(core.initial(), 'farmater', ['Approved content.'], at);
+  assert.equal(approve(ignored, 'farmater', ['Unexpected content.'], at), ignored);
+  const approved = approve(core.initial(), 'farmater', ['Approved content.'], at);
   assert.equal(core.ignore(approved, 'farmater', at), approved);
 });
 
 test('Unknown companies cannot be approved or ignored', () => {
-  assert.throws(() => core.approve(core.initial(), 'unknown', ['A bullet.'], at), /Company not found/);
+  assert.throws(() => approve(core.initial(), 'unknown', ['A bullet.'], at), /Company not found/);
   assert.throws(() => core.ignore(core.initial(), 'unknown', at), /Company not found/);
 });
 
 test('Normal review transitions and JSON persistence retain valid state', () => {
   let state = core.initial();
-  state = core.approve(state, 'pernod-ricard', ['Confirm the scope.'], at);
+  state = approve(state, 'pernod-ricard', ['Confirm the scope.'], at);
   state = core.ignore(state, 'farmater', at);
   assert.equal(core.valid(state), true);
   assert.equal(core.valid(json(state)), true);
@@ -187,7 +188,7 @@ function fakePage(savedState){
     querySelectorAll(){return [];}querySelector(){return new Element();}
   }
   const elements=new Map(),events={},storage=new Map();
-  if(savedState)storage.set('bianca.pipeline-review.demo.v1',JSON.stringify(savedState));
+  if(savedState)storage.set('bianca.pipeline-review.demo.v2',JSON.stringify(savedState));
   const get=selector=>{if(!elements.has(selector))elements.set(selector,new Element());return elements.get(selector);};
   get('#owner-filter').value='all';
   const page=vm.createContext({
@@ -253,6 +254,73 @@ test('Demo current row with no Next steps shows a clear empty state',()=>{
   const card=fakePage(state).get('#review-list').innerHTML;
   assert.ok(card.includes('No Next steps are currently noted.'));
   assert.equal(card.includes('Older context must not return'),false);
+});
+
+
+test('New schema rejects saved flat legacy proposals instead of guessing column categories',()=>{
+  const legacy=core.initial();legacy.schema=1;
+  assert.equal(core.valid(legacy),false);
+  assert.throws(()=>core.approve(core.initial(),'campari',['A flat legacy bullet.'],at),/at least one bullet/);
+  assert.equal(html.includes('bianca.pipeline-review.demo.v2'),true);
+});
+
+test('Approval routes groups to separate cells and preserves the old Client Context exactly',()=>{
+  const before=core.initial(),id='pernod-ricard',old=rowFor(before,id);
+  const after=core.approve(before,id,{nextStepBullets:['Blocker: Store codes are missing.'],clientContextBullets:['Buying signal: Pilot approved.']},at);
+  assert.equal(rowFor(after,id).nextStep,'- Blocker: Store codes are missing.');
+  assert.equal(rowFor(after,id).lastProgress,old.nextStep);
+  assert.equal(rowFor(after,id).clientContext,old.clientContext+'\n- Buying signal: Pilot approved.');
+  assert.equal(rowFor(after,id).nextStep.includes('Buying signal'),false);
+});
+
+test('Context-only approval changes no action or progress cell',()=>{
+  const before=core.initial(),old=rowFor(before,'campari');
+  const after=core.approve(before,'campari',{nextStepBullets:[],clientContextBullets:['Objection: Timing depends on budget.']},at);
+  assert.equal(rowFor(after,'campari').lastProgress,old.lastProgress);
+  assert.equal(rowFor(after,'campari').nextStep,old.nextStep);
+  assert.equal(rowFor(after,'campari').clientContext,old.clientContext+'\n- Objection: Timing depends on budget.');
+  const page=fakePage(after),history=page.get('#activity-list').innerHTML;
+  assert.ok(history.includes('<strong>Client Context</strong>'));
+  assert.equal(history.includes('<strong>Next Step</strong>'),false);
+});
+
+test('Next-Step-only approval leaves Client Context intact',()=>{
+  const before=core.initial(),old=rowFor(before,'campari');
+  const after=core.approve(before,'campari',{nextStepBullets:['Send the data fields.'],clientContextBullets:[]},at);
+  assert.equal(rowFor(after,'campari').clientContext,old.clientContext);
+});
+
+test('Context append deduplicates bullets without trimming or rewriting existing context',()=>{
+  const existing='  Existing introductory context.\n• Customer need: Retail reporting.\n';
+  assert.equal(core.appendContext(existing,['customer need: Retail reporting.','Objection: Timing.','Objection: Timing.']),existing+'- Objection: Timing.');
+  assert.equal(core.appendContext(existing,['Customer need: Retail reporting.']),existing);
+});
+
+test('Both groups empty or malformed cannot be approved',()=>{
+  for(const update of [{nextStepBullets:[],clientContextBullets:[]},{nextStepBullets:['Valid'],clientContextBullets:[null]},{nextStepBullets:[],clientContextBullets:'Wrong'},{nextStepBullets:['x'.repeat(4001)],clientContextBullets:[]}]){
+    assert.throws(()=>core.approve(core.initial(),'campari',update,at));
+  }
+});
+
+test('Cards and editor expose separate destination groups and existing Client Context',()=>{
+  const before=core.initial(),p=proposalFor(before,'pernod-ricard');
+  const page=fakePage(before),cards=page.get('#review-list').innerHTML;
+  assert.ok(cards.includes('Next Step · actions and blockers'));
+  assert.ok(cards.includes('Client Context · needs, signals, and objections'));
+  assert.ok(cards.includes('<summary>Current Client Context</summary>'));
+  assert.ok(html.includes('id="edit-client-context"'));
+  const article={dataset:{id:p.id}},button={dataset:{action:'edit'},closest:()=>article};
+  page.events.click({target:{closest:()=>button}});
+  assert.equal(page.get('#edit-content').value,p.nextStepBullets.map(b=>'- '+b).join('\n'));
+  assert.equal(page.get('#edit-client-context').value,p.clientContextBullets.map(b=>'- '+b).join('\n'));
+  assert.equal(page.get('#previous-client-context').textContent,rowFor(before,p.id).clientContext);
+});
+
+test('Empty current Client Context is explicit and does not revive the proposal baseline',()=>{
+  const before=core.initial();before.proposals[0].clientContext='Old context';before.rows[0].clientContext='';
+  const cards=fakePage(before).get('#review-list').innerHTML;
+  assert.ok(cards.includes('No Client Context is currently noted.'));
+  assert.equal(cards.includes('Old context'),false);
 });
 
 process.stdout.write(`\n${passed} passed; ${failed} failed.\n`);
