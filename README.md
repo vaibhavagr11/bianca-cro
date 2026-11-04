@@ -14,13 +14,17 @@ n8n (Cloud) fetches data from Google and posts it to the backend; all business l
 ## Sales Pipeline Updates
 
 The founder review application groups proposed changes by company and supports **Approve**, **Edit → Save & approve**,
-and **Ignore**. Approval replaces `Last progress` with the exact previous `Next step`, then writes the approved bullets
-into `Next step`. Ignore never writes to the Sheet. Owners RG, NC, and NDL are supported.
+and **Ignore**. Next steps, commitments, and blockers go to `Next step`; customer needs, buying signals, and objections
+go to `Client Context`. Action approval replaces `Last progress` with the exact previous `Next step`, then writes the
+approved action bullets into `Next step`. Context approval adds distinct reviewed bullets to the existing `Client Context`.
+An empty section leaves its cells unchanged. Ignore never writes to the Sheet. Owners RG, NC, and NDL are supported.
+
+The configured default destination is the [Pipeline tab of the designated source-of-truth Sheet](https://docs.google.com/spreadsheets/d/14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw/edit?gid=1869050409#gid=1869050409).
 
 - [Live interface and approved sample-data preview](artifacts/README.md)
 - [Deployment, Claude Enterprise connector, and n8n setup](docs/gsheet-updates.md)
 
-This feature is disabled by default. It requires migration `012_sheet_review.sql`, a configured Google service account,
+This feature is disabled by default. It requires migrations `012_sheet_review.sql` and `013_sheet_review_columns.sql`, a configured Google service account,
 and separate founder review credentials. Committing this code does not connect or modify a production Sheet or Claude account.
 
 ## Run the backend locally
