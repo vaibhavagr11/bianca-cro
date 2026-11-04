@@ -104,11 +104,24 @@ def _workspace() -> dict:
         return review_service.workspace_view(conn, workspace_id)
 
 
-def _build() -> dict:
+def _build(force: bool = False) -> dict:
     with db.connect() as conn:
         workspace_id = _workspace_id(conn)
         conn.row_factory = dict_row
-        return review_service.build_proposals(conn, workspace_id)
+        return review_service.build_proposals(conn, workspace_id, force=force)
+
+
+def _daily_ready() -> None:
+    """Do not freeze a daily review cycle before upstream processing has finished."""
+    with db.connect() as conn:
+        workspace_id = _workspace_id(conn)
+        row = conn.execute(
+            "select d.stage, exists (select 1 from source_records s where s.workspace_id = d.workspace_id"
+            " and s.status = 'pending') from daily_runs d where d.workspace_id = %s and d.for_date ="
+            " (now() at time zone (select timezone from workspaces where id = %s))::date",
+            (workspace_id, workspace_id)).fetchone()
+    if not row or row[0] != "done" or row[1]:
+        raise HTTPException(409, "Finish today's ingestion and /process/daily with stage=done before publishing review updates")
 
 
 def _decision(proposal_id: str, actor: str, action: str, payload: IgnoreRequest) -> dict:
@@ -135,9 +148,18 @@ def workspace(actor: str = Depends(reviewer)) -> dict:
 
 
 @router.post("/build")
-def build(x_ingest_token: str | None = Header(default=None)) -> dict:
+def build(force: bool = False, x_ingest_token: str | None = Header(default=None)) -> dict:
     enabled()
     require_token(x_ingest_token)
+    return _build(force=force)
+
+
+@router.post("/daily")
+def daily_review(x_ingest_token: str | None = Header(default=None)) -> dict:
+    """Daily scheduler entry point; never builds or sends a second email brief."""
+    enabled()
+    require_token(x_ingest_token)
+    _daily_ready()
     return _build()
 
 
@@ -176,14 +198,7 @@ def publish(version: Literal["v1", "v2"] = "v2", x_ingest_token: str | None = He
     """
     enabled()
     require_token(x_ingest_token)
-    with db.connect() as conn:
-        workspace_id = _workspace_id(conn)
-        row = conn.execute(
-            "select stage from daily_runs where workspace_id = %s and for_date ="
-            " (now() at time zone (select timezone from workspaces where id = %s))::date",
-            (workspace_id, workspace_id)).fetchone()
-    if not row or row[0] != "done":
-        raise HTTPException(409, "Finish /process/daily with stage=done before publishing")
+    _daily_ready()
     result = {}
     with ThreadPoolExecutor(max_workers=2) as pool:
         tasks = {"brief": pool.submit(brief_api.build_brief, False, version, x_ingest_token),
@@ -259,7 +274,7 @@ async def mcp(request: Request, actor: str = Depends(reviewer)) -> Response:
     if method == "initialize":
         requested = params.get("protocolVersion")
         result = {"protocolVersion": requested if requested in PROTOCOLS else PROTOCOLS[0],
-                  "capabilities": {"tools": {}}, "serverInfo": {"name": "Bianca Sales Pipeline Updates", "version": "2.0.0"}}
+                  "capabilities": {"tools": {}}, "serverInfo": {"name": "Bianca Sales Pipeline Updates", "version": "3.0.0"}}
     elif method == "ping":
         result = {}
     elif method == "tools/list":

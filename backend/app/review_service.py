@@ -9,7 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 
 from psycopg.rows import dict_row
@@ -20,6 +21,7 @@ from app import db
 from app.config import settings
 from app.pipeline import PipelineRow, TRACKED_FIELDS, normalize_name
 from app.review_sheets import SheetsClient, SheetConflict, SheetError, SheetWriteUncertain
+from app.review_content import (source_version, proposal_content, merge_content, approved_lineage, validate_lineage)
 
 
 class ReviewConflict(ValueError):
@@ -92,98 +94,75 @@ def clean_bullets(bullets: list[str], *, allow_empty: bool = False) -> list[str]
     return clean
 
 
-def source_version(record: dict) -> dict:
-    """Calendar cancellation-only changes count; mailbox aliases and extracted UUIDs do not."""
-    meta = record.get("meta") or {}
-    identity = {"source": record["source"], "external_id": record["external_id"],
-                "content_hash": record["content_hash"], "occurred_at": _stamp(record.get("occurred_at")),
-                "subject": record.get("subject"), "calendar_status": meta.get("status") if record["source"] == "calendar" else None}
-    return {"source": record["source"], "external_id": record["external_id"], "version": _hash(identity)}
-
-
 def _source_key(version: dict) -> tuple:
     return version["source"], version["external_id"], version["version"]
 
 
-def _source_link(record: dict) -> str | None:
-    if record["source"] == "gmail" and record.get("thread_id"):
-        return "https://mail.google.com/mail/u/0/#all/" + str(record["thread_id"])
-    if record["source"] == "notes" and (record.get("meta") or {}).get("doc_id"):
-        return "https://docs.google.com/document/d/" + str(record["meta"]["doc_id"]) + "/edit"
-    return None
+def _instant(value: Any) -> datetime | None:
+    """Source timestamps are UTC instants; an unknown initial date cannot prove recency."""
+    if isinstance(value, date) and not isinstance(value, datetime):
+        value = datetime.combine(value, datetime.min.time(), tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
 
 
-def proposal_content(records: list[dict], insights: list[dict]) -> tuple[list[str], list[str], list[dict]]:
-    """Reuse already validated commercial insights; factual fallbacks never infer progress from a meeting title."""
-    next_steps: list[str] = []
-    client_context: list[str] = []
-    seen: set[tuple[str, str]] = set()
-    covered: set[str] = set()
-    sources: list[dict] = []
-    by_id = {str(r["id"]): r for r in records}
+def _in_bootstrap_window(record: dict, state: dict) -> bool:
+    occurred = _instant(record.get("occurred_at"))
+    return occurred is not None and state["bootstrap_cutoff"] <= occurred <= state["initialized_at"]
 
-    def add(text: str, destination: str = "next_step") -> None:
-        key = (destination, _squash(text))
-        if key[1] and key not in seen:
-            seen.add(key)
-            (next_steps if destination == "next_step" else client_context).append(text)
 
-    def evidence(record: dict, quote: str) -> None:
-        entry = {"type": SOURCE_NAMES[record["source"]], "date": _stamp(record.get("occurred_at"))[:10] or "Undated",
-                 "quote": quote, "recordedAt": _stamp(record.get("created_at")),
-                 "url": _source_link(record), "recordId": str(record["id"])}
-        if not any(s["recordId"] == entry["recordId"] and s["quote"] == quote for s in sources):
-            sources.append(entry)
+def _cycle(conn, workspace_id, *, force: bool) -> tuple[dict, bool]:
+    """Persist one initial source boundary and one resumable cycle per workspace day."""
+    clock = conn.execute("select now() as now, timezone from workspaces where id = %s", (workspace_id,)).fetchone()
+    if not clock:
+        raise ReviewUnavailable("The review workspace is unavailable.")
+    now = _instant(clock["now"])
+    today = now.astimezone(ZoneInfo(clock["timezone"])).date()
+    state = conn.execute("select * from review_queue_state where workspace_id = %s for update", (workspace_id,)).fetchone()
+    if state is None:
+        state = conn.execute(
+            "insert into review_queue_state (workspace_id, initialized_at, bootstrap_cutoff, cycle_for_date, cycle_started_at)"
+            " values (%s, %s, %s, %s, %s) returning *",
+            (workspace_id, now, now - timedelta(days=14), today, now)).fetchone()
+        # Snapshot every existing source version, even if unclassified or unlinked.
+        # These exclusions are not approvals and never consume a future changed version.
+        records = conn.execute(
+            "select source, external_id, content_hash, occurred_at, subject, meta, created_at"
+            " from source_records where workspace_id = %s and created_at <= %s", (workspace_id, now)).fetchall()
+        excluded = []
+        for record in records:
+            if not _in_bootstrap_window(record, state):
+                version = source_version(record)
+                excluded.append({**version, "reason": "undated" if _instant(record.get("occurred_at")) is None
+                                 else "outside_initial_window"})
+        if excluded:
+            conn.execute(
+                "insert into review_bootstrap_exclusions (workspace_id, source, external_id, version, reason)"
+                " select %s, item.source, item.external_id, item.version, item.reason"
+                " from jsonb_to_recordset(%s) as item(source text, external_id text, version text, reason text)"
+                " on conflict do nothing", (workspace_id, Jsonb(excluded)))
+        return state, False
+    if state["cycle_completed_at"] is None:
+        return state, False  # Batch continuations must drain even across midnight.
+    if not force and state["last_completed_on"] is not None and state["last_completed_on"] >= today:
+        return state, True
+    state = conn.execute(
+        "update review_queue_state set cycle_for_date = %s, cycle_started_at = %s, cycle_completed_at = null"
+        " where workspace_id = %s returning *", (today, now, workspace_id)).fetchone()
+    return state, False
 
-    # Route by the stored insight type, never by a model-generated prefix or edited wording.
-    ordered = sorted(insights, key=lambda i: (i["type"] in ("commitment", "next_step"), _stamp(i.get("occurred_at")), i["text"]))
-    for insight in ordered:
-        if insight.get("type") not in ACTION_TYPES | CONTEXT_TYPES:
-            continue
-        if insight.get("status") in ("done", "dismissed", "possibly_done"):
-            continue
-        quote = insight.get("quote") or ""
-        if not quote.strip():
-            continue
-        matches = [r for rid in insight.get("source_record_ids") or [] if (r := by_id.get(str(rid)))
-                   and _squash(quote) in _squash(f"{r.get('subject') or ''} {r.get('body') or ''}")]
-        if not matches:
-            continue
-        # A calendar title alone is evidence of scheduling, not a commitment, need or buying signal.
-        substantive = [r for r in matches if r["source"] != "calendar" or _squash(quote) in _squash(r.get("body"))]
-        if not substantive:
-            continue
-        prefix = CONTEXT_NAMES.get(insight["type"])
-        if insight["type"] in ("commitment", "next_step"):
-            prefix = "We owe" if insight.get("owner_side") == "bianca" else (
-                "Customer next step" if insight.get("owner_side") == "customer" else "Next step (owner to confirm)")
-        text = f"{prefix}: {insight['text']}" if prefix else insight["text"]
-        if insight.get("owner_name"):
-            text += f" (owner: {insight['owner_name']})"
-        if insight.get("due_date"):
-            text += f" — due {_stamp(insight['due_date'])[:10]}"
-        add(text, "next_step" if insight["type"] in ACTION_TYPES else "client_context")
-        for record in substantive:
-            covered.add(str(record["id"]))
-            evidence(record, quote)
 
-    for record in records:
-        if str(record["id"]) in covered:
-            continue
-        subject = (record.get("subject") or "Untitled item").strip()
-        day = _stamp(record.get("occurred_at"))[:10]
-        when = f" ({day})" if day else " (date unconfirmed)"
-        if record["source"] == "calendar":
-            verb = "Meeting cancelled" if (record.get("meta") or {}).get("status") == "cancelled" else "Meeting scheduled"
-            add(f"{verb}{when}: {subject}. Review the agenda and confirm any next actions.")
-        elif record["source"] == "notes":
-            add(f"Commercial meeting notes recorded{when}: {subject}. Review the notes for context and next actions.")
-        else:
-            add(f"Commercial email recorded{when}: {subject}. Review the message for context and any reply needed.")
-        quote = ((record.get("classification") or {}).get("evidence_quote") or "").strip()
-        body = f"{record.get('subject') or ''} {record.get('body') or ''}"
-        evidence(record, quote if quote and _squash(quote) in _squash(body) else subject)
-    return next_steps, client_context, sources
+def _cycle_info(state: dict) -> dict:
+    return {"forDate": state["cycle_for_date"].isoformat(),
+            "bootstrap": {"initializedAt": _stamp(state["initialized_at"]),
+                          "cutoff": _stamp(state["bootstrap_cutoff"]), "days": 14,
+                          "completed": bool(state["bootstrap_completed"])}}
 
 
 def _proposal_data(row: dict) -> dict:
@@ -192,24 +171,29 @@ def _proposal_data(row: dict) -> dict:
             "nextStepBullets": row.get("next_step_bullets") or [],
             "clientContextBullets": row.get("client_context_bullets") or [], "sources": row["sources"],
             "routingVersion": row.get("routing_version", 0),
+            "lineageVersion": row.get("lineage_version", 0),
+            "bulletLineage": row.get("bullet_lineage") or {"nextStep": [], "clientContext": []},
             "lastProgress": row["snapshot_last_progress"], "nextStep": row["snapshot_next_step"],
             "clientContext": _cell(row.get("snapshot_client_context")),
             "revision": row["revision"], "status": row["status"]}
 
 
-def build_proposals(conn, workspace_id) -> dict:
-    """Coalesce new source versions per company. Call again while remaining > 0."""
+def build_proposals(conn, workspace_id, *, force: bool = False) -> dict:
+    """Resume today's bounded build; only the initial import has a 14-day window."""
     conn.row_factory = dict_row
-    # Multiple n8n retries cannot create separate active proposals for the same company.
     conn.execute("select pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"review-build:{workspace_id}",))
+    state, skip = _cycle(conn, workspace_id, force=force)
+    counts = {"created": 0, "updated": 0, "unchanged": 0, "applying": 0, "remaining": 0}
+    if skip:
+        return {**counts, "done": True, "skipped": True, **_cycle_info(state)}
     deals = conn.execute(
         "select o.id as opportunity_id, o.company_id, c.name as company_name, o.owner_code, o.stage, c.country,"
         " o.last_progress, o.next_step, o.client_context from opportunities o join companies c on c.id = o.company_id"
         " where o.workspace_id = %s and o.removed_at is null order by c.name", (workspace_id,)).fetchall()
     receipts = {_source_key(r) + (str(r["company_id"]),) for r in conn.execute(
-        "select company_id, source, external_id, version from review_source_receipts where workspace_id = %s",
-        (workspace_id,))}
-    counts = {"created": 0, "updated": 0, "unchanged": 0, "applying": 0, "remaining": 0}
+        "select company_id, source, external_id, version from review_source_receipts where workspace_id = %s", (workspace_id,))}
+    exclusions = {_source_key(r) for r in conn.execute(
+        "select source, external_id, version from review_bootstrap_exclusions where workspace_id = %s", (workspace_id,))}
     limit = max(1, settings.review_build_batch)
     for deal in deals:
         existing = conn.execute(
@@ -220,27 +204,39 @@ def build_proposals(conn, workspace_id) -> dict:
             continue
         records = conn.execute(
             "select * from source_records where workspace_id = %s and company_id = %s and status = 'classified'"
-            " and classification->>'is_commercial' = 'true' order by occurred_at nulls last, source, external_id",
-            (workspace_id, deal["company_id"])).fetchall()
-        records = [r for r in records if _source_key(source_version(r)) + (str(deal["company_id"]),) not in receipts]
-        if not records:
+            " and classification->>'is_commercial' = 'true' and created_at <= %s"
+            " order by occurred_at nulls last, source, external_id",
+            (workspace_id, deal["company_id"], state["cycle_started_at"])).fetchall()
+        records = [r for r in records
+                   if _source_key(source_version(r)) not in exclusions
+                   and _source_key(source_version(r)) + (str(deal["company_id"]),) not in receipts
+                   and (state["bootstrap_completed"] or _in_bootstrap_window(r, state))]
+        retain = (existing and existing.get("lineage_version") == 1 and existing.get("routing_version") == ROUTING_VERSION
+                  and validate_lineage(existing["next_step_bullets"], existing["client_context_bullets"],
+                                       existing["sources"], existing["bullet_lineage"]))
+        if not records and not retain:
             if existing:
-                # Reclassification or relinking can invalidate a pending card. Keep its history but stop offering it.
                 conn.execute("update review_proposals set status = 'superseded' where id = %s and status = 'pending'",
                              (existing["id"],))
             counts["unchanged"] += 1
             continue
-        versions = sorted((source_version(r) for r in records), key=_source_key)
+        observed = sorted((source_version(r) for r in records), key=_source_key)
+        previous_versions = {_source_key(v) for v in (existing.get("source_versions", []) if retain else [])}
+        new_records = [r for r in records if force or _source_key(source_version(r)) not in previous_versions]
         insights = conn.execute(
             "select * from insights where workspace_id = %s and company_id = %s and source_record_ids && %s::uuid[]",
-            (workspace_id, deal["company_id"], [r["id"] for r in records])).fetchall()
-        next_steps, context, sources = proposal_content(records, insights)
+            (workspace_id, deal["company_id"], [r["id"] for r in new_records])).fetchall() if new_records else []
+        next_steps, context, sources, lineage = merge_content(existing if retain else None, proposal_content(new_records, insights))
+        versions = {_source_key(v): v for v in (existing.get("source_versions", []) if retain else [])}
+        versions.update({_source_key(v): v for v in observed})
+        versions = [versions[key] for key in sorted(versions)]
         baseline = _cells(deal["last_progress"], deal["next_step"], deal.get("client_context"))
         data = {"company_name": deal["company_name"], "owner_code": deal["owner_code"], "stage": deal["stage"],
                 "country": deal["country"], "bullets": next_steps + context, "sources": sources, "source_versions": versions,
                 "next_step_bullets": next_steps, "client_context_bullets": context, "routing_version": ROUTING_VERSION,
                 "snapshot_last_progress": baseline["lastProgress"], "snapshot_next_step": baseline["nextStep"],
-                "snapshot_client_context": baseline["clientContext"]}
+                "snapshot_client_context": baseline["clientContext"], "observed_source_versions": observed,
+                "bullet_lineage": lineage, "lineage_version": 1}
         if existing and all(existing.get(k) == value for k, value in data.items()):
             counts["unchanged"] += 1
             continue
@@ -252,23 +248,30 @@ def build_proposals(conn, workspace_id) -> dict:
                 "update review_proposals set company_name = %s, owner_code = %s, stage = %s, country = %s,"
                 " bullets = %s, sources = %s, source_versions = %s, snapshot_last_progress = %s,"
                 " snapshot_next_step = %s, snapshot_client_context = %s, next_step_bullets = %s,"
-                " client_context_bullets = %s, routing_version = %s, revision = revision + 1 where id = %s",
+                " client_context_bullets = %s, routing_version = %s, observed_source_versions = %s,"
+                " bullet_lineage = %s, lineage_version = %s, revision = revision + 1 where id = %s",
                 (data["company_name"], data["owner_code"], data["stage"], data["country"], Jsonb(next_steps + context), Jsonb(sources),
                  Jsonb(versions), baseline["lastProgress"], baseline["nextStep"], baseline["clientContext"],
-                 Jsonb(next_steps), Jsonb(context), ROUTING_VERSION, existing["id"]))
+                 Jsonb(next_steps), Jsonb(context), ROUTING_VERSION, Jsonb(observed), Jsonb(lineage), 1, existing["id"]))
             counts["updated"] += 1
         else:
             conn.execute(
                 "insert into review_proposals (workspace_id, company_id, opportunity_id, company_name, owner_code,"
                 " stage, country, bullets, sources, source_versions, snapshot_last_progress, snapshot_next_step,"
-                " snapshot_client_context, next_step_bullets, client_context_bullets, routing_version)"
-                " values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                " snapshot_client_context, next_step_bullets, client_context_bullets, routing_version,"
+                " observed_source_versions, bullet_lineage, lineage_version)"
+                " values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (workspace_id, deal["company_id"], deal["opportunity_id"], data["company_name"], data["owner_code"],
                  data["stage"], data["country"], Jsonb(next_steps + context), Jsonb(sources), Jsonb(versions),
                  baseline["lastProgress"], baseline["nextStep"], baseline["clientContext"],
-                 Jsonb(next_steps), Jsonb(context), ROUTING_VERSION))
+                 Jsonb(next_steps), Jsonb(context), ROUTING_VERSION, Jsonb(observed), Jsonb(lineage), 1))
             counts["created"] += 1
-    return {**counts, "done": counts["remaining"] == 0}
+    done = counts["remaining"] == 0
+    if done:
+        state = conn.execute(
+            "update review_queue_state set cycle_completed_at = now(), last_completed_on = cycle_for_date,"
+            " bootstrap_completed = true where workspace_id = %s returning *", (workspace_id,)).fetchone()
+    return {**counts, "done": done, "skipped": False, **_cycle_info(state)}
 
 
 def _activity(row: dict, company: str) -> dict:
@@ -276,7 +279,9 @@ def _activity(row: dict, company: str) -> dict:
             "kind": "approved" if row["action"] == "approve" else "ignored", "edited": row["edited"],
             "actor": row["actor"], "at": _stamp(row.get("completed_at") or row["created_at"]),
             "before": row["before_cells"], "after": row["after_cells"],
-            "mirror_refreshed": row.get("mirror_refreshed")}
+            "mirror_refreshed": row.get("mirror_refreshed"),
+            "lineageVersion": row.get("lineage_version", 0),
+            "bulletLineage": row.get("bullet_lineage") or {"nextStep": [], "clientContext": []}}
 
 
 def workspace_view(conn, workspace_id) -> dict:
@@ -290,11 +295,13 @@ def workspace_view(conn, workspace_id) -> dict:
         if row["status"] == "applying":
             intent = conn.execute(
                 "select idempotency_key, revision, next_step_bullets, client_context_bullets, routing_version,"
-                " sheet_target, error from review_decisions where workspace_id = %s"
+                " sheet_target, error, bullet_lineage, lineage_version from review_decisions where workspace_id = %s"
                 " and proposal_id = %s and status = 'applying'", (workspace_id, row["id"])).fetchone()
             if intent and row.get("routing_version") == ROUTING_VERSION and intent.get("routing_version") == ROUTING_VERSION:
                 item["nextStepBullets"] = intent["next_step_bullets"]
                 item["clientContextBullets"] = intent["client_context_bullets"]
+                item["bulletLineage"] = intent.get("bullet_lineage") or {"nextStep": [], "clientContext": []}
+                item["lineageVersion"] = intent.get("lineage_version", 0)
                 if _target_is_pinned(intent.get("sheet_target")) and intent["sheet_target"] == _sheet_target():
                     item["retry"] = {"idempotency_key": intent["idempotency_key"], "revision": intent["revision"],
                                      "next_step_bullets": intent["next_step_bullets"],
@@ -306,6 +313,8 @@ def workspace_view(conn, workspace_id) -> dict:
                 item["error"] = "This approval predates column routing. An operator must reconcile its original Sheet write before it can be reviewed again."
         elif row.get("routing_version") != ROUTING_VERSION:
             item["error"] = "This proposal predates column routing. Rebuild the review queue before deciding."
+        if row["status"] == "pending" and row.get("lineage_version") != 1:
+            item["error"] = "This proposal predates source lineage. Rebuild the review queue before deciding."
         proposals.append(item)
     rows = [{"id": str(r["id"]), "company": r["name"], "owner": r["owner_code"] or "", "stage": r["stage"] or "",
              "lastProgress": _cell(r["last_progress"]), "nextStep": _cell(r["next_step"]),
@@ -449,6 +458,11 @@ def _prepare(conn, workspace_id, proposal_id: str, actor: str, action: str, revi
         raise ReviewConflict("This company has a newer update. Reload it before deciding.")
     if proposal["removed_at"] is not None:
         raise ReviewConflict("This company is no longer in the active Pipeline sheet.")
+    if proposal.get("lineage_version") != 1:
+        raise ReviewConflict("This proposal predates source lineage. Rebuild the review queue before deciding.")
+    if not validate_lineage(proposal["next_step_bullets"], proposal["client_context_bullets"],
+                            proposal["sources"], proposal["bullet_lineage"]):
+        raise ReviewConflict("This proposal has invalid source lineage. Rebuild the review queue before deciding.")
     before = _cells(proposal["snapshot_last_progress"], proposal["snapshot_next_step"], proposal.get("snapshot_client_context"))
     after = dict(before)
     target = None
@@ -459,7 +473,7 @@ def _prepare(conn, workspace_id, proposal_id: str, actor: str, action: str, revi
         current_sources = {_source_key(source_version(r)) for r in conn.execute(
             "select * from source_records where workspace_id = %s and company_id = %s and status = 'classified'"
             " and classification->>'is_commercial' = 'true'", (workspace_id, proposal["company_id"]))}
-        if any(_source_key(version) not in current_sources for version in proposal["source_versions"]):
+        if any(_source_key(version) not in current_sources for version in proposal.get("observed_source_versions", [])):
             raise ReviewConflict("The source material changed since this card was generated. Refresh the review queue before approving.")
         live = sheets.read_company(proposal["company_name"])
         exact_live = _cells(live.last_progress, live.next_step, live.client_context)
@@ -474,14 +488,16 @@ def _prepare(conn, workspace_id, proposal_id: str, actor: str, action: str, revi
                                       else "\n".join("- " + b for b in context))
         if context and len(after["clientContext"]) > 50_000:
             raise ValueError("The resulting Client Context exceeds one Sheet cell. Shorten the context or update the existing cell first.")
+    decision_lineage = approved_lineage(proposal, next_steps, context) if action == "approve" else {"nextStep": [], "clientContext": []}
     edited = action == "approve" and (next_steps != proposal["next_step_bullets"] or context != proposal["client_context_bullets"])
     intent = conn.execute(
         "insert into review_decisions (workspace_id, proposal_id, actor, action, revision, idempotency_key, request_hash,"
-        " bullets, before_cells, after_cells, edited, status, next_step_bullets, client_context_bullets, routing_version, sheet_target)"
-        " values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) returning *",
+        " bullets, before_cells, after_cells, edited, status, next_step_bullets, client_context_bullets, routing_version, sheet_target, bullet_lineage, lineage_version)"
+        " values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) returning *",
         (workspace_id, proposal["id"], actor, action, revision, idempotency_key, request_hash, Jsonb(next_steps + context),
          Jsonb(before), Jsonb(after), edited, "applying" if action == "approve" else "succeeded",
-         Jsonb(next_steps), Jsonb(context), ROUTING_VERSION, Jsonb(target) if target is not None else None)).fetchone()
+         Jsonb(next_steps), Jsonb(context), ROUTING_VERSION, Jsonb(target) if target is not None else None,
+         Jsonb(decision_lineage), 1)).fetchone()
     if action == "ignore":
         intent = conn.execute("update review_decisions set completed_at = now() where id = %s returning *",
                               (intent["id"],)).fetchone()
@@ -587,9 +603,10 @@ def decide(workspace_id, proposal_id: str, actor: str, action: str, revision: in
                 "update review_decisions set status = 'succeeded', error = null, completed_at = now(), mirror_refreshed = %s"
                 " where id = %s returning *", (mirror_refreshed, intent["id"])).fetchone()
             conn.execute("update review_proposals set status = 'approved', bullets = %s, next_step_bullets = %s,"
-                         " client_context_bullets = %s, decided_by = %s, decided_at = now() where id = %s",
+                         " client_context_bullets = %s, bullet_lineage = %s, lineage_version = %s, decided_by = %s, decided_at = now() where id = %s",
                          (Jsonb(intent["bullets"]), Jsonb(intent["next_step_bullets"]),
-                          Jsonb(intent["client_context_bullets"]), intent["actor"], proposal["id"]))
+                          Jsonb(intent["client_context_bullets"]), Jsonb(intent.get("bullet_lineage") or {"nextStep": [], "clientContext": []}),
+                          intent.get("lineage_version", 0), intent["actor"], proposal["id"]))
             _consume_sources(conn, proposal)
             conn.commit()
         except Exception as exc:
