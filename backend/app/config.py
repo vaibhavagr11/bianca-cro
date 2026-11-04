@@ -54,6 +54,9 @@ class Settings(BaseSettings):
     review_sheet_id: int | None = 1869050409
     review_client_context_mode: Literal["append", "replace"] = "append"
     review_google_service_account_json: SecretStr | None = None
+    # When set, Sheet reads and writes go through n8n, which holds the Google credential (n8n/sheets-proxy.json).
+    review_sheets_webhook_url: str | None = None
+    review_sheets_webhook_secret: SecretStr | None = None
     review_build_batch: int = 20
 
 

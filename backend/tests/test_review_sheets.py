@@ -5,6 +5,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from pydantic import SecretStr
 
 from app.review_sheets import SheetConflict, SheetError, SheetsClient, SheetWriteUncertain
 
@@ -305,3 +306,80 @@ def test_literal_context_is_written_as_string_and_not_evaluated():
     assert row.client_context == '=HYPERLINK("https://example.com")'
     context_cell = transport.data["sheets"][0]["data"][0]["rowData"][1]["values"][5]
     assert context_cell == cell('=HYPERLINK("https://example.com")')
+
+
+# ---------------------------------------------------------------- through n8n (the Google connector)
+
+class N8n:
+    """Plays the n8n proxy workflow: checks the secret, forwards to fake Google, wraps the reply."""
+
+    def __init__(self, google, status=None):
+        self.google, self.status, self.calls = google, status, []
+
+    def __call__(self, method, url, headers, payload, timeout):
+        self.calls.append((method, url, headers, payload))
+        assert headers["X-Bianca-Sheets-Secret"] == "proxy-secret"
+        if self.status:
+            return {"status": self.status, "body": {"error": {"message": "from Google"}}}
+        google_url = "https://sheets.googleapis.com/v4/spreadsheets/" + payload["spreadsheetId"] + payload["suffix"]
+        return {"status": 200, "body": self.google(payload["method"], google_url, {}, payload["body"], timeout)}
+
+
+@pytest.fixture
+def via_n8n(monkeypatch):
+    from app.review_sheets import settings
+    monkeypatch.setattr(settings, "review_sheets_webhook_url", "https://n8n.test/webhook/bianca-sheets")
+    monkeypatch.setattr(settings, "review_sheets_webhook_secret", SecretStr("proxy-secret"))
+    monkeypatch.setattr(settings, "review_google_service_account_json", None)
+
+    def make(status=None):
+        google = Transport(document())
+        proxy = N8n(google, status)
+        return SheetsClient(spreadsheet_id="test-sheet", transport=proxy, sheet_id=123), proxy, google
+    return make
+
+
+def test_n8n_path_reads_and_writes_without_a_google_credential(via_n8n):
+    api, proxy, google = via_n8n()
+    row = approve(api)
+    assert (row.last_progress, row.next_step) == ("Previous next step", "- Approved update")
+    assert [p["method"] for _, _, _, p in proxy.calls] == ["GET", "POST", "GET"]
+    assert all(url == "https://n8n.test/webhook/bianca-sheets" and "Authorization" not in h for _, url, h, _ in proxy.calls)
+    assert {p["spreadsheetId"] for _, _, _, p in proxy.calls} == {"test-sheet"}
+    assert proxy.calls[1][3]["suffix"] == ":batchUpdate" and proxy.calls[0][3]["query"]["ranges"] == "'Pipeline'"
+
+
+def test_n8n_path_maps_google_errors_like_direct_calls(via_n8n):
+    api, _, _ = via_n8n(status=403)
+    with pytest.raises(SheetError) as read_error:
+        api.read_company("Campari")
+    assert not isinstance(read_error.value, SheetWriteUncertain) and "from Google" not in str(read_error.value)
+
+    api, proxy, google = via_n8n()
+    proxy.status = None
+    original = proxy.__call__
+
+    def write_fails(method, url, headers, payload, timeout):
+        if payload["method"] == "POST":
+            return {"status": 503, "body": {}}
+        return original(method, url, headers, payload, timeout)
+    api.transport = write_fails
+    with pytest.raises(SheetWriteUncertain):
+        approve(api)
+
+
+def test_n8n_path_treats_a_broken_reply_to_a_write_as_uncertain(via_n8n):
+    api, proxy, _ = via_n8n()
+    original = proxy.__call__
+    api.transport = lambda m, u, h, p, t: "not json" if p["method"] == "POST" else original(m, u, h, p, t)
+    with pytest.raises(SheetWriteUncertain):
+        approve(api)
+
+
+def test_n8n_path_needs_its_secret_before_any_call(via_n8n, monkeypatch):
+    from app.review_sheets import settings
+    api, proxy, _ = via_n8n()
+    monkeypatch.setattr(settings, "review_sheets_webhook_secret", None)
+    with pytest.raises(SheetError):
+        api.read_company("Campari")
+    assert proxy.calls == []

@@ -17,3 +17,17 @@ An authorized operator can call `POST /review/build?force=true` for an intention
 This workflow's JSON and connections are checked locally. Its credential selection, exact timing, import compatibility, and final execution must be verified in the actual n8n account.
 
 References: [n8n Schedule Trigger](https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.scheduletrigger/), [workflow JSON import](https://docs.n8n.io/workflows/export-import/), and [HTTP Request credentials](https://docs.n8n.io/integrations/builtin/credentials/httprequest/).
+
+# Sheets proxy: the backend's only route to Google Sheets
+
+n8n is the Google connector, so the backend never holds a Google credential. Import `sheets-proxy.json`; the backend
+posts each Sheets call to its webhook and n8n makes it with the existing Google Sheets OAuth2 credential.
+
+1. **Backend request** (Webhook): Header Auth credential, name `X-Bianca-Sheets-Secret`, value = `REVIEW_SHEETS_WEBHOOK_SECRET`.
+2. **Read tab** and **Write cells**: select a Google Sheets OAuth2 credential whose account can edit the target spreadsheet.
+3. **Check request** allows one spreadsheet ID (the staging copy as committed), a tab read and a cell-value batch update of at most 3 cells.
+   For production, duplicate the workflow and change only that ID and the webhook path.
+4. Activate it, then set `REVIEW_SHEETS_WEBHOOK_URL` (the Production URL of the webhook) and `REVIEW_SHEETS_WEBHOOK_SECRET` on the backend.
+
+n8n returns `{"status": <Google status>, "body": <Google JSON>}`; the backend keeps all checks (row and header lookup,
+before/after comparison, read-back) and treats an unclear write reply as "retry the same approval".

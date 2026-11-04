@@ -118,6 +118,8 @@ class SheetsClient:
         self.sheet_id = sheet_id if sheet_id is not None else settings.review_sheet_id
         self.credentials = credentials
         self.transport = transport or _json_transport
+        # n8n is the Google connector: an explicit credential (tests, one-off scripts) is the only way past it.
+        self.webhook_url = settings.review_sheets_webhook_url if credentials is None else None
         self.timeout = max(1, min(float(timeout), 60))
         if not self.spreadsheet_id or not re.fullmatch(r"[A-Za-z0-9_-]+", self.spreadsheet_id):
             raise SheetError("REVIEW_SPREADSHEET_ID must identify the source-of-truth spreadsheet.")
@@ -149,6 +151,8 @@ class SheetsClient:
         return {"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"}
 
     def _request(self, method: str, suffix: str = "", payload: dict | None = None, query: dict | None = None) -> dict:
+        if self.webhook_url:
+            return self._via_n8n(method, suffix, payload, query)
         url = f"{API_ROOT}/{quote(self.spreadsheet_id, safe='')}{suffix}"
         if query:
             url += "?" + urlencode(query)
@@ -163,6 +167,35 @@ class SheetsClient:
                 raise SheetWriteUncertain("Google did not confirm the write. Retry the same approval to reconcile its result.") from None
             raise SheetError("Google Sheets rejected the request. Check sheet access and configuration, then retry.") from None
         except (URLError, TimeoutError, OSError, ValueError):
+            if method == "POST":
+                raise SheetWriteUncertain("The connection ended before the write was confirmed. Retry the same approval.") from None
+            raise SheetError("Could not read the Google Sheet. Check connectivity and try again.") from None
+
+    def _via_n8n(self, method: str, suffix: str, payload: dict | None, query: dict | None) -> dict:
+        """Ask n8n to make the same Sheets call. n8n only allows this spreadsheet, a tab read and a batch update.
+
+        n8n replies {"status": <Google's status>, "body": <Google's JSON>}; failures map exactly as direct calls do.
+        """
+        secret = settings.review_sheets_webhook_secret
+        if secret is None:
+            raise SheetError("Google Sheet approval is not configured. Set REVIEW_SHEETS_WEBHOOK_SECRET.")
+        envelope = {"method": method, "spreadsheetId": self.spreadsheet_id, "suffix": suffix,
+                    "query": query or {}, "body": payload}
+        headers = {"X-Bianca-Sheets-Secret": secret.get_secret_value(), "Accept": "application/json",
+                   "Content-Type": "application/json"}
+        try:
+            reply = self.transport("POST", self.webhook_url, headers, envelope, self.timeout)
+            status, body = reply.get("status"), reply.get("body")
+            if isinstance(status, bool) or not isinstance(status, int) or not isinstance(body, dict):
+                raise ValueError("invalid n8n response")
+            if status >= 400:
+                raise HTTPError(API_ROOT, status, "Google Sheets error", None, None)
+            return body
+        except HTTPError as exc:
+            if method == "POST" and (exc.code >= 500 or exc.code == 408):
+                raise SheetWriteUncertain("Google did not confirm the write. Retry the same approval to reconcile its result.") from None
+            raise SheetError("Google Sheets rejected the request. Check sheet access and configuration, then retry.") from None
+        except (URLError, TimeoutError, OSError, ValueError, AttributeError):
             if method == "POST":
                 raise SheetWriteUncertain("The connection ended before the write was confirmed. Retry the same approval.") from None
             raise SheetError("Could not read the Google Sheet. Check connectivity and try again.") from None

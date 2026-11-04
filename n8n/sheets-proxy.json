@@ -1,0 +1,179 @@
+{
+  "name": "Bianca Sheets proxy (STAGING)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "bianca-sheets-staging",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "5b0b6a43-3f0e-4a64-9a43-1f0b3c0a0001",
+      "name": "Backend request",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "webhookId": "5b0b6a43-3f0e-4a64-9a43-1f0b3c0a00aa",
+      "notesInFlow": true,
+      "notes": "Header Auth credential: name X-Bianca-Sheets-Secret, value = REVIEW_SHEETS_WEBHOOK_SECRET."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Only this spreadsheet, only a tab read or a cell-value batch update. Everything else is refused.\nconst ALLOWED_SPREADSHEET = '14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw'; // STAGING COPY\nconst r = $input.first().json.body || {};\nconst q = r.query || {};\nconst read = r.method === 'GET' && r.suffix === '' && r.body == null;\nconst write = r.method === 'POST' && r.suffix === ':batchUpdate' && r.body && Array.isArray(r.body.requests)\n  && r.body.requests.length > 0 && r.body.requests.length <= 3\n  && r.body.requests.every(x => Object.keys(x).length === 1 && x.updateCells && x.updateCells.fields === 'userEnteredValue');\nconst queryOk = Object.keys(q).every(k => k === 'ranges' || k === 'fields');\nif (r.spreadsheetId !== ALLOWED_SPREADSHEET || !(read || write) || !queryOk) {\n  return [{ json: { allowed: false } }];\n}\nconst qs = Object.entries(q).map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&');\nconst url = 'https://sheets.googleapis.com/v4/spreadsheets/' + ALLOWED_SPREADSHEET + (write ? ':batchUpdate' : '') + (qs ? '?' + qs : '');\nreturn [{ json: { allowed: true, write, url, payload: r.body } }];"
+      },
+      "id": "5b0b6a43-3f0e-4a64-9a43-1f0b3c0a0002",
+      "name": "Check request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.allowed }}",
+              "rightValue": true,
+              "operator": {"type": "boolean", "operation": "true", "singleValue": true}
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5b0b6a43-3f0e-4a64-9a43-1f0b3c0a0003",
+      "name": "Allowed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [440, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+          "conditions": [
+            {
+              "id": "c2",
+              "leftValue": "={{ $json.write }}",
+              "rightValue": true,
+              "operator": {"type": "boolean", "operation": "true", "singleValue": true}
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5b0b6a43-3f0e-4a64-9a43-1f0b3c0a0004",
+      "name": "Write?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [660, -100]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload) }}",
+        "options": {
+          "response": {"response": {"fullResponse": true, "neverError": true}},
+          "timeout": 20000
+        }
+      },
+      "id": "5b0b6a43-3f0e-4a64-9a43-1f0b3c0a0005",
+      "name": "Write cells",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, -200],
+      "notesInFlow": true,
+      "notes": "Credential: the Google Sheets OAuth2 account that can edit the STAGING COPY."
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "options": {
+          "response": {"response": {"fullResponse": true, "neverError": true}},
+          "timeout": 20000
+        }
+      },
+      "id": "5b0b6a43-3f0e-4a64-9a43-1f0b3c0a0006",
+      "name": "Read tab",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 0],
+      "notesInFlow": true,
+      "notes": "Same Google Sheets credential as Write cells."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Hand Google's status and JSON back unchanged; the backend decides what they mean.\nconst r = $input.first().json;\nlet body = r.body;\nif (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = {}; } }\nreturn [{ json: { status: r.statusCode, body: body && typeof body === 'object' ? body : {} } }];"
+      },
+      "id": "5b0b6a43-3f0e-4a64-9a43-1f0b3c0a0007",
+      "name": "Wrap Google reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, -100]
+    },
+    {
+      "parameters": {
+        "respondWith": "firstIncomingItem",
+        "options": {}
+      },
+      "id": "5b0b6a43-3f0e-4a64-9a43-1f0b3c0a0008",
+      "name": "Reply",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1320, -100]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"status\": 403, \"body\": {\"error\": \"not allowed\"}}",
+        "options": {}
+      },
+      "id": "5b0b6a43-3f0e-4a64-9a43-1f0b3c0a0009",
+      "name": "Refuse",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [660, 150]
+    },
+    {
+      "parameters": {
+        "content": "## Bianca Sheets proxy (STAGING)\nThe backend's only route to Google Sheets. It reads the Pipeline tab and writes the approved cells (Last progress, Next step, Client Context).\n\n- Locked to the STAGING COPY spreadsheet in **Check request**. For production, duplicate this workflow and change only that ID and the webhook path.\n- Never edit cells here: the backend checks the row before and after every write.",
+        "height": 220,
+        "width": 420
+      },
+      "id": "5b0b6a43-3f0e-4a64-9a43-1f0b3c0a0010",
+      "name": "About",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [0, -320]
+    }
+  ],
+  "connections": {
+    "Backend request": {"main": [[{"node": "Check request", "type": "main", "index": 0}]]},
+    "Check request": {"main": [[{"node": "Allowed?", "type": "main", "index": 0}]]},
+    "Allowed?": {"main": [
+      [{"node": "Write?", "type": "main", "index": 0}],
+      [{"node": "Refuse", "type": "main", "index": 0}]
+    ]},
+    "Write?": {"main": [
+      [{"node": "Write cells", "type": "main", "index": 0}],
+      [{"node": "Read tab", "type": "main", "index": 0}]
+    ]},
+    "Write cells": {"main": [[{"node": "Wrap Google reply", "type": "main", "index": 0}]]},
+    "Read tab": {"main": [[{"node": "Wrap Google reply", "type": "main", "index": 0}]]},
+    "Wrap Google reply": {"main": [[{"node": "Reply", "type": "main", "index": 0}]]}
+  },
+  "active": false,
+  "settings": {"executionOrder": "v1"},
+  "pinData": {}
+}
