@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -47,8 +49,10 @@ class Settings(BaseSettings):
     review_enabled: bool = False
     review_tokens: dict[str, SecretStr] = {}
     review_allowed_origins: list[str] = ["https://claude.ai"]
-    review_spreadsheet_id: str | None = None
+    review_spreadsheet_id: str | None = "14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw"
     review_sheet_tab: str = "Pipeline"
+    review_sheet_id: int | None = 1869050409
+    review_client_context_mode: Literal["append", "replace"] = "append"
     review_google_service_account_json: SecretStr | None = None
     review_build_batch: int = 20
 

@@ -74,12 +74,18 @@ class IgnoreRequest(BaseModel):
 
 
 class ApproveRequest(IgnoreRequest):
-    bullets: list[Bullet] = Field(min_length=1, max_length=200)
+    # Both destinations are explicit so an older flat-bullet client cannot silently
+    # send customer context to the action column after the routing upgrade.
+    next_step_bullets: list[Bullet] = Field(max_length=200)
+    client_context_bullets: list[Bullet] = Field(max_length=200)
 
     @model_validator(mode="after")
     def cell_size(self):
-        if len("\n".join("- " + b for b in self.bullets)) > 45000:
-            raise ValueError("The approved update is too long for one sheet cell")
+        if not self.next_step_bullets and not self.client_context_bullets:
+            raise ValueError("Approve at least one Next Step or Client Context bullet")
+        for bullets in (self.next_step_bullets, self.client_context_bullets):
+            if len("\n".join("- " + b for b in bullets)) > 45000:
+                raise ValueError("The approved update is too long for one sheet cell")
         return self
 
 
@@ -111,7 +117,8 @@ def _decision(proposal_id: str, actor: str, action: str, payload: IgnoreRequest)
     try:
         return review_service.decide(workspace_id, proposal_id, actor, action,
                                      payload.revision, payload.idempotency_key,
-                                     payload.bullets if isinstance(payload, ApproveRequest) else None)
+                                     payload.next_step_bullets if isinstance(payload, ApproveRequest) else None,
+                                     payload.client_context_bullets if isinstance(payload, ApproveRequest) else None)
     except review_service.ReviewNotFound as exc:
         raise HTTPException(404, str(exc)) from exc
     except review_service.ReviewConflict as exc:
@@ -195,7 +202,7 @@ def _tools() -> list[dict]:
         {"name": "bianca_review_workspace", "description": "Read pending company sales updates and the review activity. Never approve an update without the founder's explicit decision.",
          "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
          "annotations": {"readOnlyHint": True, "openWorldHint": False}},
-        {"name": "bianca_approve_update", "description": "On the founder's Approve or Save & approve action, replace Last progress with the previous Next step and write the reviewed bullets as the new Next step. Retry using the same idempotency key and payload.",
+        {"name": "bianca_approve_update", "description": "On the founder's Approve or Save & approve action, write next steps, commitments, and blockers to Next step, rotating its previous value into Last progress only when action bullets are approved. Write customer needs, buying signals, and objections to Client Context using the configured context policy. Empty sections leave their cells unchanged. Retry using the same idempotency key and both bullet lists.",
          "inputSchema": ApproveTool.model_json_schema(),
          "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False}},
         {"name": "bianca_ignore_update", "description": "On the founder's Ignore action, dismiss this proposal without changing any Google Sheet cell.",
@@ -252,7 +259,7 @@ async def mcp(request: Request, actor: str = Depends(reviewer)) -> Response:
     if method == "initialize":
         requested = params.get("protocolVersion")
         result = {"protocolVersion": requested if requested in PROTOCOLS else PROTOCOLS[0],
-                  "capabilities": {"tools": {}}, "serverInfo": {"name": "Bianca Sales Pipeline Updates", "version": "1.0.0"}}
+                  "capabilities": {"tools": {}}, "serverInfo": {"name": "Bianca Sales Pipeline Updates", "version": "2.0.0"}}
     elif method == "ping":
         result = {}
     elif method == "tools/list":

@@ -18,11 +18,12 @@ COLUMN_MAP = {
     "nombre contacto (rol)": "contacts_text",
     "last progress": "last_progress",
     "next step": "next_step",
+    "client context": "client_context",
 }
 REQUIRED_COLUMN = "empresa"
 
 # Fields compared between syncs; a change in any of them is logged to opportunity_changes.
-TRACKED_FIELDS = ("owner_code", "stage", "country", "primary_buyer", "contacts_text", "last_progress", "next_step")
+TRACKED_FIELDS = ("owner_code", "stage", "country", "primary_buyer", "contacts_text", "last_progress", "next_step", "client_context")
 
 # Refuse a sync that would remove more than this share of active deals (wrong tab, empty file...).
 MAX_REMOVAL_SHARE = 0.5

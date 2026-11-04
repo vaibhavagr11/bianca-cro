@@ -368,13 +368,13 @@ def _fail(conn: psycopg.Connection, run_id, error: str) -> None:
 def _load_existing(conn: psycopg.Connection, workspace_id) -> list[ExistingDeal]:
     rows = conn.execute(
         "select o.id, c.normalized_name, o.owner_code, o.stage, c.country, o.primary_buyer, o.contacts_text,"
-        " o.last_progress, o.next_step, o.row_hash, o.removed_at is not null"
+        " o.last_progress, o.next_step, o.client_context, o.row_hash, o.removed_at is not null"
         " from opportunities o join companies c on c.id = o.company_id where o.workspace_id = %s",
         (workspace_id,),
     ).fetchall()
     # Column order above matches TRACKED_FIELDS.
     return [
-        ExistingDeal(str(r[0]), r[1], dict(zip(TRACKED_FIELDS, r[2:9])), r[9], r[10])
+        ExistingDeal(str(r[0]), r[1], dict(zip(TRACKED_FIELDS, r[2:2 + len(TRACKED_FIELDS)])), r[-2], r[-1])
         for r in rows
     ]
 
@@ -391,7 +391,7 @@ def _apply(conn: psycopg.Connection, workspace_id, run_id, plan: SyncPlan) -> No
         ).fetchone()[0]
         opp_id = conn.execute(
             "insert into opportunities (workspace_id, company_id, owner_code, stage, stage_rank, primary_buyer,"
-            " contacts_text, last_progress, next_step, row_hash) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            " contacts_text, last_progress, next_step, client_context, row_hash) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
             " returning id",
             (workspace_id, company_id, *_opp_values(row), row.row_hash),
         ).fetchone()[0]
@@ -400,7 +400,7 @@ def _apply(conn: psycopg.Connection, workspace_id, run_id, plan: SyncPlan) -> No
     for opp_id, row, field_changes, restored in plan.updates:
         conn.execute(
             "update opportunities set owner_code = %s, stage = %s, stage_rank = %s, primary_buyer = %s,"
-            " contacts_text = %s, last_progress = %s, next_step = %s, row_hash = %s,"
+            " contacts_text = %s, last_progress = %s, next_step = %s, client_context = %s, row_hash = %s,"
             " last_seen_at = now(), removed_at = null where id = %s",
             (*_opp_values(row), row.row_hash, opp_id),
         )
@@ -432,4 +432,4 @@ def _apply(conn: psycopg.Connection, workspace_id, run_id, plan: SyncPlan) -> No
 def _opp_values(row) -> tuple:
     f = row.fields
     return (f["owner_code"], f["stage"], parse_stage(f["stage"]), f["primary_buyer"],
-            f["contacts_text"], f["last_progress"], f["next_step"])
+            f["contacts_text"], f["last_progress"], f["next_step"], f["client_context"])

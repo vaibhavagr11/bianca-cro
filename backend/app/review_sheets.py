@@ -1,7 +1,7 @@
 """Narrow Google Sheets adapter for founder-approved pipeline changes.
 
-Only ``Last progress`` and ``Next step`` are writable. Every attempt resolves the
-company and columns again, checks both reviewed cell values, and writes the fixed
+Only ``Last progress``, ``Next step`` and ``Client Context`` are writable. Every attempt resolves the
+company and columns again, checks all reviewed cell values, and writes the fixed
 before/after plan in one batch. Google Sheets has no cell compare-and-swap: a
 collaborator can still edit or sort between the read and write. Keep the backend's
 per-proposal lock and audit record, and avoid simultaneous manual row sorting.
@@ -23,7 +23,7 @@ from app.pipeline import normalize_name
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 API_ROOT = "https://sheets.googleapis.com/v4/spreadsheets"
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
-REQUIRED_HEADERS = ("empresa", "last progress", "next step")
+REQUIRED_HEADERS = ("empresa", "last progress", "next step", "client context")
 
 
 class SheetError(Exception):
@@ -47,6 +47,8 @@ class SheetRow:
     sheet_id: int
     last_progress_col: int  # Zero-based column indices for updateCells.
     next_step_col: int
+    client_context: str
+    client_context_col: int
 
 
 class _AuthResponse:
@@ -102,16 +104,18 @@ def _review_text(cell: dict) -> str:
     if "formulaValue" in entered or "errorValue" in effective:
         raise SheetConflict("Review columns contain a formula or error. Resolve it in the Sheet before approving.")
     if any(key in entered or key in effective for key in ("numberValue", "boolValue")):
-        raise SheetConflict("Last progress and Next step must contain plain text before approving.")
+        raise SheetConflict("Last progress, Next step and Client Context must contain plain text before approving.")
     # Blank cells can have no userEnteredValue at all. Preserve literal whitespace.
     return entered.get("stringValue", effective.get("stringValue", ""))
 
 
 class SheetsClient:
     def __init__(self, spreadsheet_id: str | None = None, sheet_tab: str | None = None,
-                 credentials=None, transport: Transport | None = None, timeout: float = 20):
+                 credentials=None, transport: Transport | None = None, timeout: float = 20,
+                 sheet_id: int | None = None):
         self.spreadsheet_id = spreadsheet_id or settings.review_spreadsheet_id
         self.sheet_tab = sheet_tab or settings.review_sheet_tab
+        self.sheet_id = sheet_id if sheet_id is not None else settings.review_sheet_id
         self.credentials = credentials
         self.transport = transport or _json_transport
         self.timeout = max(1, min(float(timeout), 60))
@@ -119,6 +123,8 @@ class SheetsClient:
             raise SheetError("REVIEW_SPREADSHEET_ID must identify the source-of-truth spreadsheet.")
         if not self.sheet_tab:
             raise SheetError("REVIEW_SHEET_TAB must identify the source-of-truth tab.")
+        if self.sheet_id is not None and (isinstance(self.sheet_id, bool) or not isinstance(self.sheet_id, int) or self.sheet_id < 0):
+            raise SheetError("REVIEW_SHEET_ID must be the numeric Pipeline tab ID.")
 
     def _headers(self) -> dict:
         try:
@@ -181,6 +187,8 @@ class SheetsClient:
         sheet_id = sheet.get("properties", {}).get("sheetId")
         if not isinstance(sheet_id, int):
             raise SheetError("Google returned an incomplete sheet. Try again before approving.")
+        if self.sheet_id is not None and sheet_id != self.sheet_id:
+            raise SheetConflict("The configured Pipeline tab ID does not match REVIEW_SHEET_ID. Check the target Sheet before approving.")
         cells: dict[int, dict[int, dict]] = {}
         for grid in sheet.get("data", []):
             for offset, row in enumerate(grid.get("rowData", []), start=grid.get("startRow", 0)):
@@ -191,8 +199,8 @@ class SheetsClient:
         for col, cell in cells.get(0, {}).items():
             headers.setdefault(_display_text(cell).strip().casefold(), []).append(col)
         if any(len(headers.get(name, [])) != 1 for name in REQUIRED_HEADERS):
-            raise SheetConflict("The first row must contain exactly one Empresa, Last progress, and Next step header.")
-        company_col, progress_col, next_col = (headers[name][0] for name in REQUIRED_HEADERS)
+            raise SheetConflict("The first row must contain exactly one Empresa, Last progress, Next step, and Client Context header.")
+        company_col, progress_col, next_col, context_col = (headers[name][0] for name in REQUIRED_HEADERS)
         matches = [(number, row) for number, row in cells.items() if number > 0
                    and normalize_name(_display_text(row.get(company_col, {}))) == normalize_name(company)]
         if len(matches) != 1:
@@ -201,39 +209,43 @@ class SheetsClient:
         return SheetRow(company=_display_text(row.get(company_col, {})),
                         last_progress=_review_text(row.get(progress_col, {})),
                         next_step=_review_text(row.get(next_col, {})), row_number=number + 1,
-                        sheet_id=sheet_id, last_progress_col=progress_col, next_step_col=next_col)
+                        sheet_id=sheet_id, last_progress_col=progress_col, next_step_col=next_col,
+                        client_context=_review_text(row.get(context_col, {})), client_context_col=context_col)
 
     def apply_update(self, company: str, expected_last_progress: str, expected_next_step: str,
-                     new_last_progress: str, new_next_step: str) -> SheetRow:
-        """Apply a persisted rotation plan; retries never rotate the live cell twice."""
-        values = (expected_last_progress, expected_next_step, new_last_progress, new_next_step)
+                     new_last_progress: str, new_next_step: str, *,
+                     expected_client_context: str, new_client_context: str) -> SheetRow:
+        """Apply one persisted three-cell plan; retries never rotate or append twice."""
+        before = (expected_last_progress, expected_next_step, expected_client_context)
+        after = (new_last_progress, new_next_step, new_client_context)
+        values = before + after
         if any(not isinstance(value, str) for value in values):
             raise SheetError("Approval cell values must be text.")
-        if any(len(value) > 50_000 for value in values[2:]):
+        if any(len(value) > 50_000 for value in after):
             raise SheetError("An approved cell exceeds Google's 50,000-character limit. Shorten the update.")
         row = self.read_company(company)
-        current, before, after = ((row.last_progress, row.next_step),
-                                  (expected_last_progress, expected_next_step),
-                                  (new_last_progress, new_next_step))
+        current = (row.last_progress, row.next_step, row.client_context)
         if current == after:
             return row
         if current != before:
             raise SheetConflict("The Sheet changed since this card was prepared. Refresh the pipeline before approving.")
         requests = []
-        for column, value in ((row.last_progress_col, new_last_progress), (row.next_step_col, new_next_step)):
+        for column, old_value, value in zip((row.last_progress_col, row.next_step_col, row.client_context_col), before, after):
+            if old_value == value:
+                continue
             requests.append({"updateCells": {
                 "range": {"sheetId": row.sheet_id, "startRowIndex": row.row_number - 1,
                           "endRowIndex": row.row_number, "startColumnIndex": column, "endColumnIndex": column + 1},
                 "rows": [{"values": [{"userEnteredValue": {"stringValue": value}}]}],
                 "fields": "userEnteredValue",
             }})
-        # Both cells are atomic within this batch. The preceding comparison is not
+        # All changed cells are atomic within this batch. The preceding comparison is not
         # a server-side CAS and cannot exclude a simultaneous human edit/sort.
         self._request("POST", ":batchUpdate", payload={"requests": requests})
         try:
             verified = self.read_company(company)
         except (SheetError, ValueError):
             raise SheetWriteUncertain("The write was accepted but could not be verified. Retry the same approval.") from None
-        if (verified.last_progress, verified.next_step) != after:
+        if (verified.last_progress, verified.next_step, verified.client_context) != after:
             raise SheetWriteUncertain("The Sheet changed while the update was being verified. Reconcile the same approval before proceeding.")
         return verified
