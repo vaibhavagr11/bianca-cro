@@ -13,7 +13,7 @@ const core=context.BiancaLive;
 const json=value=>JSON.parse(JSON.stringify(value));
 const approve=(client,nextStepBullets)=>client.decide('p-1','approve',{nextStepBullets,clientContextBullets:[]});
 function snapshot(status='pending'){
-  return {proposals:[{id:'p-1',company:'A real company',owner:'NDL',stage:'4. Pilot',country:'ARG',routingVersion:1,nextStepBullets:['Confirm the scope.'],clientContextBullets:[],sources:[{type:'Email',date:'Nov 2',quote:'Please confirm the scope.'}],lastProgress:'Old progress',nextStep:'Old next step',revision:2,status}],rows:[{id:'r-1',company:'A real company',owner:'NDL',stage:'4. Pilot',lastProgress:'Old progress',nextStep:'Old next step',revision:0}],activity:[]};
+  return {proposals:[{id:'p-1',company:'A real company',owner:'NDL',stage:'4. Pilot',country:'ARG',routingVersion:1,nextStepBullets:['Confirm the scope.'],clientContextBullets:[],lineageVersion:1,bulletLineage:{nextStep:[{bulletId:'bullet-scope',text:'Confirm the scope.',sourceIds:['email-scope']}],clientContext:[]},sources:[{id:'email-scope',type:'Email',date:'Nov 2',subject:'Pilot scope',quote:'Please confirm the scope.'}],lastProgress:'Old progress',nextStep:'Old next step',revision:2,status}],rows:[{id:'r-1',company:'A real company',owner:'NDL',stage:'4. Pilot',lastProgress:'Old progress',nextStep:'Old next step',revision:0}],activity:[]};
 }
 const completed=()=>({proposals:[],rows:[{id:'r-1',company:'A real company',owner:'NDL',stage:'4. Pilot',lastProgress:'Old next step',nextStep:'- Confirm the scope.',revision:1}],activity:[{id:'a-1',proposalId:'p-1',company:'A real company',kind:'approved',edited:false,at:'2026-11-02T20:00:00Z',before:{lastProgress:'Old progress',nextStep:'Old next step'},after:{lastProgress:'Old next step',nextStep:'- Confirm the scope.'}}]});
 let passed=0,failed=0;
@@ -445,7 +445,7 @@ test('Cards show separate destination sections and read-only current Client Cont
 });
 
 test('Editor submits two independently editable destination groups, including context-only approval',async()=>{
-  const s=snapshot();s.proposals[0].clientContextBullets=['Customer need: Existing suggestion.'];s.rows[0].clientContext='Current Sheet context';
+  const s=snapshot();s.proposals[0].clientContextBullets=['Customer need: Existing suggestion.'];s.proposals[0].bulletLineage.clientContext=[{bulletId:'context-original',text:'Customer need: Existing suggestion.',sourceIds:['email-scope']}];s.rows[0].clientContext='Current Sheet context';
   const writes=[];
   const page=fakePage({callTool:async(name,args)=>{if(name===core.TOOLS.workspace)return {structuredContent:s};writes.push(json(args));return {structuredContent:{status:'approved'}};}});
   await new Promise(resolve=>setImmediate(resolve));
@@ -495,5 +495,168 @@ test('A configured context replacement policy is stated honestly in the live edi
   await new Promise(resolve=>setImmediate(resolve));
   assert.ok(page.get('#context-help').textContent.includes('replace Client Context'));
 });
+
+
+function tracedWorkspace(){
+  const s=snapshot(),p=s.proposals[0];
+  p.nextStepBullets=['Review the store codes.','Send the launch checklist.'];
+  p.clientContextBullets=['Buying signal: The pilot scope is confirmed.'];
+  p.sources=[
+    {id:'email-a',type:'Email',date:'2026-11-02',subject:'Revised store list',recordId:'r-email-a',version:'v1'},
+    {id:'notes-a',type:'Meeting notes',date:'2026-11-01',subject:'Pilot planning notes',recordId:'r-notes-a',version:'v1'},
+    {id:'email-b',type:'Email',date:'2026-11-02',subject:'Launch confirmation',recordId:'r-email-b',version:'v1'}
+  ];
+  p.bulletLineage={nextStep:[
+    {bulletId:'action-codes',text:p.nextStepBullets[0],sourceIds:['email-a']},
+    {bulletId:'action-checklist',text:p.nextStepBullets[1],sourceIds:['notes-a','email-b']}
+  ],clientContext:[{bulletId:'context-pilot',text:p.clientContextBullets[0],sourceIds:['email-a','email-b']}]};
+  return s;
+}
+function sourceClick(page,companyId,sourceId){
+  const article={dataset:{id:companyId}},button={dataset:{action:'source',sourceId},closest:selector=>selector==='[data-id]'?article:null};
+  page.events.click({target:{closest:()=>button}});
+}
+const articleHtml=(page,id='p-1')=>page.get('#review-list').innerHTML.match(new RegExp('<article[^>]*data-id="'+id+'"[\\s\\S]*?<\\/article>'))?.[0]||'';
+const highlighted=(card,bulletId)=>new RegExp('<li(?=[^>]*data-bullet-id="'+bulletId+'")(?=[^>]*class="source-highlight")[^>]*>').test(card);
+
+test('Lineage validates exact text and known source identities rather than label/date guesses',()=>{
+  const p=tracedWorkspace().proposals[0],data=core.trace(p);
+  assert.equal(data.available,true);
+  assert.deepEqual(json(data.lineage.nextStep[1].sourceIds),['notes-a','email-b']);
+  for(const mutate of [
+    value=>delete value.lineageVersion,
+    value=>{value.bulletLineage.nextStep[0].text='A different sentence with the same position';},
+    value=>{value.bulletLineage.nextStep[0].sourceIds=['unknown-email'];},
+    value=>{value.bulletLineage.nextStep.pop();},
+    value=>{value.bulletLineage.clientContext[0].bulletId=value.bulletLineage.nextStep[0].bulletId;},
+    value=>{value.bulletLineage.nextStep[0].sourceIds=[];},
+    value=>{value.sources.push({...value.sources[0],subject:'A conflicting identity'});}
+  ]){const value=json(p);mutate(value);assert.equal(core.trace(value).available,false);}
+  const duplicate=json(p);duplicate.sources.push({...duplicate.sources[0]});
+  assert.equal(core.trace(duplicate).sources.length,3,'One source version has one chip even when repeated in evidence.');
+});
+
+test('A source click highlights only its associated bullets across both destinations without a write',async()=>{
+  let writes=0;
+  const page=fakePage({callTool:async name=>{if(name!==core.TOOLS.workspace)writes++;return {structuredContent:tracedWorkspace()};}});
+  await new Promise(resolve=>setImmediate(resolve));
+  sourceClick(page,'p-1','email-a');
+  let card=articleHtml(page);
+  assert.equal(highlighted(card,'action-codes'),true);
+  assert.equal(highlighted(card,'action-checklist'),false);
+  assert.equal(highlighted(card,'context-pilot'),true);
+  assert.ok(card.includes('data-source-id="email-a" data-source-unavailable="false" aria-pressed="true"'));
+  assert.ok(page.get('#announcer').textContent.includes('2 bullets highlighted from Email · Nov 2'));
+  sourceClick(page,'p-1','notes-a');card=articleHtml(page);
+  assert.equal(highlighted(card,'action-codes'),false);
+  assert.equal(highlighted(card,'action-checklist'),true);
+  assert.equal(highlighted(card,'context-pilot'),false);
+  assert.ok(page.get('#announcer').textContent.includes('1 bullet highlighted from Notes · Nov 1'));
+  sourceClick(page,'p-1','notes-a');card=articleHtml(page);
+  assert.equal(card.includes('class="source-highlight"'),false);
+  assert.ok(page.get('#announcer').textContent.includes('Source highlighting cleared'));
+  assert.equal(writes,0);
+});
+
+test('Same-date source chips remain distinct native keyboard buttons with descriptive accessible names',async()=>{
+  const page=fakePage({callTool:async()=>({structuredContent:tracedWorkspace()})});await new Promise(resolve=>setImmediate(resolve));
+  const card=articleHtml(page);
+  assert.ok(card.includes('<button type="button" class="source-label" data-action="source" data-source-id="email-a"'));
+  assert.ok(card.includes('Highlight bullets from Email · Nov 2 — Revised store list (source 1)'));
+  assert.ok(card.includes('Highlight bullets from Email · Nov 2 — Launch confirmation (source 3)'));
+  sourceClick(page,'p-1','email-b');
+  const selected=articleHtml(page);
+  assert.equal(highlighted(selected,'action-codes'),false);
+  assert.equal(highlighted(selected,'action-checklist'),true);
+  assert.equal(highlighted(selected,'context-pilot'),true);
+});
+
+test('Source selection is independent for each company card',async()=>{
+  const s=tracedWorkspace(),other=json(s.proposals[0]);other.id='p-2';other.company='A second company';s.proposals.push(other);
+  const page=fakePage({callTool:async()=>({structuredContent:s})});await new Promise(resolve=>setImmediate(resolve));
+  sourceClick(page,'p-1','email-a');
+  assert.equal(highlighted(articleHtml(page,'p-1'),'action-codes'),true);
+  assert.equal(articleHtml(page,'p-2').includes('class="source-highlight"'),false);
+  sourceClick(page,'p-2','notes-a');
+  assert.equal(highlighted(articleHtml(page,'p-1'),'action-codes'),true);
+  assert.equal(highlighted(articleHtml(page,'p-2'),'action-checklist'),true);
+});
+
+test('Refresh preserves a still-present selected source by stable identity, not array position',async()=>{
+  const s=tracedWorkspace();let reads=0;
+  const page=fakePage({callTool:async()=>{const current=json(s);if(++reads>1)current.proposals[0].sources.reverse();return {structuredContent:current};}});
+  await new Promise(resolve=>setImmediate(resolve));sourceClick(page,'p-1','email-b');
+  await page.get('#refresh-updates').onclick();
+  const card=articleHtml(page);
+  assert.equal(highlighted(card,'action-codes'),false);
+  assert.equal(highlighted(card,'action-checklist'),true);
+  assert.ok(card.includes('data-source-id="email-b" data-source-unavailable="false" aria-pressed="true"'));
+});
+
+test('Refresh clears a selected source when the new revision no longer includes it',async()=>{
+  let current=tracedWorkspace();
+  const page=fakePage({callTool:async()=>({structuredContent:current})});await new Promise(resolve=>setImmediate(resolve));
+  sourceClick(page,'p-1','email-a');
+  current=json(current);const p=current.proposals[0];p.revision++;
+  p.sources=p.sources.filter(source=>source.id!=='email-a');
+  p.bulletLineage.nextStep[0].sourceIds=['email-b'];p.bulletLineage.clientContext[0].sourceIds=['email-b'];
+  await page.get('#refresh-updates').onclick();
+  assert.equal(articleHtml(page).includes('class="source-highlight"'),false);
+  assert.ok(articleHtml(page).includes('Select a source to highlight'));
+});
+
+test('Missing or invalid lineage never fabricates source highlights and blocks a new approval',async()=>{
+  for(const mutate of [p=>delete p.lineageVersion,p=>{p.bulletLineage.nextStep[0].sourceIds=['invented-source'];}]){
+    const s=tracedWorkspace();mutate(s.proposals[0]);let writes=0;
+    const transport=async name=>{if(name!==core.TOOLS.workspace)writes++;return s;};
+    const client=core.createClient(transport);await client.refresh();
+    await assert.rejects(client.decide('p-1','approve',s.proposals[0]),/restore its source links/);
+    const page=fakePage({callTool:async()=>({structuredContent:s})});await new Promise(resolve=>setImmediate(resolve));
+    sourceClick(page,'p-1','email-a');const card=articleHtml(page);
+    assert.ok(card.includes('Source tracing is unavailable'));
+    assert.equal(card.includes('class="source-highlight"'),false);
+    assert.ok(card.includes('Rebuild required'));
+    assert.equal(writes,0);
+  }
+});
+
+test('Legacy typed applying requests remain retryable while their unavailable lineage stays honest',async()=>{
+  const s=snapshot('applying');delete s.proposals[0].lineageVersion;
+  s.proposals[0].retry={idempotency_key:'legacy-durable-key',revision:2,next_step_bullets:['The saved manual edit.'],client_context_bullets:[]};
+  const calls=[];const client=core.createClient(async(name,args)=>{if(name===core.TOOLS.workspace)return s;calls.push(json(args));return {status:'approved'};});
+  await client.refresh();await client.decide('p-1','approve',{});
+  assert.deepEqual(calls,[{proposal_id:'p-1',...s.proposals[0].retry}]);
+  const page=fakePage({callTool:async()=>({structuredContent:s})});await new Promise(resolve=>setImmediate(resolve));
+  assert.ok(articleHtml(page).includes('data-action="retry"'));
+  assert.ok(articleHtml(page).includes('Its original request can still be retried'));
+  assert.equal(articleHtml(page).includes('class="source-highlight"'),false);
+});
+
+test('A same-length edited applying payload cannot inherit the original bullet source by position',async()=>{
+  const s=snapshot('applying');s.proposals[0].retry={idempotency_key:'edited-durable-key',revision:2,next_step_bullets:['A manually changed sentence.'],client_context_bullets:[]};
+  const page=fakePage({callTool:async()=>({structuredContent:s})});await new Promise(resolve=>setImmediate(resolve));
+  sourceClick(page,'p-1','email-scope');
+  assert.equal(articleHtml(page).includes('class="source-highlight"'),false);
+  assert.ok(articleHtml(page).includes('Source tracing is unavailable'));
+});
+
+test('Founder-edited bullets with explicit empty provenance do not claim support from a source',()=>{
+  const p=tracedWorkspace().proposals[0];p.bulletLineage.nextStep[0].sourceIds=[];p.bulletLineage.nextStep[0].origin='founder_edit';
+  const data=core.trace(p);assert.equal(data.available,true);
+  assert.deepEqual(json(data.lineage.nextStep[0].sourceIds),[]);
+});
+
+test('An entirely founder-edited saved approval explains why its source chips are unavailable',async()=>{
+  const s=snapshot('applying'),p=s.proposals[0];
+  p.nextStepBullets=['A founder supplied action.'];
+  p.bulletLineage.nextStep=[{bulletId:'founder-edit',text:p.nextStepBullets[0],sourceIds:[],origin:'founder_edit'}];
+  p.retry={idempotency_key:'founder-edit-key',revision:2,next_step_bullets:[...p.nextStepBullets],client_context_bullets:[]};
+  const page=fakePage({callTool:async()=>({structuredContent:s})});await new Promise(resolve=>setImmediate(resolve));
+  const card=articleHtml(page);
+  assert.ok(card.includes('These founder-edited bullets have no source attribution.'));
+  assert.ok(card.includes('data-source-unavailable="true"'));
+  assert.ok(card.includes('data-action="retry"'));
+});
+
 
 (async()=>{for(const t of tests){try{await t.fn();passed++;process.stdout.write('PASS '+t.name+'\n');}catch(error){failed++;process.stdout.write('FAIL '+t.name+'\n  '+error.stack+'\n');}}process.stdout.write(`\n${passed} passed; ${failed} failed.\n`);process.exitCode=failed?1:0;})();

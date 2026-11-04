@@ -188,7 +188,7 @@ function fakePage(savedState){
     querySelectorAll(){return [];}querySelector(){return new Element();}
   }
   const elements=new Map(),events={},storage=new Map();
-  if(savedState)storage.set('bianca.pipeline-review.demo.v2',JSON.stringify(savedState));
+  if(savedState)storage.set('bianca.pipeline-review.demo.v3',JSON.stringify(savedState));
   const get=selector=>{if(!elements.has(selector))elements.set(selector,new Element());return elements.get(selector);};
   get('#owner-filter').value='all';
   const page=vm.createContext({
@@ -214,10 +214,11 @@ test('Demo navigation and actions contain no Sheet preview or bottom rotation hi
 test('Demo sources show every type and date without rendering sample quotes',()=>{
   const state=core.initial();
   state.proposals[0].sources=[
-    {type:'Meeting notes',date:'2026-09-28',quote:'Hidden notes quotation.'},
-    {type:'Email',date:'2026-10-06',quote:'Hidden email quotation.'},
-    {type:'Calendar',date:'2026-10-07',quote:'Hidden calendar quotation.'}
+    {id:'date-notes',type:'Meeting notes',date:'2026-09-28',quote:'Hidden notes quotation.'},
+    {id:'date-email',type:'Email',date:'2026-10-06',quote:'Hidden email quotation.'},
+    {id:'date-calendar',type:'Calendar',date:'2026-10-07',quote:'Hidden calendar quotation.'}
   ];
+  for(const edges of Object.values(state.proposals[0].bulletLineage))for(const edge of edges)edge.sourceIds=['date-notes'];
   const page=fakePage(state),card=page.get('#review-list').innerHTML;
   for(const label of ['Notes · Sep 28','Email · Oct 6','Calendar · Oct 7'])assert.ok(card.includes(label),label);
   for(const source of state.proposals[0].sources)assert.equal(card.includes(source.quote),false);
@@ -261,7 +262,7 @@ test('New schema rejects saved flat legacy proposals instead of guessing column 
   const legacy=core.initial();legacy.schema=1;
   assert.equal(core.valid(legacy),false);
   assert.throws(()=>core.approve(core.initial(),'campari',['A flat legacy bullet.'],at),/at least one bullet/);
-  assert.equal(html.includes('bianca.pipeline-review.demo.v2'),true);
+  assert.equal(html.includes('bianca.pipeline-review.demo.v3'),true);
 });
 
 test('Approval routes groups to separate cells and preserves the old Client Context exactly',()=>{
@@ -321,6 +322,58 @@ test('Empty current Client Context is explicit and does not revive the proposal 
   const cards=fakePage(before).get('#review-list').innerHTML;
   assert.ok(cards.includes('No Client Context is currently noted.'));
   assert.equal(cards.includes('Old context'),false);
+});
+
+
+function clickSource(page,companyId,sourceId){const article={dataset:{id:companyId}},button={dataset:{action:'source',sourceId},closest:selector=>selector==='[data-id]'?article:null};page.events.click({target:{closest:()=>button}});}
+const demoArticle=(page,id)=>page.get('#review-list').innerHTML.match(new RegExp('<article[^>]*data-id="'+id+'"[\\s\\S]*?<\\/article>'))?.[0]||'';
+const demoHighlighted=(card,bulletId)=>new RegExp('<li(?=[^>]*data-bullet-id="'+bulletId+'")(?=[^>]*class="source-highlight")[^>]*>').test(card);
+
+test('Fictional Pernod source edges explicitly link Email to its first two actions and Notes to its last action',()=>{
+  const p=core.initial().proposals[0],data=core.trace(p);
+  assert.equal(data.available,true);assert.equal(p.lineageVersion,1);
+  assert.deepEqual(json(data.lineage.nextStep.map(edge=>edge.sourceIds)),[[p.sources[0].id],[p.sources[0].id],[p.sources[1].id]]);
+  const page=fakePage();clickSource(page,p.id,p.sources[0].id);let card=demoArticle(page,p.id);
+  assert.equal(demoHighlighted(card,p.bulletLineage.nextStep[0].bulletId),true);
+  assert.equal(demoHighlighted(card,p.bulletLineage.nextStep[1].bulletId),true);
+  assert.equal(demoHighlighted(card,p.bulletLineage.nextStep[2].bulletId),false);
+  assert.ok(page.get('#announcer').textContent.includes('2 bullets highlighted from Email · Nov 2'));
+  clickSource(page,p.id,p.sources[1].id);card=demoArticle(page,p.id);
+  assert.equal(demoHighlighted(card,p.bulletLineage.nextStep[0].bulletId),false);
+  assert.equal(demoHighlighted(card,p.bulletLineage.nextStep[2].bulletId),true);
+  assert.equal(demoHighlighted(card,p.bulletLineage.clientContext[0].bulletId),true);
+});
+
+test('Source selection toggles independently without storing a decision or changing any demo cell',()=>{
+  const state=core.initial(),p=state.proposals[0],page=fakePage(state);
+  clickSource(page,p.id,p.sources[0].id);
+  assert.equal(page.get('#pending-count').textContent,6);assert.equal(page.get('#activity-count').textContent,0);
+  assert.equal(demoArticle(page,'campari').includes('class="source-highlight"'),false);
+  clickSource(page,p.id,p.sources[0].id);
+  assert.equal(demoArticle(page,p.id).includes('class="source-highlight"'),false);
+  assert.ok(page.get('#announcer').textContent.includes('highlighting cleared'));
+});
+
+test('Demo graph validation refuses old or fabricated attribution',()=>{
+  for(const mutate of [s=>{s.schema=2;},s=>{delete s.proposals[0].lineageVersion;},s=>{s.proposals[0].bulletLineage.nextStep[0].sourceIds=['invented'];},s=>{s.proposals[0].bulletLineage.nextStep[0].text='Wrong positional text';}]){
+    const state=core.initial();mutate(state);assert.equal(core.valid(state),false);
+  }
+});
+
+test('A manually rewritten demo approval keeps no false link to the original source',()=>{
+  const before=core.initial(),after=core.approve(before,'pernod-ricard',{nextStepBullets:['A founder supplied replacement action.'],clientContextBullets:[]},at);
+  const p=after.proposals.find(item=>item.id==='pernod-ricard');
+  assert.deepEqual(json(p.bulletLineage.nextStep[0].sourceIds),[]);
+  assert.equal(p.bulletLineage.nextStep[0].origin,'founder_edit');
+  assert.equal(core.valid(after),true);
+});
+
+test('The demo keeps a selected source on a filter rerender and clears it on workspace reset',()=>{
+  const p=core.initial().proposals[0],page=fakePage();clickSource(page,p.id,p.sources[0].id);
+  page.get('#company-search').handlers.input();
+  assert.equal(demoHighlighted(demoArticle(page,p.id),p.bulletLineage.nextStep[0].bulletId),true);
+  page.get('#confirm-reset').onclick();
+  assert.equal(demoArticle(page,p.id).includes('class="source-highlight"'),false);
 });
 
 process.stdout.write(`\n${passed} passed; ${failed} failed.\n`);
