@@ -530,3 +530,72 @@ def test_done_buttons_link_each_closable_row_and_skip_the_rest():
     assert "https://x/done?r=insight:c" in html and "https://x/done?r=thread:t1" in html
     no_target = primary_move(view("Quiet Co", 2, owner="RG"), TODAY, set())
     assert no_target.tag == "Confirm status" and no_target.done is None
+
+
+# ---------------------------------------------------------------- Nov 4 founder feedback: automated mail, waiting list
+
+from app.brief_v2 import Waiting, is_automated, pick_waiting, waiting_on_them, waiting_text  # noqa: E402
+
+NOV4 = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
+INTERNAL = {"bianca-ai.com"}
+
+
+@pytest.mark.parametrize("senders,subject", [
+    (["juan@andina.cl"], "Respuesta automática: Bianca"),          # Andina Chile, Nov 4 "Reply needed"
+    (["ana@campari.com"], "Automatic reply: [EXTERNAL] Re: Pilot"),  # Campari, Nov 4 "Reply needed"
+    (["x@pernod-ricard.com"], "Out of Office Re: Bianca"),
+    (["gemini-notes@google.com"], "Notes: “Menús PRA” Oct 29, 2026"),  # Pernod, Nov 4: internal meeting notes
+    (["noreplysupplierportal@coca-cola.com"], "Supplier registration"),
+    (["mailer-daemon@googlemail.com"], "Delivery Status Notification (Failure)"),
+])
+def test_auto_replies_and_bots_are_not_people(senders, subject):
+    assert is_automated(senders, subject)
+
+
+@pytest.mark.parametrize("senders,subject", [
+    (["juan@andina.cl"], "Fwd: Out of Office: Business review"),   # a person forwarded it
+    (["juan@andina.cl"], "Re: Automatic replenishment pilot"),
+    (["support@vtinfo.zendesk.com"], "Re: VIP data access"),
+])
+def test_people_are_not_automated(senders, subject):
+    assert not is_automated(senders, subject)
+
+
+def msg(days_ago, frm, to=("juan@andina.cl",), automated=False, name="Juan Pérez"):
+    return {"at": NOV4 - timedelta(days=days_ago), "from": [frm], "automated": automated,
+            "to": [{"address": a, "name": name if "andina" in a else ""} for a in to], "cc": []}
+
+
+def test_waiting_counts_our_unanswered_emails_and_sees_through_an_out_of_office():
+    thread = [msg(40, "juan@andina.cl", to=("ramiro@bianca-ai.com",)), msg(20, "ramiro@bianca-ai.com"),
+              msg(9, "ramiro@bianca-ai.com"), msg(8.9, "juan@andina.cl", to=("ramiro@bianca-ai.com",), automated=True)]
+    w = waiting_on_them(thread, INTERNAL, NOV4)
+    assert (w["to"], w["days"], w["nudges"], w["replied_before"], w["auto_reply"]) == ("Juan Pérez", 9, 2, True, True)
+
+
+def test_no_wait_when_they_answered_last_too_recent_or_internal_only():
+    assert waiting_on_them([msg(10, "ramiro@bianca-ai.com"), msg(5, "juan@andina.cl")], INTERNAL, NOV4) is None
+    assert waiting_on_them([msg(1, "ramiro@bianca-ai.com")], INTERNAL, NOV4) is None
+    assert waiting_on_them([msg(10, "ramiro@bianca-ai.com", to=("nico@bianca-ai.com",))], INTERNAL, NOV4) is None
+    assert waiting_on_them([msg(200, "ramiro@bianca-ai.com")], INTERNAL, NOV4) is None
+
+
+def wait(deal, days, owner="RG", rank=2, **kw):
+    return Waiting(deal, STAGES[rank], "Juan Pérez", (NOV4 - timedelta(days=days)).date(), days, kw.get("nudges", 1),
+                   kw.get("replied", False), kw.get("auto", False), "https://mail/t", "Email · Oct 1", f"t-{deal}", owner, rank)
+
+
+def test_waiting_list_is_per_founder_prospects_first_newest_silence_first():
+    ws = [wait("Customer Co", 60, rank=5), wait("Andina Chile", 9), wait("Arca Peru", 70), wait("Nico deal", 5, owner="NC")]
+    shown, more = pick_waiting(ws, "RG")
+    assert [w.deal for w in shown] == ["Andina Chile", "Arca Peru", "Customer Co"] and more == 0
+    assert waiting_text(wait("Arca Peru", 70, nudges=3, auto=True)) == "To Juan Pérez · no reply to our 3 emails, out-of-office received"
+    assert waiting_text(wait("Farmater", 4, nudges=8, replied=True)) == "To Juan Pérez · 8 emails since their last reply"
+
+
+def test_waiting_list_renders_with_a_done_button():
+    s = section("RG", [], [])
+    s.waiting = [wait("Andina Chile", 9, auto=True)]
+    html = render([s], [], [], TODAY, 1, "c", False, action_url=lambda ref: f"https://x/done?r={ref}")
+    assert "Waiting on their reply" in html and "out-of-office received" in html and "r=thread:t-Andina Chile" in html
+    assert "thread:t-Andina Chile" in completable([s], [])

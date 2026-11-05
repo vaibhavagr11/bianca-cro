@@ -24,6 +24,7 @@ REPLY_DAYS = 7              # customer email this recent + a question/request = 
 PROPOSAL_FOLLOWUP_DAYS = (7, 30)   # our proposal with no reply after this many days = follow-up may be needed
 UNDATED_WINDOW_DAYS = 45
 MAX_HIGHLIGHTS, MAX_CUSTOMERS, MAX_FOLLOWUPS, MAX_EXCEPTIONS, MAX_NAMES = 4, 4, 3, 1, 3
+MAX_WAITING = 6
 IN_TALKS_RANK = 2
 REQUEST_FRESH_DAYS = 21       # a customer request this recent still counts as outstanding
 CHANGE_QUOTA = {0: 3, 1: 2, 2: 0}  # what changed: prospects/pilots, customers, other
@@ -231,6 +232,88 @@ def reply_text(u: Unanswered) -> str:
     """What to do about an unanswered customer email: the extracted request if there is one, otherwise a neutral
     instruction. Never an action invented from the subject line."""
     return u.action or f"Review the customer's email and decide the response needed ({u.subject[:60]})"
+
+
+# Mail no person wrote: out-of-office replies, bounces, meeting-notes bots and no-reply notifications. They never
+# mean a customer is waiting on us, and an out-of-office does not mean the customer answered.
+AUTO_SUBJECT_RE = re.compile(
+    r"^\s*(automatic reply|auto[- ]?reply|autoreply|auto[- ]?response|out of (the )?office|ooo\b|"
+    r"respuesta autom[aá]tica|resposta autom[aá]tica|r[ée]ponse automatique|fuera de (la )?oficina|"
+    r"abwesenheitsnotiz|undeliverable|delivery status notification|mail delivery (failed|subsystem))", re.I)
+AUTO_SENDER_RE = re.compile(
+    r"(no-?reply|do-?not-?reply|^mailer-daemon@|^postmaster@|^bounces?[+@-]|^gemini-notes@|^calendar-notification@"
+    r"|@([^@]*\.)?notifications?\.)", re.I)
+WAITING_DAYS = (3, 90)      # we wrote last and nobody has answered for this many days = waiting on their reply
+
+
+def is_automated(senders: list[str], subject: str | None) -> bool:
+    return bool(AUTO_SUBJECT_RE.match(subject or "")) or any(AUTO_SENDER_RE.search(a or "") for a in senders)
+
+
+@dataclass
+class Waiting:
+    """A thread where we wrote last and the customer has not answered."""
+    deal: str
+    stage: str | None
+    to: str                         # who we wrote to
+    sent: date                      # our latest email
+    days: int
+    nudges: int                     # our emails in a row since their last real reply
+    replied_before: bool            # they had answered earlier in this thread
+    auto_reply: bool                # an out-of-office came back after our latest email
+    link: str | None
+    source: str = ""
+    thread_id: str | None = None
+    owner: str | None = None        # whose section it goes to: who sent it, else the deal owner
+    rank: int | None = None
+
+
+def waiting_on_them(thread: list[dict], internal: set[str], now: datetime) -> dict | None:
+    """The thread's latest real message is ours, to someone outside Bianca, and 3-90 days old.
+
+    Each message: {"at": datetime, "from": [address], "to": [{"address", "name"}], "cc": [...], "automated": bool},
+    oldest first. Returns {"last", "to", "days", "nudges", "replied_before", "auto_reply"} or None.
+    """
+    dom = lambda a: (a or "").rsplit("@", 1)[-1].lower()
+    ours = lambda m: bool(m["from"]) and all(dom(a) in internal for a in m["from"])
+    real = [m for m in thread if not m["automated"]]
+    if not real or not ours(real[-1]):
+        return None
+    last = real[-1]
+    days = (now - last["at"]).days
+    if not WAITING_DAYS[0] <= days <= WAITING_DAYS[1]:
+        return None
+    people = [p for p in (last.get("to") or []) + (last.get("cc") or [])
+              if dom(p.get("address")) not in internal and not AUTO_SENDER_RE.search(p.get("address") or "")]
+    if not people:
+        return None                 # an internal-only thread: nobody outside to wait for
+    nudges = 0
+    for m in reversed(real):
+        if not ours(m):
+            break
+        nudges += 1
+    names = [(p.get("name") or "").strip() or p["address"] for p in people[:2]]
+    to = ", ".join(names) + (f" +{len(people) - 2}" if len(people) > 2 else "")
+    return {"last": last, "to": to, "days": days, "nudges": nudges,
+            "replied_before": any(not ours(m) for m in real),
+            "auto_reply": any(m["automated"] and m["at"] > last["at"] for m in thread)}
+
+
+def pick_waiting(waiting: list[Waiting], code: str) -> tuple[list[Waiting], int]:
+    """This founder's waits: prospects and pilots first, then the most recent silence (still worth a nudge)."""
+    mine = sorted((w for w in waiting if w.owner == code), key=lambda w: (w.rank not in PROSPECT_RANKS, w.days, w.deal))
+    return mine[:MAX_WAITING], max(0, len(mine) - MAX_WAITING)
+
+
+def waiting_text(w: Waiting) -> str:
+    """What the founder needs: who, since when, and what came back."""
+    if w.replied_before:
+        bits = [f"{w.nudges} emails since their last reply" if w.nudges > 1 else "no reply to our last email"]
+    else:
+        bits = [f"no reply to our {w.nudges} emails" if w.nudges > 1 else "no reply yet"]
+    if w.auto_reply:
+        bits.append("out-of-office received")
+    return f"To {w.to} · " + ", ".join(bits)
 
 
 def first_sentence(text: str, limit: int = 95) -> str:
@@ -493,6 +576,8 @@ class Section:
     hidden: int = 0
     all_items: list[Item] = field(default_factory=list)   # everything routed here, for the payload
     audit: list[SelectionRecord] = field(default_factory=list)
+    waiting: list["Waiting"] = field(default_factory=list)  # we wrote last, no answer yet (set after selection)
+    more_waiting: int = 0
 
 
 def build_section(code: str, name: str, short: str, views: dict[str, DealView], items: list[Item],
@@ -721,6 +806,15 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None) -> 
     if s.also_active:
         out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">Also active: {_e(", ".join(s.also_active))}</p>')
 
+    if s.waiting:
+        out.append(_h("Waiting on their reply", AMBER, len(s.waiting) + s.more_waiting))
+        out.append(_table(_th("Deal", "20%") + _th("Who · status") + _th("Waiting", "13%") + _th("Source", "12%") + done_th,
+                          ["<tr>" + _td(_deal_cell(w.deal, w.stage)) + _td(_e(waiting_text(w)))
+                           + _td(_muted(_e(f"{w.days}d since {_date(w.sent)}"))) + _td(_src(w.source))
+                           + done_td(f"thread:{w.thread_id}" if w.thread_id else None) + "</tr>" for w in s.waiting]))
+        if s.more_waiting:
+            out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">+ {s.more_waiting} more on record</p>')
+
     if s.customers:
         out.append(_h("Customer accounts", AMBER, len(s.customers)))
         out.append(_table(_th("Account", "20%") + _th("Next move") + _th("Source", "12%") + done_th,
@@ -778,6 +872,8 @@ def completable(sections: list[Section], ndl_rows: list[TodayRow]) -> dict[str, 
         rows = [(r.done, r.deal, r.text) for r in s.today]
         rows += [(m.done, v.deal, m.text) for v, m, _ in s.highlights] + [(m.done, v.deal, m.text) for v, m in s.customers]
         rows += [(m.done, m.text.split(":", 1)[0], m.text.split(":", 1)[-1].strip()) for m in s.followups]
+        rows += [(f"thread:{w.thread_id}" if w.thread_id else None, w.deal, f"Waiting on their reply: {waiting_text(w)}")
+                 for w in s.waiting]
         for ref, deal, text in rows:
             if ref:
                 out.setdefault(ref, (deal, text))
@@ -830,6 +926,9 @@ def plain_text(sections: list[Section], today: date) -> str:
         lines += [f"• {v.deal} (customer): [{m.tag}] {m.text}" for v, m in s.customers]
         lines += [f"• {m.at:%a %H:%M} {m.title} — {p}" for m, p in s.meetings]
         lines += [f"• [{m.tag}] {m.text} ({m.when})" for m in s.followups]
+        if s.waiting:
+            lines.append(f"Waiting on their reply ({len(s.waiting) + s.more_waiting})")
+            lines += [f"• {w.deal}: {waiting_text(w)} ({w.days}d since {_date(w.sent)})" for w in s.waiting]
     return "\n".join(lines)
 
 
@@ -851,6 +950,9 @@ def to_payload(sections: list[Section], ndl_rows: list[TodayRow], changes: list[
         "also_active": s.also_active,
         "customers": [{"deal": v.deal, "move": move(m)} for v, m in s.customers],
         "followups": [move(m) for m in s.followups], "more_followups": s.more_followups,
+        "waiting": [{"deal": w.deal, "to": w.to, "sent": w.sent, "days": w.days, "nudges": w.nudges,
+                     "replied_before": w.replied_before, "auto_reply": w.auto_reply, "thread_id": w.thread_id}
+                    for w in s.waiting], "more_waiting": s.more_waiting,
         "unclear": [v.deal for v in s.unclear], "dormant": s.dormant,
         "backlog": {"count": s.backlog.count, "deals": s.backlog.deals, "oldest": s.backlog.oldest,
                     "exceptions": [item(i) for i in s.backlog.exceptions]},

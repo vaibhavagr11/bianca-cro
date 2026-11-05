@@ -319,30 +319,76 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
             " where i.workspace_id = %s and i.type in ('commitment', 'next_step') and i.owner_side = 'bianca'"
             " and i.status = 'possibly_done' group by o.owner_code", (workspace_id,))}
 
-        # Unanswered customer emails (v1 window), newest per deal, with whether the email asks for something.
+        # Each email thread's latest real message (auto-replies, bounces and notification bots skipped) decides it:
+        # from the customer = unanswered customer email (v1 window), newest per deal; from us = waiting on their reply.
         unanswered: dict[str, brief_v2.Unanswered] = {}
         unanswered_src: dict[str, tuple[str, str]] = {}  # deal -> (thread id, latest customer message body)
+        threads: dict[str, list[dict]] = {}
         for t in conn.execute(
-                "select distinct on (thread_id) thread_id, company_id, subject, body, occurred_at, participants"
-                " from source_records where workspace_id = %s and source = 'gmail' and company_id is not null"
-                " and (classification->>'is_commercial')::bool order by thread_id, occurred_at desc", (workspace_id,)):
-            d = deals.get(str(t["company_id"]))
-            senders = [p["address"] for p in (t["participants"] or {}).get("from") or []]
-            if not (d and senders and all(domain(s) not in internal for s in senders)):
+                "select thread_id, company_id, subject, body, occurred_at, participants from source_records"
+                " where workspace_id = %s and source = 'gmail' and company_id is not null and occurred_at <= now()"
+                " and (classification->>'is_commercial')::bool order by thread_id, occurred_at", (workspace_id,)):
+            p = t["participants"] or {}
+            frm = [x["address"] for x in p.get("from") or []]
+            threads.setdefault(t["thread_id"], []).append(
+                {"at": t["occurred_at"], "from": frm, "to": p.get("to") or [], "cc": p.get("cc") or [],
+                 "automated": brief_v2.is_automated(frm, t["subject"]), "row": t})
+        from_customer = lambda m: bool(m["from"]) and all(domain(a) not in internal for a in m["from"])
+        last_reply: dict[str, datetime] = {}         # deal -> the customer's latest real email, any thread
+        last_ours: dict[str, datetime] = {}          # deal -> our latest email, any thread
+        ours_sent: dict[str, list[datetime]] = {}    # deal -> every email we sent outside Bianca
+        last_auto: dict[str, datetime] = {}          # deal -> latest out-of-office/bounce (they arrive as own threads)
+        outside = lambda m: any(domain(x.get("address")) not in internal for x in m["to"] + m["cc"])
+        for msgs in threads.values():
+            for m in msgs:
+                d = deals.get(str(m["row"]["company_id"]))
+                if not d:
+                    continue
+                if m["automated"]:
+                    if from_customer(m) and (d["name"] not in last_auto or m["at"] > last_auto[d["name"]]):
+                        last_auto[d["name"]] = m["at"]
+                    continue
+                if not from_customer(m) and outside(m):
+                    ours_sent.setdefault(d["name"], []).append(m["at"])
+                latest = last_reply if from_customer(m) else last_ours
+                if d["name"] not in latest or m["at"] > latest[d["name"]]:
+                    latest[d["name"]] = m["at"]
+        waiting: dict[str, brief_v2.Waiting] = {}
+        for thread_id, msgs in threads.items():
+            real = [m for m in msgs if not m["automated"]]
+            if not real:
                 continue
-            handled = closed.get(("thread", t["thread_id"]))
-            if handled and handled[0] == "done" and handled[1] >= t["occurred_at"]:
-                continue  # a founder marked it handled after the customer's latest message
+            t = real[-1]["row"]
+            d = deals.get(str(t["company_id"]))
+            handled = closed.get(("thread", thread_id))
+            if not d or (handled and handled[0] == "done" and handled[1] >= t["occurred_at"]):
+                continue  # a founder marked it handled after its latest real message
+            if not from_customer(real[-1]):
+                w = brief_v2.waiting_on_them(msgs, internal, now)
+                if (not w or last_reply.get(d["name"], t["occurred_at"]) > t["occurred_at"]
+                        or last_ours.get(d["name"], t["occurred_at"]) > t["occurred_at"]):
+                    continue  # they answered since, or we wrote again in another thread (that one counts)
+                sender = next((email_to_code.get(a.lower()) for a in w["last"]["from"]), None)
+                sent = t["occurred_at"].astimezone(tz)
+                replied = last_reply.get(d["name"])
+                nudges = sum(1 for at in ours_sent.get(d["name"], []) if not replied or at > replied)  # every thread
+                if d["name"] not in waiting or sent.date() > waiting[d["name"]].sent:
+                    waiting[d["name"]] = brief_v2.Waiting(
+                        d["name"], d["stage"], w["to"], sent.date(), w["days"], max(nudges, w["nudges"]), replied is not None,
+                        w["auto_reply"] or last_auto.get(d["name"], t["occurred_at"]) > t["occurred_at"],
+                        timeline.GMAIL_THREAD_URL.format(thread_id), f"Email · {sent:%b} {sent.day}",
+                        thread_id, sender if sender in FOUNDER_ORDER else d["owner_code"], d["stage_rank"])
+                continue
             c = brief.unanswered_candidate("x", d["name"], d["stage"], d["owner_code"], t["subject"],
-                                           t["occurred_at"], now, timeline.GMAIL_THREAD_URL.format(t["thread_id"]))
+                                           t["occurred_at"], now, timeline.GMAIL_THREAD_URL.format(thread_id))
             if c:
                 days = max(1, (now - t["occurred_at"]).days)
                 if d["name"] not in unanswered or days < unanswered[d["name"]].days:
                     sent = t["occurred_at"].astimezone(tz)
                     unanswered[d["name"]] = brief_v2.Unanswered(
                         t["subject"] or "", days, c.link, brief_v2.has_request(f"{t['subject'] or ''} {t['body'] or ''}"),
-                        source=f"Email · {sent:%b} {sent.day}", thread_id=t["thread_id"])
-                    unanswered_src[d["name"]] = (t["thread_id"], t["body"] or "")
+                        source=f"Email · {sent:%b} {sent.day}", thread_id=thread_id)
+                    unanswered_src[d["name"]] = (thread_id, t["body"] or "")
 
         start = datetime.combine(today, time.min, tz)
         meetings: list[brief.Meeting] = []
@@ -443,6 +489,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
             rec = recs.get(str(rid))
             if rec and quote in " ".join((rec["body"] or "").split()).lower():
                 frm = [p["address"] for p in (rec["participants"] or {}).get("from") or []]
+                if brief_v2.is_automated(frm, None):
+                    return "notes"      # a meeting-notes bot (Gemini) wrote it, not the customer
                 return "bianca" if frm and all(domain(a) in internal for a in frm) else "customer"
         return "unknown"
 
@@ -466,6 +514,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
     for deal, (thread_id, body) in unanswered_src.items():
         asks = [kinds[str(r["id"])] for r in open_items if r["source"] == "gmail" and r["unit_id"] == thread_id
                 and str(r["id"]) in kinds and kinds[str(r["id"])].kind in ("owed", "customer_request")
+                and kinds[str(r["id"])].basis != "delegated"  # someone else's task (e.g. engineering) is not the ask
                 and brief_v2.is_new_insight(r["quote"], body)]
         if asks:
             unanswered[deal].action = brief_v2.first_sentence(asks[0].text, 120)
@@ -499,6 +548,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
         sections.append(brief_v2.build_section(
             code, full, short, views, items, [(m, "") for m in meetings if code in m.attendees], today, display,
             hidden.get(code, 0), settings.brief_critical_ahead_days, settings.brief_in_talks_target))
+        sections[-1].waiting, sections[-1].more_waiting = brief_v2.pick_waiting(list(waiting.values()), code)
 
     # ---- the existing planner call (unchanged contract), after selection: it only rewords the AI moves already
     # chosen and writes meeting prep lines. It cannot add, remove or reorder deals.
@@ -554,7 +604,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
         q = " ".join(r["quote"].split()).lower()
         title_only = q in " ".join((rec["subject"] or "").split()).lower() and q not in " ".join((rec["body"] or "").split()).lower()
         frm = [x["address"] for x in (rec["participants"] or {}).get("from") or []]
-        spk = (r["source"] if r["source"] != "gmail" else
+        spk = (r["source"] if r["source"] != "gmail" else "notes" if brief_v2.is_automated(frm, None) else
                "bianca" if frm and all(domain(a) in internal for a in frm) else "customer")
         ikind = (brief_v2.item_kind(r["type"], r["due_date"], spk, r["quote"], side_for(r))
                  if r["type"] in ("commitment", "next_step") and r["owner_side"] == "bianca" else None)
@@ -575,8 +625,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
             continue
         if rec["source"] == "gmail":
             senders = [x["address"] for x in (rec["participants"] or {}).get("from") or []]
-            if not senders or any(domain(a) in internal for a in senders):
-                continue
+            if not senders or any(domain(a) in internal for a in senders) or brief_v2.is_automated(senders, rec["subject"]):
+                continue  # ours, or an out-of-office/notification: nobody replied
             text = f"Customer replied (nothing new extracted): {(rec['subject'] or '')[:60]}"
         else:
             text = f"Meeting notes added (nothing new extracted): {(rec['subject'] or '')[:60]}"
