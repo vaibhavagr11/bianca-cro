@@ -11,9 +11,9 @@ from typing import Literal
 import anthropic
 from pydantic import BaseModel, Field
 
-EXTRACTOR_VERSION = "extract-v4"
+EXTRACTOR_VERSION = "extract-v5"
 # Units extracted by these versions are not re-extracted automatically (re-extracting all history is deliberate).
-KEPT_VERSIONS = ("extract-v3", EXTRACTOR_VERSION)
+KEPT_VERSIONS = ("extract-v3", "extract-v4", EXTRACTOR_VERSION)
 MAX_TEXT_CHARS = 30_000
 
 InsightType = Literal["need", "buying_signal", "objection", "commitment", "blocker", "next_step"]
@@ -32,6 +32,8 @@ class ExtractedInsight(BaseModel):
         description="YYYY-MM-DD when the text gives a deadline, resolved against the item's date (see rules). "
                     "Null when there is no deadline.")
     confidence: Literal["high", "medium", "low"]
+    source_ref: str | None = Field(default=None, description="The M-number labeling the exact message or record "
+                                                             "that contains the quote, if provided in the input.")
 
 
 class Extraction(BaseModel):
@@ -57,7 +59,8 @@ Extract only what the text actually says, as a list of insights:
 
 Rules:
 - quote: copy a passage verbatim from the text. Never translate or paraphrase the quote. The text field is
-  your English one-liner.
+  your English one-liner. When the input has M-number labels, set source_ref to the exact message or record
+  where the quoted passage appears. Use a quote from its subject or body, not a header, timestamp or sender label.
 - Commitments and next steps: say who must act (owner_side bianca/customer/unclear). Fill owner_name only when
   the text names or clearly identifies the person (an email's sender saying "I'll...", "NDL:", "Rama manda...").
   "We will", "nosotros", or an unattributed task -> owner_name null. Never guess from who usually runs the deal.
@@ -104,7 +107,13 @@ def parse_due(value: str | None) -> date | None:
         return None
 
 
-def validate(extraction: Extraction, text: str) -> tuple[list[dict], int]:
+def quote_in_record(quote: str, record: dict) -> bool:
+    """Check the exact source, excluding message headers and synthetic prompt labels."""
+    needle = _squash(quote)
+    return bool(needle) and any(needle in _squash(record.get(field) or "") for field in ("subject", "body"))
+
+
+def validate(extraction: Extraction, text: str, records: dict[str, dict] | None = None) -> tuple[list[dict], int]:
     """Keep insights whose quote appears in the text. Returns (kept, dropped_count)."""
     haystack = _squash(text)
     kept, dropped = [], 0
@@ -112,6 +121,16 @@ def validate(extraction: Extraction, text: str) -> tuple[list[dict], int]:
         if not i.quote.strip() or _squash(i.quote) not in haystack:
             dropped += 1
             continue
+        origin = None
+        if records is not None:
+            matches = {ref: rec for ref, rec in records.items() if quote_in_record(i.quote, rec)}
+            if i.source_ref:
+                origin = matches.get(i.source_ref)
+                if origin is None:
+                    dropped += 1
+                    continue
+            elif len(matches) == 1:
+                origin = next(iter(matches.values()))
         actionable = i.type in ("commitment", "next_step")
         kept.append({
             "type": i.type,
@@ -122,6 +141,10 @@ def validate(extraction: Extraction, text: str) -> tuple[list[dict], int]:
             "due_date": parse_due(i.due_date) if actionable else None,
             "confidence": i.confidence,
         })
+        if records is not None:
+            reliable = origin is not None and not (origin.get("meta") or {}).get("date_inferred")
+            kept[-1].update(origin_record_id=origin["id"] if origin else None,
+                            origin_occurred_at=origin["occurred_at"] if reliable else None)
     return kept, dropped
 
 
