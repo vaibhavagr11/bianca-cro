@@ -54,3 +54,9 @@ def test_brief_shows_hidden_count():
 
 def test_reconcile_requires_token():
     assert TestClient(app).post("/process/reconcile").status_code == 401
+
+
+def test_ordinary_completion_cannot_cite_the_original_source():
+    result = Verdicts(verdicts=[ItemVerdict(item="T1", state="done", record="S",
+                                           quote="Reunión de entrega el 14/10", reason="Event passed.")])
+    assert validate(result, ITEMS, RECORDS) == []
