@@ -7,11 +7,12 @@ from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import anthropic
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, HTTPException
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from app import actions, brief, brief_v2, db, timeline
+from app.brief_text import BriefTextReview, prepare_table_text
 from app.config import settings
 from app.gmail import domain
 from app.ingest import _workspace_id, require_token
@@ -32,9 +33,13 @@ DISPLAY = {"RG": ("Ramiro", "Ramiro Godfrid"), "NC": ("Nico", "Nico Casaux"), "N
 @router.post("/build")
 def build_brief(dry_run: bool = False, version: str = "v1", x_ingest_token: str | None = Header(default=None)) -> dict:
     require_token(x_ingest_token)
-    if version == "v2":
-        return build_brief_v2(dry_run)
-    return build_brief_v1(dry_run)
+    try:
+        if version == "v2":
+            return build_brief_v2(dry_run)
+        return build_brief_v1(dry_run)
+    except BriefTextReview as exc:
+        log.warning("brief needs table text review: %s", exc.kind)
+        raise HTTPException(503, {"code": "brief_text_review_required", "field": exc.kind}) from exc
 
 
 def build_brief_v1(dry_run: bool = False, since: datetime | None = None) -> dict:
@@ -109,7 +114,7 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None) -> dict
             if (d["stage_rank"] or 0) >= 1:
                 for b in (prof.get("blockers") or [])[:2]:
                     cands.append(brief.Candidate(cid(), d["name"], d["stage"], d["owner_code"], "blocker",
-                                                 "Blocker: " + b["text"][:70].rstrip() + ("…" if len(b["text"]) > 70 else ""),
+                                                 "Blocker",
                                                  f"Blocker: {b['text']}", 60))
 
         # Unanswered customer emails: thread's latest message is from outside Bianca.
@@ -152,7 +157,7 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None) -> dict
             context = ""
             if prof:
                 opens = "; ".join(c["text"] for c in (prof.get("open_commitments") or [])[:2])
-                context = f"{prof['summary']['text'][:300]} Open: {opens or 'none'}"
+                context = f"{prof['summary']['text']} Open: {opens or 'none'}"
             codes = sorted({email_to_code[a["address"]] for a in (m["participants"] or {}).get("attendees") or []
                             if a.get("address") in email_to_code})
             meetings.append(brief.Meeting(m["occurred_at"].astimezone(tz), m["subject"] or "(no title)",
@@ -184,17 +189,17 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None) -> dict
             if r["source"] == "gmail":
                 senders = [p["address"] for p in (r["participants"] or {}).get("from") or []]
                 if senders and all(domain(s) not in internal for s in senders):
-                    changes.append(brief.Change(d["name"], f"Customer replied: {(r['subject'] or '')[:60]}",
+                    changes.append(brief.Change(d["name"], f"Customer replied: {r['subject'] or '(no subject)'}",
                                                 d["owner_code"], timeline.GMAIL_THREAD_URL.format(r["thread_id"])))
             elif r["source"] == "notes":
-                changes.append(brief.Change(d["name"], f"New meeting notes: {(r['subject'] or '')[:60]}", d["owner_code"],
+                changes.append(brief.Change(d["name"], f"New meeting notes: {r['subject'] or '(no subject)'}", d["owner_code"],
                                             timeline.DOC_URL.format((r["meta"] or {}).get("doc_id", ""))))
         for r in conn.execute(
                 "select subject, company_id from source_records where workspace_id = %s and source = 'calendar'"
                 " and meta->>'status' = 'cancelled' and updated_at > %s and occurred_at >= now()",
                 (workspace_id, since)):
             d = deals.get(str(r["company_id"])) if r["company_id"] else None
-            changes.append(brief.Change(d["name"] if d else "-", f"Meeting cancelled: {(r['subject'] or '')[:60]}",
+            changes.append(brief.Change(d["name"] if d else "-", f"Meeting cancelled: {r['subject'] or '(no subject)'}",
                                         d["owner_code"] if d else None))
 
     # Per-founder sections.
@@ -230,8 +235,9 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None) -> dict
     payload["ndl"] = [{"company": r.company, "what": r.what, "due": r.due} for r in ndl]
     payload["changes"] = [{"deal": c.deal, "text": c.text, "owner": c.owner_code} for c in changes[:brief.MAX_CHANGES]]
 
-    html_body = brief.render(sections, ndl, changes, today, len(deals))
-    text_body = brief.plain_text(sections, today)
+    display = prepare_table_text(brief.table_text_fields(sections, ndl, changes), client, settings.anthropic_model)
+    html_body = brief.render(sections, ndl, changes, today, len(deals), display=display)
+    text_body = brief.plain_text(sections, today, display=display)
     subj = brief.subject(sections, today)
     to = settings.brief_to or [t["email"] for t in team if t["receives_brief"]]
     if not dry_run:
@@ -402,7 +408,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
             context = ""
             if prof:
                 opens = "; ".join(c["text"] for c in (prof.get("open_commitments") or [])[:2])
-                context = f"{prof['summary']['text'][:300]} Open: {opens or 'none'}"
+                context = f"{prof['summary']['text']} Open: {opens or 'none'}"
             codes = sorted({email_to_code[a["address"]] for a in (m["participants"] or {}).get("attendees") or []
                             if a.get("address") in email_to_code})
             meetings.append(brief.Meeting(m["occurred_at"].astimezone(tz), m["subject"] or "(no title)",
@@ -517,7 +523,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
                 and kinds[str(r["id"])].basis != "delegated"  # someone else's task (e.g. engineering) is not the ask
                 and brief_v2.is_new_insight(r["quote"], body)]
         if asks:
-            unanswered[deal].action = brief_v2.first_sentence(asks[0].text, 120)
+            unanswered[deal].action = asks[0].text
 
     # ---- classify every newly extracted insight by the event time of the record its quote comes from
     lookback = settings.brief_late_lookback_days
@@ -574,7 +580,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
     ndl = [brief_v2.TodayRow(i.deal, views[i.deal].stage, "Due now", i.text, f"due {i.due:%b} {i.due.day}", "Nico DL",
                              i.link, i.id, i.source, f"insight:{i.id}")
            for i in items if i.route == "NDL" and i.kind == "owed" and i.bucket in ("today", "overdue")]
-    ndl += [brief_v2.TodayRow(v.deal, v.stage, "Reply needed", f"Customer asked: {v.unanswered.subject}",
+    ndl += [brief_v2.TodayRow(v.deal, v.stage, "Reply needed", brief_v2.reply_text(v.unanswered),
                               f"received {v.unanswered.days}d ago", "Nico DL", v.unanswered.link, None,
                               v.unanswered.source, f"thread:{v.unanswered.thread_id}")
             for v in views.values() if v.owner == "NDL" and v.unanswered and brief_v2.reply_label(v.unanswered) == "reply_needed"]
@@ -612,7 +618,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
                                            rec["subject"], event, spk)
         changes.append(brief_v2.ChangeRow(d["name"], d["stage_rank"], text,
                                           f"{SOURCE_LABEL.get(r['source'], r['source'])} · {event:%b} {event.day}",
-                                          _link_for(r["source"], r["unit_id"], r["meta"]), kind, event))
+                                          _link_for(r["source"], r["unit_id"], r["meta"]), kind, event,
+                                          title_only=title_only))
     seen: set[tuple[str, str]] = set()
     for rec in reversed(new_records):  # plain facts only where nothing was extracted, dated the same way
         key, d = (rec["source"], rec["thread_id"]), deals.get(str(rec["company_id"]))
@@ -627,12 +634,12 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
             senders = [x["address"] for x in (rec["participants"] or {}).get("from") or []]
             if not senders or any(domain(a) in internal for a in senders) or brief_v2.is_automated(senders, rec["subject"]):
                 continue  # ours, or an out-of-office/notification: nobody replied
-            text = f"Customer replied (nothing new extracted): {(rec['subject'] or '')[:60]}"
+            text = f"Customer replied (nothing new extracted): {rec['subject'] or '(no subject)'}"
         else:
-            text = f"Meeting notes added (nothing new extracted): {(rec['subject'] or '')[:60]}"
+            text = f"Meeting notes added (nothing new extracted): {rec['subject'] or '(no subject)'}"
         changes.append(brief_v2.ChangeRow(d["name"], d["stage_rank"], text, SOURCE_LABEL[rec["source"]],
                                           _link_for(rec["source"], rec["thread_id"], rec["meta"]), kind,
-                                          _event_day(rec, tz)))
+                                          _event_day(rec, tz), title_only=True))
     changes = brief_v2.select_changes(changes)
     backfill_events = [(r, rec) for r, rec, kind in events if kind == "backfill"]
     undated_events = sum(1 for _, _, kind in events if kind == "undated")
@@ -651,9 +658,10 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
                 "and calendar, WhatsApp, so missing activity is not proof nothing happened.")
     labels = brief_v2.completable(sections, ndl)  # ref -> (deal, text) for each row's "Mark as complete" link
     action_url = (lambda ref: actions.link(ref, *labels[ref])) if settings.brief_action_secret else None
+    display = prepare_table_text(brief_v2.table_text_fields(sections, ndl, changes), client, settings.anthropic_model)
     html_body = brief_v2.render(sections, ndl, changes, today, len(deals), coverage, not NICO_INBOX_CONNECTED,
-                                backfill, action_url)
-    text_body = brief_v2.plain_text(sections, today)
+                                backfill, action_url, display=display)
+    text_body = brief_v2.plain_text(sections, today, display=display)
     subj = brief_v2.subject(sections, today)
     to = settings.brief_to or [t["email"] for t in team if t["receives_brief"]]
     payload = brief_v2.to_payload(sections, ndl, changes)
