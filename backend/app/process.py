@@ -8,7 +8,7 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel
 from psycopg.types.json import Jsonb
 
-from app import classifier, db, extractor, opportunities, profiler, reconciler, resolution, timeline
+from app import classifier, db, extractor, gmail, opportunities, profiler, reconciler, resolution, timeline
 from app.config import settings
 from app.ingest import _fail, _workspace_id, require_token
 from app.pipeline import normalize_name
@@ -228,11 +228,88 @@ def resolve_entities(x_ingest_token: str | None = Header(default=None)) -> dict:
 
 class ExtractRequest(BaseModel):
     opportunity_ids: list[str]
+    backfill_scope: bool = False
+
+
+_PENDING_EXTRACTION = """
+    select r.source, r.thread_id, r.company_id, max(r.occurred_at) as latest
+    from source_records r
+    where r.workspace_id = %(workspace_id)s and r.company_id::text = any(%(company_ids)s)
+      and r.status = 'classified' and r.body is not null and r.thread_id is not null
+      and (r.classification->>'is_commercial')::bool
+    group by r.workspace_id, r.source, r.thread_id, r.company_id
+    having bool_or(r.extracted_version is null or not r.extracted_version = any(%(kept_versions)s))
+       or (%(backfill_scope)s and bool_or(r.extracted_version is distinct from %(current_version)s) and (
+           (r.source = 'gmail' and max(r.occurred_at) >= now() - interval '90 days')
+           or exists (select 1 from insights i where i.workspace_id = r.workspace_id
+                      and i.source = r.source and i.unit_id = r.thread_id and i.company_id = r.company_id
+                      and i.status = 'open' and i.type in ('commitment', 'next_step'))))
+"""
+
+
+def _write_insights(conn, key: tuple, deal: dict, records: list[dict], kept: list[dict], backfill_scope: bool) -> None:
+    """Keep matching row IDs and review states, even if a legacy request had the wrong action type."""
+    record_ids = [r["id"] for r in records]
+    occurred_at = {r["id"]: r["occurred_at"] for r in records}
+    existing = conn.execute(
+        "select id, type, text, quote, status, origin_record_id from insights"
+        " where workspace_id = %s and source = %s and unit_id = %s"
+        " order by (status <> 'open') desc, created_at, id for update", key,
+    ).fetchall()
+
+    def identity(row: dict) -> tuple:
+        return (*extractor.insight_key(row["type"], row["quote"]), extractor.insight_key(row["type"], row["text"])[1])
+
+    incoming = {identity(item): item for item in kept}
+    matched = set()
+    for item_key, item in incoming.items():
+        origin = item["origin_record_id"]
+        candidates = [row for row in existing if row["id"] not in matched and row["origin_record_id"] in (None, origin)]
+        old = next((row for row in candidates if identity(row) == item_key), None)
+        if old is None:
+            same_quote = [row for row in candidates if identity(row)[1] == item_key[1]]
+            same_type = [row for row in same_quote if row["type"] == item["type"]]
+            if len(same_type) == 1 and sum(k[:2] == item_key[:2] for k in incoming) == 1:
+                old = same_type[0]
+            elif item["confidence"] == "high" and item["type"] in ("commitment", "next_step"):
+                actions = [row for row in same_quote if row["type"] in ("commitment", "next_step")]
+                if len(actions) == 1 and sum(k[1] == item_key[1] for k in incoming) == 1:
+                    old = actions[0]
+            if old is None and any(row["status"] != "open" for row in same_quote):
+                # An ambiguous rewrite must not reopen a reviewed action.
+                continue
+
+        fields = (deal["company_id"], deal["id"], record_ids, item["type"], item["text"], item["quote"],
+                  item["owner_side"], item["owner_name"], item["due_date"], occurred_at[origin] or records[-1]["occurred_at"],
+                  item["confidence"], extractor.EXTRACTOR_VERSION, item["action_scope"], origin)
+        if old:
+            matched.add(old["id"])
+            conn.execute(
+                "update insights set company_id = %s, opportunity_id = %s, source_record_ids = %s, type = %s,"
+                " text = %s, quote = %s, owner_side = %s, owner_name = %s, due_date = %s, occurred_at = %s,"
+                " confidence = %s, extractor_version = %s, action_scope = %s, origin_record_id = %s where id = %s",
+                (*fields, old["id"]),
+            )
+        else:
+            conn.execute(
+                "insert into insights (workspace_id, source, unit_id, company_id, opportunity_id, source_record_ids,"
+                " type, text, quote, owner_side, owner_name, due_date, occurred_at, confidence, extractor_version,"
+                " action_scope, origin_record_id) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (*key, *fields),
+            )
+
+    for old in existing:
+        if old["id"] in matched or old["status"] in ("done", "dismissed"):
+            continue
+        if backfill_scope:
+            conn.execute("update insights set action_scope = null where id = %s and action_scope is not null", (old["id"],))
+        else:
+            conn.execute("delete from insights where id = %s", (old["id"],))
 
 
 @router.post("/extract")
 def extract_insights(payload: ExtractRequest, x_ingest_token: str | None = Header(default=None)) -> dict:
-    """Extract insights for up to classify_batch_threads not-yet-extracted units of the given deals."""
+    """Extract one batch. With backfill_scope, also review older open actions and recent Gmail threads."""
     require_token(x_ingest_token)
     client = _claude()
     with db.connect() as conn:
@@ -245,69 +322,66 @@ def extract_insights(payload: ExtractRequest, x_ingest_token: str | None = Heade
         team = conn.execute("select owner_code, full_name, email from team_members where workspace_id = %s"
                             " order by owner_code", (workspace_id,)).fetchall()
         system_prompt = extractor.build_system_prompt(team)
+        params = {"workspace_id": workspace_id, "company_ids": list(deals), "kept_versions": list(extractor.KEPT_VERSIONS),
+                  "current_version": extractor.EXTRACTOR_VERSION, "backfill_scope": payload.backfill_scope,
+                  "limit": settings.classify_batch_threads}
         units = conn.execute(
-            "select source, thread_id, company_id from source_records where workspace_id = %s"
-            " and company_id::text = any(%s) and status = 'classified' and body is not null"
-            " and (classification->>'is_commercial')::bool"
-            " group by source, thread_id, company_id"
-            " having bool_or(extracted_version is null or not extracted_version = any(%s))"
-            " order by max(occurred_at) desc nulls last limit %s",
-            (workspace_id, list(deals), list(extractor.KEPT_VERSIONS), settings.classify_batch_threads),
+            _PENDING_EXTRACTION + " order by latest desc nulls last limit %(limit)s", params,
         ).fetchall()
 
         counts = {"units": len(units), "insights": 0, "dropped_quotes": 0, "failed": 0}
+        touched = set()
         for unit in units:
             deal = deals[str(unit["company_id"])]
+            key = (workspace_id, unit["source"], unit["thread_id"])
             records = conn.execute(
-                "select id, external_id, occurred_at::text, subject, participants, body, meta from source_records"
-                " where workspace_id = %s and source = %s and thread_id = %s order by occurred_at",
-                (workspace_id, unit["source"], unit["thread_id"]),
+                "select id, source, occurred_at, updated_at, extracted_version, subject, participants, body, meta"
+                " from source_records where workspace_id = %s and source = %s and thread_id = %s"
+                " order by occurred_at nulls first, id", key,
             ).fetchall()
-            renderers = {"notes": lambda r: classifier.render_note(r[0]),
-                         "calendar": lambda r: classifier.render_event(r[0])}
-            text = renderers.get(unit["source"], classifier.render_thread)(records)
+            conn.commit()
+            if not records or all(r["extracted_version"] == extractor.EXTRACTOR_VERSION for r in records):
+                continue
+            if unit["source"] == "gmail":
+                for r in records:
+                    # Stored Gmail normally has quotes stripped already. Ignore legacy quoted lines as well.
+                    r["body"] = "\n".join(line for line in gmail.strip_quoted(r["body"] or "").splitlines()
+                                          if not line.lstrip().startswith(">"))
+            refs = {f"M{n}": r for n, r in enumerate(records, start=1)}
+            if unit["source"] == "gmail":
+                text = classifier.render_thread([
+                    {**r, "external_id": ref, "occurred_at": str(r["occurred_at"]) if r["occurred_at"] else None}
+                    for ref, r in refs.items()
+                ])
+            else:
+                render = classifier.render_note if unit["source"] == "notes" else classifier.render_event
+                text = f"Source record: M1\n{render(records[0])}"
             try:
                 result = extractor.extract(client, settings.anthropic_model, system_prompt, deal, text)
             except (anthropic.APIStatusError, anthropic.APIConnectionError, ValueError) as exc:
                 log.warning("extract unit failed: %s", type(exc).__name__)
                 counts["failed"] += 1
                 continue
-            kept, dropped = extractor.validate(result, text)
-            record_ids = [r["id"] for r in records]
-            occurred_at = records[-1]["occurred_at"]
+            kept, dropped = extractor.validate(result, text, refs)
             with conn.transaction():
-                # A thread re-extracted after a new message keeps the review state of insights it finds again.
-                reviewed = {extractor.insight_key(r["type"], r["quote"]): r for r in conn.execute(
-                    "select type, quote, status, completion from insights where workspace_id = %s and source = %s"
-                    " and unit_id = %s and status <> 'open'", (workspace_id, unit["source"], unit["thread_id"]))}
-                conn.execute("delete from insights where workspace_id = %s and source = %s and unit_id = %s",
-                             (workspace_id, unit["source"], unit["thread_id"]))
-                for i in kept:
-                    prior = reviewed.get(extractor.insight_key(i["type"], i["quote"]))
-                    conn.execute(
-                        "insert into insights (workspace_id, company_id, opportunity_id, source, unit_id,"
-                        " source_record_ids, type, text, quote, owner_side, owner_name, due_date, occurred_at,"
-                        " confidence, extractor_version, status, completion) values"
-                        " (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                        (workspace_id, unit["company_id"], deal["id"], unit["source"], unit["thread_id"],
-                         record_ids, i["type"], i["text"], i["quote"], i["owner_side"], i["owner_name"],
-                         i["due_date"], occurred_at, i["confidence"], extractor.EXTRACTOR_VERSION,
-                         prior["status"] if prior else "open",
-                         Jsonb(prior["completion"]) if prior and prior["completion"] else None))
+                current = {r["id"]: r["updated_at"] for r in conn.execute(
+                    "select id, updated_at from source_records where workspace_id = %s and source = %s"
+                    " and thread_id = %s order by id for update", key,
+                )}
+                if current != {r["id"]: r["updated_at"] for r in records}:
+                    continue
+                _write_insights(conn, key, deal, records, kept, payload.backfill_scope)
                 conn.execute("update source_records set extracted_version = %s where id = any(%s)",
-                             (extractor.EXTRACTOR_VERSION, record_ids))
+                             (extractor.EXTRACTOR_VERSION, list(current)))
             counts["insights"] += len(kept)
             counts["dropped_quotes"] += dropped
+            touched.add(str(deal["id"]))
 
         remaining = conn.execute(
-            "select count(*) as n from (select 1 from source_records where workspace_id = %s"
-            " and company_id::text = any(%s) and status = 'classified' and body is not null"
-            " and (classification->>'is_commercial')::bool group by source, thread_id"
-            " having bool_or(extracted_version is null or not extracted_version = any(%s))) u",
-            (workspace_id, list(deals), list(extractor.KEPT_VERSIONS)),
+            "select count(*) as n from (" + _PENDING_EXTRACTION + ") u", params,
         ).fetchone()["n"]
     log.info("extract run: %s remaining_units=%s", counts, remaining)
-    return {**counts, "remaining_units": remaining}
+    return {**counts, "remaining_units": remaining, "touched_opportunity_ids": sorted(touched)}
 
 
 def _claude() -> anthropic.Anthropic:

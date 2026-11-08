@@ -72,12 +72,15 @@ def daily_step(x_ingest_token: str | None = Header(default=None)) -> dict:
     elif stage == "extract":
         res = process.extract_insights(process.ExtractRequest(opportunity_ids=opportunity_ids),
                                        x_ingest_token=x_ingest_token)
-        entry = {"stage": stage, **res}
+        touched = set(touched) | set(res["touched_opportunity_ids"])
+        entry = {"stage": stage, **{k: v for k, v in res.items() if k != "touched_opportunity_ids"}}
         if res["remaining_units"] == 0:
             with db.connect() as conn:
-                touched = [r[0] for r in conn.execute(
+                touched.update(r[0] for r in conn.execute(
                     "select distinct opportunity_id::text from insights where workspace_id = %s"
-                    " and opportunity_id is not null and created_at >= %s", (workspace_id, run["started_at"]))]
+                    " and opportunity_id is not null and updated_at >= %s", (workspace_id, run["started_at"])))
+        touched = sorted(touched)
+        if res["remaining_units"] == 0:
             stage, queue = "reconcile", touched
     elif stage == "reconcile":
         batch, queue = take(queue, stage)

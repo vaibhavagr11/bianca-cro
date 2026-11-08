@@ -83,11 +83,12 @@ def opportunity_insights(opportunity_id: str, x_ingest_token: str | None = Heade
         conn.row_factory = dict_row
         rows = conn.execute(
             "select id, type, text, quote, owner_side, owner_name, due_date, occurred_at, status, confidence,"
-            " source, unit_id, source_record_ids from insights"
+            " source, unit_id, source_record_ids, action_scope, origin_record_id from insights"
             " where workspace_id = %s and opportunity_id::text = %s order by occurred_at desc nulls last, type",
             (workspace_id, opportunity_id),
         ).fetchall()
     return [{**r, "id": str(r["id"]), "source_record_ids": [str(x) for x in r["source_record_ids"]],
+             "origin_record_id": str(r["origin_record_id"]) if r["origin_record_id"] else None,
              "due_date": timeline._iso(r["due_date"]), "occurred_at": timeline._iso(r["occurred_at"])} for r in rows]
 
 

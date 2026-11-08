@@ -2,11 +2,8 @@
 
 Per founder, in reading order: needs you today (time-critical only), deals to move (one line per prospect or
 pilot: situation, one next move, date, evidence), customer accounts (one line each), meetings, follow-ups that may
-be needed, deals whose status to confirm, and a one-line backlog summary. Shared: what changed (from new,
+be needed, deals with unclear status, and a one-line backlog summary. Shared: what changed (from new,
 quote-checked insights) and Nico de León's urgent items.
-
-Every rule here is deterministic. The existing planner call only shortens the suggested moves it picks and writes
-meeting prep lines; it never decides urgency or ownership.
 """
 
 import re
@@ -20,7 +17,7 @@ from app.brief import (
 
 ACTIVE_DAYS = 14            # last recorded interaction within this = active
 UNCLEAR_DAYS = 45           # 15..45 days = status unclear (confirm); older = dormant
-REPLY_DAYS = 7              # customer email this recent + a question/request = reply needed
+REPLY_DAYS = 7              # customer email this recent with an extracted sales ask = reply needed
 PROPOSAL_FOLLOWUP_DAYS = (7, 30)   # our proposal with no reply after this many days = follow-up may be needed
 UNDATED_WINDOW_DAYS = 45
 MAX_HIGHLIGHTS, MAX_CUSTOMERS, MAX_FOLLOWUPS, MAX_EXCEPTIONS, MAX_NAMES = 4, 4, 3, 1, 3
@@ -30,7 +27,7 @@ REQUEST_FRESH_DAYS = 21       # a customer request this recent still counts as o
 CHANGE_QUOTA = {0: 3, 1: 2, 2: 0}  # what changed: prospects/pilots, customers, other
 PROSPECT_RANKS, CUSTOMER_RANK = (1, 2, 3, 4), 5
 CHANGE_TYPES = {"buying_signal": "Buying signal", "blocker": "New blocker", "objection": "Objection",
-                "commitment": "New commitment", "next_step": "Next step agreed", "need": "New need"}
+                "commitment": "New commitment", "next_step": "Next step noted", "need": "New need"}
 REQUEST_RE = re.compile(
     r"\?|\b(por favor|podr[ií]an|podr[ií]as|pod[eé]s|necesit\w*|pid(i[oó]|en|e)|solicit\w*|quier\w*|"
     r"please|could you|can you|would you|need|asked|requested|wants?)\b", re.I)
@@ -79,6 +76,13 @@ class Unanswered:
     action: str | None = None       # what the latest customer message asks of us, if extraction found it
     source: str = ""                # "Email · Oct 6": the customer's latest message
     thread_id: str | None = None
+    item_id: str | None = None     # the extracted ask also eligible for deal-level selection
+
+    @property
+    def completion_ref(self) -> str | None:
+        if self.item_id:
+            return f"insight:{self.item_id}"
+        return f"thread:{self.thread_id}" if self.thread_id else None
 
 
 @dataclass
@@ -101,7 +105,7 @@ class DealView:
 @dataclass
 class Move:
     """The one next move shown for a deal, with what kind of thing it is."""
-    tag: str                        # We owe | Reply needed | Customer asked | AI recommendation | Follow up | Confirm status
+    tag: str
     text: str
     when: str                       # deadline or last recorded interaction
     link: str | None
@@ -189,19 +193,17 @@ def has_request(text: str | None) -> bool:
 def item_kind(type_: str, due: date | None, speaker: str, quote: str, profile_side: str | None = None) -> str:
     """What an extracted Bianca-side item really is (the extractor does not record this).
 
-    owed: a deadline, or a promise the current deal profile still lists as open on Bianca's side.
+    owed: an extracted commitment with a deadline, or a promise still open on Bianca's side.
     progress: a "commitment" the profile reads as done on our side (it cites it only in an open item owned by the
     customer, e.g. "validate our fix"), or that it no longer lists as open although Bianca wrote it.
     customer_request: asked for by the customer. proposed: written in Bianca's own email, the next move is theirs.
-    next_step: an agreed step from the meeting notes, not a promise.
+    next_step: a step or question without an explicit promise.
 
     profile_side is how the current, evidence-checked profile lists the same insight among open commitments:
     "bianca", "customer", "none" (not listed), or None when there is no current profile to ask.
     """
-    if due is not None:
-        return "owed"
     if type_ == "commitment":
-        if profile_side in (None, "bianca"):
+        if due is not None or profile_side in (None, "bianca"):
             return "owed"
         if profile_side == "customer" or speaker == "bianca":
             return "progress"
@@ -224,14 +226,15 @@ def deal_status(d: DealView, today: date) -> str:
     return "active" if days <= ACTIVE_DAYS else "unclear" if days <= UNCLEAR_DAYS else "dormant"
 
 
-def reply_label(u: Unanswered) -> str:
+def reply_label(u: Unanswered) -> str | None:
+    if not u.action:
+        return None
     return "reply_needed" if u.days <= REPLY_DAYS and u.has_request else "follow_up"
 
 
 def reply_text(u: Unanswered) -> str:
-    """What to do about an unanswered customer email: the extracted request if there is one, otherwise a neutral
-    instruction. Never an action invented from the subject line."""
-    return u.action or f"Review the customer's email and decide the response needed ({u.subject[:60]})"
+    """Use the extracted ask for the unanswered email."""
+    return u.action or ""
 
 
 # Mail no person wrote: out-of-office replies, bounces, meeting-notes bots and no-reply notifications. They never
@@ -266,6 +269,7 @@ class Waiting:
     thread_id: str | None = None
     owner: str | None = None        # whose section it goes to: who sent it, else the deal owner
     rank: int | None = None
+    action: str | None = None      # the extracted sales ask we are waiting on
 
 
 def waiting_on_them(thread: list[dict], internal: set[str], now: datetime) -> dict | None:
@@ -306,14 +310,15 @@ def pick_waiting(waiting: list[Waiting], code: str) -> tuple[list[Waiting], int]
 
 
 def waiting_text(w: Waiting) -> str:
-    """What the founder needs: who, since when, and what came back."""
+    """Who we asked, what we asked for, and whether we heard back."""
     if w.replied_before:
         bits = [f"{w.nudges} emails since their last reply" if w.nudges > 1 else "no reply to our last email"]
     else:
         bits = [f"no reply to our {w.nudges} emails" if w.nudges > 1 else "no reply yet"]
     if w.auto_reply:
         bits.append("out-of-office received")
-    return f"To {w.to} · " + ", ".join(bits)
+    action = f" · {first_sentence(w.action)}" if w.action else ""
+    return f"To {w.to} · " + ", ".join(bits) + action
 
 
 def first_sentence(text: str, limit: int = 95) -> str:
@@ -336,11 +341,21 @@ def item_move(tag: str, text: str, when: str, i: Item) -> Move:
 
 
 def email_move(tag: str, text: str, when: str, u: Unanswered) -> Move:
-    return Move(tag, text, when, u.link, None, u.source, f"thread:{u.thread_id}" if u.thread_id else None)
+    return Move(tag, text, when, u.link, u.item_id, u.source, u.completion_ref)
 
 
 def note_move(tag: str, text: str, when: str, n: Note, link: str | None) -> Move:
     return Move(tag, text, when, link, None, n.source, f"rec:{n.ref}" if n.ref else None)
+
+
+def recorded_move(i: Item, text: str) -> Move:
+    if i.kind == "owed":
+        return item_move("We owe", text, f"due {_date(i.due)}" if i.due else f"recorded {_date(i.recorded)}", i)
+    if i.kind == "customer_request":
+        return item_move("Customer asked", text,
+                         f"requested by {_date(i.due)}" if i.due else f"asked {_date(i.recorded)}", i)
+    return item_move("Next step noted", text,
+                     f"date mentioned {_date(i.due)}" if i.due else f"recorded {_date(i.recorded)}", i)
 
 
 def primary_move(d: DealView, today: date, used: set[str]) -> Move:
@@ -354,11 +369,9 @@ def primary_move(d: DealView, today: date, used: set[str]) -> Move:
     open_items = [i for i in d.items if i.id not in used]
     b = d.blocker if d.blocker and d.blocker.verified else None
     if b is not None:
-        for i in sorted((i for i in open_items if i.kind in ("owed", "customer_request") and i.id in b.evidence),
+        for i in sorted((i for i in open_items if i.kind in ("owed", "customer_request", "next_step") and i.id in b.evidence),
                         key=lambda i: i.due or date.max):
-            tag = "We owe" if i.kind == "owed" else "Customer asked"
-            when = f"due {_date(i.due)}" if i.due else f"recorded {_date(i.recorded)}"
-            return item_move(tag, i.text, when, i)
+            return recorded_move(i, i.text)
         for r in d.recommendations:
             if r.verified and addresses(r.evidence, b):
                 return note_move("AI recommendation", first_sentence(r.text), _last(d, today), r, r.link)
@@ -368,10 +381,11 @@ def primary_move(d: DealView, today: date, used: set[str]) -> Move:
                     key=lambda i: i.due or date.max):
         late = (today - i.due).days
         return item_move("We owe", i.text, f"due {_date(i.due)}" + (f", {late}d late" if late > 0 else ""), i)
-    for i in sorted((i for i in open_items if i.kind == "customer_request" and i.bucket == "undated"),
-                    key=lambda i: -i.recorded.toordinal()):
-        return item_move("Customer asked", i.text, f"asked {_date(i.recorded)}", i)
-    if d.unanswered and reply_label(d.unanswered) == "follow_up":
+    for kind in ("customer_request", "next_step"):
+        for i in sorted((i for i in open_items if i.kind == kind and i.bucket not in ("stale", "old_undated")),
+                        key=lambda i: (i.due or date.max, -i.recorded.toordinal())):
+            return recorded_move(i, i.text)
+    if d.unanswered and d.unanswered.item_id not in used and reply_label(d.unanswered) == "follow_up":
         return email_move("Follow up", reply_text(d.unanswered), f"email {d.unanswered.days}d ago", d.unanswered)
     if d.recommendation and d.recommendation.verified:
         return note_move("AI recommendation", first_sentence(d.recommendation.text), _last(d, today), d.recommendation,
@@ -380,10 +394,9 @@ def primary_move(d: DealView, today: date, used: set[str]) -> Move:
         age = (today - i.recorded).days
         if PROPOSAL_FOLLOWUP_DAYS[0] <= age <= PROPOSAL_FOLLOWUP_DAYS[1] and (d.last_contact or i.recorded) <= i.recorded:
             return item_move("Follow up", f"No reply since we proposed: {i.text}", f"proposed {_date(i.recorded)}", i)
-    if d.recommendation:
-        return note_move("AI recommendation", first_sentence(d.recommendation.text) + " (profile not verified)",
-                         _last(d, today), d.recommendation, None)
-    return Move("Confirm status", "Check where this deal stands", _last(d, today), None)
+    status = ("No additional sales action recorded" if any(i.id in used for i in d.items)
+              else "No eligible sales action recorded")
+    return Move("Status", status, _last(d, today), None)
 
 
 def _last(d: DealView, today: date) -> str:
@@ -435,14 +448,15 @@ def deal_signals(v: DealView, today: date, in_today: set[str], critical_ahead: i
     dated = [i for i in v.items if i.kind == "owed" and i.bucket in ("overdue", "week")]
     if dated:
         signals.append(f"deadline: {len(dated)} dated promise(s)")
-    if any(i.kind == "customer_request" and i.bucket == "undated" and (today - i.recorded).days <= REQUEST_FRESH_DAYS
+    if any(i.kind == "customer_request" and i.bucket not in ("stale", "old_undated")
+           and (today - i.recorded).days <= REQUEST_FRESH_DAYS
            for i in v.items):
         signals.append("outstanding customer request")
     if v.blocker and v.blocker.verified:
         signals.append("verified blocker")
     if v.developments:
         signals.append(f"{v.developments} new or late-recorded development(s)")
-    if v.unanswered:
+    if v.unanswered and v.unanswered.action:
         signals.append(f"customer email waiting {v.unanswered.days}d")
     if v.recommendation and v.recommendation.verified:
         signals.append("next milestone: verified recommendation")
@@ -516,7 +530,7 @@ def describe_change(type_: str, owner_side: str | None, kind: str | None, title_
         what = "Meeting" if source == "calendar" else "Email"
         return "recorded", f"{what} on {_date(event)}: {title}" if event else f"{what}: {title}"
     if type_ in ("commitment", "next_step"):
-        if owner_side == "customer":
+        if owner_side == "customer" and type_ == "commitment":
             cat = "they_owe"
         elif kind == "owed":
             cat = "commitment_owed"
@@ -617,8 +631,10 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
         if v.unanswered and reply_label(v.unanswered) == "reply_needed":
             u = v.unanswered
             today_rows.append(TodayRow(v.deal, v.stage, "Reply needed", reply_text(u), f"received {u.days}d ago",
-                                       display.get(code, code) + " (deal owner)", u.link, None, u.source,
-                                       f"thread:{u.thread_id}" if u.thread_id else None))
+                                       display.get(code, code) + " (deal owner)", u.link, u.item_id, u.source,
+                                       u.completion_ref))
+            if u.item_id:
+                used.add(u.item_id)
     today_rows.sort(key=lambda r: (r.tag != "Due now", r.when))
     in_today = {r.deal for r in today_rows}
 
@@ -653,8 +669,7 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                 used.add(m.item_id)
             customers.append((v, m))
 
-    # Follow-ups that may be needed (not today): unanswered without a request or older, recent overdue promises,
-    # our proposals with no reply, customer requests on deals not shown above.
+    # Older unanswered sales asks and recent actionable items on deals that have no highlighted move.
     follow: list[Move] = []
     for v, m, _ in highlights:  # when the move addresses the blocker instead, the nearest promise stays visible
         dated = sorted((i for i in v.items if i.id not in used and i.kind == "owed" and i.bucket in ("overdue", "week")),
@@ -665,15 +680,16 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
     for v in mine.values():
         if v.deal in shown:
             continue
-        if v.unanswered and reply_label(v.unanswered) == "follow_up":
+        if v.unanswered and v.unanswered.item_id not in used and reply_label(v.unanswered) == "follow_up":
             follow.append(email_move("Follow up", f"{v.deal}: {reply_text(v.unanswered)}",
                                      f"email {v.unanswered.days}d ago", v.unanswered))
         for i in v.items:
             if i.id in used:
                 continue
-            if (i.kind == "owed" and i.bucket == "overdue") or (i.kind == "customer_request" and i.bucket == "undated"):
-                follow.append(item_move("We owe" if i.kind == "owed" else "Customer asked", f"{v.deal}: {i.text}",
-                                        f"due {_date(i.due)}" if i.due else f"recorded {_date(i.recorded)}", i))
+            if (i.kind == "owed" and i.bucket == "overdue") or (
+                    i.kind in ("customer_request", "next_step") and i.bucket not in ("stale", "old_undated")):
+                if not v.unanswered or i.id != v.unanswered.item_id:
+                    follow.append(recorded_move(i, f"{v.deal}: {i.text}"))
     follow_shown = follow[:MAX_FOLLOWUPS]
     used |= {m.item_id for m in follow_shown if m.item_id}
 
@@ -703,7 +719,8 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
 # ---------------------------------------------------------------- rendering
 
 TAG_COLOR = {"Due now": RED, "Reply needed": BLUE, "We owe": INK, "Customer asked": BLUE,
-             "AI recommendation": PURPLE, "Follow up": AMBER, "Confirm status": MUTED, "Clarify next action": AMBER}
+             "Next step noted": BLUE, "AI recommendation": PURPLE, "Follow up": AMBER, "Status": MUTED,
+             "Clarify next action": AMBER}
 
 # sRGB background/foreground pairs sampled from the pipeline Sheet. Each pair has at least 4.5:1 contrast.
 STAGE_BADGES = {
@@ -906,8 +923,8 @@ def render(sections: list[Section], ndl_rows: list[TodayRow], changes: list[Chan
                 if changes else _empty("No notable changes."))
     if backfill:
         out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">{_e(backfill)}</p>')
-    out.append(f'<p style="font:11px {FONT};color:#98a2b3;margin-top:28px">{_e(coverage)} <b>We owe</b> = promise '
-               f"or deadline in a source · <b>AI recommendation</b> = suggested, not promised.</p></div>")
+    out.append(f'<p style="font:11px {FONT};color:#98a2b3;margin-top:28px">{_e(coverage)} <b>We owe</b> = recorded '
+               f"agreement · <b>AI recommendation</b> = suggested next move.</p></div>")
     return "".join(out)
 
 
@@ -951,7 +968,8 @@ def to_payload(sections: list[Section], ndl_rows: list[TodayRow], changes: list[
         "customers": [{"deal": v.deal, "move": move(m)} for v, m in s.customers],
         "followups": [move(m) for m in s.followups], "more_followups": s.more_followups,
         "waiting": [{"deal": w.deal, "to": w.to, "sent": w.sent, "days": w.days, "nudges": w.nudges,
-                     "replied_before": w.replied_before, "auto_reply": w.auto_reply, "thread_id": w.thread_id}
+                     "replied_before": w.replied_before, "auto_reply": w.auto_reply, "thread_id": w.thread_id,
+                     "action": w.action}
                     for w in s.waiting], "more_waiting": s.more_waiting,
         "unclear": [v.deal for v in s.unclear], "dormant": s.dormant,
         "backlog": {"count": s.backlog.count, "deals": s.backlog.deals, "oldest": s.backlog.oldest,
