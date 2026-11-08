@@ -43,7 +43,9 @@ def section(code, views, items):
 
 def test_item_kind_separates_promises_requests_proposals_and_notes():
     assert item_kind("commitment", None, "notes", "Nosotros mandamos el deck") == "owed"
-    assert item_kind("next_step", TODAY, "notes", "revisar el jueves") == "owed"               # has a deadline
+    assert item_kind("next_step", TODAY, "notes", "revisar el jueves") == "next_step"
+    assert item_kind("next_step", TODAY, "customer", "Can you send the proposal by Thursday?") == "customer_request"
+    assert item_kind("next_step", TODAY, "bianca", "Could we review the pilot by Thursday?") == "proposed"
     # Campari: "les compartimos una breve presentacion" written by Bianca -> done/proposed, not owed
     assert item_kind("next_step", None, "bianca", "les compartimos una breve presentacion") == "proposed"
     # Arca Peru: "Nos gustaría reconectar" in Bianca's own email -> proposed, the next move is theirs
@@ -72,16 +74,17 @@ def test_completed_or_proposed_history_does_not_fill_the_deal_row():
 
 # ---- urgency (point 3)
 
-def test_unanswered_email_needs_a_request_and_recency_to_be_today():
-    assert reply_label(Unanswered("Next steps?", 1, None, True)) == "reply_needed"
-    assert reply_label(Unanswered("Presentación", 9, None, False)) == "follow_up"       # Campari FYI email
-    assert reply_label(Unanswered("Contrato CCO", 13, None, True)) == "follow_up"       # Martin Albretch, 13d
+def test_unanswered_email_needs_an_extracted_request_and_recency_to_be_today():
+    assert reply_label(Unanswered("Next steps?", 1, None, True, "Share proposal")) == "reply_needed"
+    assert reply_label(Unanswered("Presentación", 9, None, False)) is None
+    assert reply_label(Unanswered("Contrato CCO", 13, None, True, "Confirm NDA terms")) == "follow_up"
     assert has_request("¿Podrían confirmar?") and has_request("please send")
     assert not has_request("Les comparto la presentación")
 
 
 def test_reply_needed_in_today_but_fyi_email_is_not():
-    s = section("RG", [view("Pernod", 3, owner="RG", unanswered=Unanswered("Próximos pasos?", 1, "l", True)),
+    s = section("RG", [view("Pernod", 3, owner="RG", unanswered=Unanswered("Próximos pasos?", 1, "l", True,
+                                                                         "Confirm pilot criteria")),
                        view("Campari", 4, owner="RG", unanswered=Unanswered("Les comparto", 9, "l2", False))], [])
     assert [(r.deal, r.tag) for r in s.today] == [("Pernod", "Reply needed")]
 
@@ -93,8 +96,18 @@ def test_due_now_only_for_promises_due_within_three_days_or_tomorrow():
     assert bucket(TODAY - timedelta(days=27), TODAY, TODAY, 3, 14) == "stale"          # Campari Oct 1
     s = section("NC", [view("Smearcase", 4)],
                 [item("Smearcase", "Send fix", due=TODAY, id="a"),
-                 item("Smearcase", "Review data", kind="next_step", id="b")])        # notes next step: not "Due now"
+                 item("Smearcase", "Review data", due=TODAY, kind="next_step", id="b")])
     assert [r.text for r in s.today] == ["Send fix"]
+    assert s.highlights[0][1].tag == "Next step noted"
+
+
+def test_dated_customer_request_remains_visible_as_a_request():
+    due = TODAY + timedelta(days=1)
+    request = item("Smearcase", "Customer asked for the pilot proposal", due=due, kind="customer_request")
+    s = section("NC", [view("Smearcase", 4)], [request])
+    assert not s.today
+    assert s.highlights[0][1].tag == "Customer asked"
+    assert s.highlights[0][1].when == "requested by Oct 29"
 
 
 # ---- stale opportunities and coverage (point 4)
@@ -156,10 +169,10 @@ def test_delegated_never_today_and_other_founders_deal_not_duplicated():
 
 # ---- recommendations and evidence
 
-def test_unverified_recommendation_is_labelled_and_has_no_evidence_link():
+def test_unverified_recommendation_does_not_become_a_move():
     v = view("FEMSA MX", 2, recommendation=Note("Re-engage the buyer", verified=False))
     m = primary_move(v, TODAY, set())
-    assert m.tag == "AI recommendation" and "not verified" in m.text and m.link is None
+    assert m.tag == "Status" and m.text == "No eligible sales action recorded" and m.link is None
 
 
 def test_first_sentence_keeps_moves_short():
@@ -266,7 +279,7 @@ def ramiro_oct28():
     d = lambda n: TODAY - timedelta(days=n)
     views = [
         view("Pernod Ricard", 3, owner="RG", last=d(2), blocker=vb, recommendation=rec,
-             unanswered=Unanswered("Próximos pasos?", 1, "l", True)),
+             unanswered=Unanswered("Próximos pasos?", 1, "l", True, "Confirm the pilot decision date")),
         view("Campari", 4, owner="RG", last=d(6), blocker=vb, recommendation=rec, developments=1),
         view("Farmater", 4, owner="RG", last=d(1), blocker=vb, recommendation=rec, developments=1),
         view("Andina Chile", 2, owner="RG", last=d(9), blocker=vb, recommendation=rec),
@@ -349,6 +362,9 @@ def test_pernod_title_only_buying_signal_reports_the_fact_not_the_interpretation
     _, text = describe_change("commitment", "customer", None, False, "gmail", "Tomas will share the sell-out data.",
                               "RE: Próximos Pasos", date(2026, 10, 26))
     assert text.startswith("Customer committed:")
+    _, text = describe_change("next_step", "customer", None, False, "gmail", "Bianca proposed a pilot review.",
+                              "RE: Próximos Pasos", date(2026, 10, 26))
+    assert text.startswith("Next step noted:")
 
 
 def campari_view(recs):
@@ -376,13 +392,16 @@ def test_no_matching_move_says_clarify_instead_of_an_unrelated_task():
     assert move.tag == "Clarify next action" and "On Premise" not in move.text
 
 
-def test_reply_needed_uses_the_extracted_request_or_a_neutral_instruction():
+def test_reply_needed_uses_the_extracted_request_without_duplicating_it_as_a_move():
     generic = Unanswered("RE: Próximos Pasos: Pernod Ricard <> Bianca", 1, "l", True)
-    assert reply_text(generic).startswith("Review the customer's email") and not reply_text(generic).startswith("Customer asked")
-    specific = Unanswered("RE: Info Distribucion", 1, "l", True, action="Build the distribution cuts from the shared file.")
-    assert reply_text(specific) == "Build the distribution cuts from the shared file."
-    s = section("RG", [view("Pernod", 3, owner="RG", unanswered=generic)], [])
-    assert not s.today[0].text.startswith("Customer asked: RE:")
+    assert reply_label(generic) is None
+    specific = Unanswered("RE: NDA", 1, "l", True, action="Confirm the NDA terms.", item_id="i")
+    assert reply_text(specific) == "Confirm the NDA terms."
+    request = item("Pernod", "Confirm the NDA terms.", deal_owner="RG", kind="customer_request")
+    s = section("RG", [view("Pernod", 3, owner="RG", unanswered=specific)], [request])
+    assert [(row.tag, row.text) for row in s.today] == [("Reply needed", request.text)]
+    assert s.today[0].done == "insight:i"
+    assert s.highlights[0][1].text == "No additional sales action recorded"
 
 
 def test_semantic_fixes_do_not_change_deal_selection():
@@ -511,7 +530,8 @@ def _brief_with_rows():
                ref="opp:abc")
     campari = view("Campari", 4, owner="RG", items=[owed], summary=sit)
     arca = view("Arca Peru", 2, owner="RG", recommendation=rec, recommendations=[rec],
-                unanswered=Unanswered("Pricing?", 2, "https://mail/t1", True, source="Email · Oct 26", thread_id="t1"))
+                unanswered=Unanswered("Pricing?", 2, "https://mail/t1", True, "Send the price proposal",
+                                      source="Email · Oct 26", thread_id="t1"))
     return section("RG", [campari, arca], [owed])
 
 
@@ -529,7 +549,7 @@ def test_done_buttons_link_each_closable_row_and_skip_the_rest():
     assert html.count("✓ Done") >= len(refs)
     assert "https://x/done?r=insight:c" in html and "https://x/done?r=thread:t1" in html
     no_target = primary_move(view("Quiet Co", 2, owner="RG"), TODAY, set())
-    assert no_target.tag == "Confirm status" and no_target.done is None
+    assert no_target.tag == "Status" and no_target.done is None
 
 
 # ---------------------------------------------------------------- Nov 4 founder feedback: automated mail, waiting list
@@ -582,7 +602,8 @@ def test_no_wait_when_they_answered_last_too_recent_or_internal_only():
 
 def wait(deal, days, owner="RG", rank=2, **kw):
     return Waiting(deal, STAGES[rank], "Juan Pérez", (NOV4 - timedelta(days=days)).date(), days, kw.get("nudges", 1),
-                   kw.get("replied", False), kw.get("auto", False), "https://mail/t", "Email · Oct 1", f"t-{deal}", owner, rank)
+                   kw.get("replied", False), kw.get("auto", False), "https://mail/t", "Email · Oct 1", f"t-{deal}",
+                   owner, rank, kw.get("action"))
 
 
 def test_waiting_list_is_per_founder_prospects_first_newest_silence_first():
@@ -595,7 +616,8 @@ def test_waiting_list_is_per_founder_prospects_first_newest_silence_first():
 
 def test_waiting_list_renders_with_a_done_button():
     s = section("RG", [], [])
-    s.waiting = [wait("Andina Chile", 9, auto=True)]
+    s.waiting = [wait("Andina Chile", 9, auto=True, action="We asked for the pilot approval date.")]
     html = render([s], [], [], TODAY, 1, "c", False, action_url=lambda ref: f"https://x/done?r={ref}")
     assert "Waiting on their reply" in html and "out-of-office received" in html and "r=thread:t-Andina Chile" in html
+    assert "We asked for the pilot approval date." in html
     assert "thread:t-Andina Chile" in completable([s], [])

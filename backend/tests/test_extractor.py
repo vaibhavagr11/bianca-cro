@@ -33,6 +33,36 @@ def test_owner_and_due_date_only_kept_for_actionable_types():
     assert kept[1]["owner_side"] == "bianca" and kept[1]["due_date"] == date(2026, 10, 8)
 
 
+def test_validation_keeps_distinct_actions_from_one_message_and_preserves_timing_certainty():
+    quote = "Mañana envío el precio y el contrato. ¿Pueden arreglar el tablero la semana que viene?"
+    records = {
+        "M1": {"id": "first", "body": quote, "occurred_at": date(2026, 10, 6)},
+        "M2": {"id": "second", "body": "Gracias", "occurred_at": date(2026, 10, 7)},
+    }
+    sales = {"quote": quote, "source_ref": "M1", "action_scope": "deal_progression",
+             "due_date": "2026-10-07", "deadline_quote": "Mañana"}
+    candidates = Extraction(insights=[
+        ins(text="Send the pricing tomorrow.", **sales),
+        ins(text="Send the contract tomorrow.", **sales),
+        ins(type="next_step", text="Customer asked for a dashboard fix next week.", quote=quote, source_ref="M1",
+            action_scope="delivery", due_date="2026-10-16", deadline_quote="la semana que viene"),
+        ins(text="Send the pricing tomorrow.", **{**sales, "source_ref": "M2"}),
+    ])
+
+    kept, dropped = validate(candidates, f"{quote}\nGracias", records)
+
+    assert dropped == 1
+    assert [item["origin_record_id"] for item in kept] == ["first", "first", "first"]
+    assert [item["text"] for item in kept[:2]] == ["Send the pricing tomorrow.", "Send the contract tomorrow."]
+    assert [item["action_scope"] for item in kept] == ["deal_progression", "deal_progression", "delivery"]
+    assert [item["due_date"] for item in kept] == [date(2026, 10, 7), date(2026, 10, 7), None]
+    assert kept[2]["type"] == "next_step" and "next week" in kept[2]["text"]
+
+    records["M1"]["meta"] = {"date_inferred": True}
+    estimated, _ = validate(candidates, f"{quote}\nGracias", records)
+    assert all(item["due_date"] is None for item in estimated)
+
+
 def test_parse_due_rejects_vague_or_bad_dates():
     assert parse_due("2026-10-08") == date(2026, 10, 8)
     assert parse_due("next Thursday") is None
