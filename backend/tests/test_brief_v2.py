@@ -563,21 +563,62 @@ def test_people_are_not_automated(senders, subject):
 
 def msg(days_ago, frm, to=("juan@andina.cl",), automated=False, name="Juan Pérez"):
     return {"at": NOV4 - timedelta(days=days_ago), "from": [frm], "automated": automated,
-            "to": [{"address": a, "name": name if "andina" in a else ""} for a in to], "cc": []}
+            "to": [{"address": a, "name": name if "andina" in a else ""} for a in to], "cc": [],
+            "external_id": f"m-{days_ago}", "content_hash": f"hash-{days_ago}"}
+
+
+def expect_reply(latest, evidence=None, **overrides):
+    evidence = latest if evidence is None else evidence
+    latest["reply_expectation"] = {
+        "state": "expected",
+        "latest_message_id": latest["external_id"],
+        "latest_content_hash": latest["content_hash"],
+        "evidence_message_id": evidence["external_id"],
+        "evidence_content_hash": evidence["content_hash"],
+        "evidence_quote": "Could you send the signed agreement?",
+        "response": "Send the signed agreement",
+        **overrides,
+    }
+    return latest
 
 
 def test_waiting_counts_our_unanswered_emails_and_sees_through_an_out_of_office():
-    thread = [msg(40, "juan@andina.cl", to=("ramiro@bianca-ai.com",)), msg(20, "ramiro@bianca-ai.com"),
-              msg(9, "ramiro@bianca-ai.com"), msg(8.9, "juan@andina.cl", to=("ramiro@bianca-ai.com",), automated=True)]
+    ask = msg(20, "ramiro@bianca-ai.com")
+    nudge = expect_reply(msg(9, "ramiro@bianca-ai.com"), evidence=ask)
+    thread = [msg(40, "juan@andina.cl", to=("ramiro@bianca-ai.com",)), ask, nudge,
+              msg(8.9, "juan@andina.cl", to=("ramiro@bianca-ai.com",), automated=True)]
     w = waiting_on_them(thread, INTERNAL, NOV4)
     assert (w["to"], w["days"], w["nudges"], w["replied_before"], w["auto_reply"]) == ("Juan Pérez", 9, 2, True, True)
 
 
-def test_no_wait_when_they_answered_last_too_recent_or_internal_only():
-    assert waiting_on_them([msg(10, "ramiro@bianca-ai.com"), msg(5, "juan@andina.cl")], INTERNAL, NOV4) is None
-    assert waiting_on_them([msg(1, "ramiro@bianca-ai.com")], INTERNAL, NOV4) is None
-    assert waiting_on_them([msg(10, "ramiro@bianca-ai.com", to=("nico@bianca-ai.com",))], INTERNAL, NOV4) is None
-    assert waiting_on_them([msg(200, "ramiro@bianca-ai.com")], INTERNAL, NOV4) is None
+def test_no_wait_when_they_answered_last_or_latest_email_is_internal_only():
+    ask = expect_reply(msg(10, "ramiro@bianca-ai.com"))
+    assert waiting_on_them([ask, msg(5, "juan@andina.cl")], INTERNAL, NOV4) is None
+    internal = expect_reply(msg(10, "ramiro@bianca-ai.com", to=("nico@bianca-ai.com",)))
+    assert waiting_on_them([internal], INTERNAL, NOV4) is None
+
+
+@pytest.mark.parametrize("days,eligible", [(6, False), (7, True), (60, True), (61, False)])
+def test_waiting_age_is_seven_through_sixty_days(days, eligible):
+    waiting = waiting_on_them([expect_reply(msg(days, "ramiro@bianca-ai.com"))], INTERNAL, NOV4)
+    assert (waiting is not None) is eligible
+
+
+@pytest.mark.parametrize("overrides", [
+    {"state": "closed"},
+    {"state": "unclear"},
+    {"latest_message_id": "old-outbound"},
+    {"latest_content_hash": "old-outbound-body"},
+    {"evidence_message_id": "missing-message"},
+    {"evidence_content_hash": "old-evidence-body"},
+])
+def test_waiting_requires_current_expected_reply_with_current_evidence(overrides):
+    outbound = expect_reply(msg(10, "ramiro@bianca-ai.com"), **overrides)
+    assert waiting_on_them([outbound], INTERNAL, NOV4) is None
+
+
+def test_waiting_omits_outbound_with_no_reply_expectation():
+    assert waiting_on_them([msg(10, "ramiro@bianca-ai.com")], INTERNAL, NOV4) is None
 
 
 def wait(deal, days, owner="RG", rank=2, **kw):
@@ -586,11 +627,11 @@ def wait(deal, days, owner="RG", rank=2, **kw):
 
 
 def test_waiting_list_is_per_founder_prospects_first_newest_silence_first():
-    ws = [wait("Customer Co", 60, rank=5), wait("Andina Chile", 9), wait("Arca Peru", 70), wait("Nico deal", 5, owner="NC")]
+    ws = [wait("Customer Co", 60, rank=5), wait("Andina Chile", 9), wait("Arca Peru", 50), wait("Nico deal", 7, owner="NC")]
     shown, more = pick_waiting(ws, "RG")
     assert [w.deal for w in shown] == ["Andina Chile", "Arca Peru", "Customer Co"] and more == 0
-    assert waiting_text(wait("Arca Peru", 70, nudges=3, auto=True)) == "To Juan Pérez · no reply to our 3 emails, out-of-office received"
-    assert waiting_text(wait("Farmater", 4, nudges=8, replied=True)) == "To Juan Pérez · 8 emails since their last reply"
+    assert waiting_text(wait("Arca Peru", 50, nudges=3, auto=True)) == "To Juan Pérez · no reply to our 3 emails, out-of-office received"
+    assert waiting_text(wait("Farmater", 7, nudges=8, replied=True)) == "To Juan Pérez · 8 emails since their last reply"
 
 
 def test_waiting_list_renders_with_a_done_button():

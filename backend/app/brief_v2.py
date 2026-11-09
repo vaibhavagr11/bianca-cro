@@ -243,7 +243,7 @@ AUTO_SUBJECT_RE = re.compile(
 AUTO_SENDER_RE = re.compile(
     r"(no-?reply|do-?not-?reply|^mailer-daemon@|^postmaster@|^bounces?[+@-]|^gemini-notes@|^calendar-notification@"
     r"|@([^@]*\.)?notifications?\.)", re.I)
-WAITING_DAYS = (3, 90)      # we wrote last and nobody has answered for this many days = waiting on their reply
+WAITING_DAYS = (7, 60)      # whole elapsed days since our latest real outbound message
 
 
 def is_automated(senders: list[str], subject: str | None) -> bool:
@@ -252,7 +252,7 @@ def is_automated(senders: list[str], subject: str | None) -> bool:
 
 @dataclass
 class Waiting:
-    """A thread where we wrote last and the customer has not answered."""
+    """A thread where we wrote last and are still expecting the customer's response."""
     deal: str
     stage: str | None
     to: str                         # who we wrote to
@@ -269,7 +269,7 @@ class Waiting:
 
 
 def waiting_on_them(thread: list[dict], internal: set[str], now: datetime) -> dict | None:
-    """The thread's latest real message is ours, to someone outside Bianca, and 3-90 days old.
+    """The latest real message is our 7–60 day old outbound with a verified open reply expectation.
 
     Each message: {"at": datetime, "from": [address], "to": [{"address", "name"}], "cc": [...], "automated": bool},
     oldest first. Returns {"last", "to", "days", "nudges", "replied_before", "auto_reply"} or None.
@@ -287,6 +287,18 @@ def waiting_on_them(thread: list[dict], internal: set[str], now: datetime) -> di
               if dom(p.get("address")) not in internal and not AUTO_SENDER_RE.search(p.get("address") or "")]
     if not people:
         return None                 # an internal-only thread: nobody outside to wait for
+    expectation = last.get("reply_expectation")
+    if not isinstance(expectation, dict) or expectation.get("state") != "expected":
+        return None
+    if (not last.get("external_id") or not last.get("content_hash")
+            or expectation.get("latest_message_id") != last["external_id"]
+            or expectation.get("latest_content_hash") != last["content_hash"]):
+        return None
+    evidence_id, evidence_hash = expectation.get("evidence_message_id"), expectation.get("evidence_content_hash")
+    if not evidence_id or not evidence_hash or not any(
+        m.get("external_id") == evidence_id and m.get("content_hash") == evidence_hash for m in real
+    ):
+        return None
     nudges = 0
     for m in reversed(real):
         if not ours(m):
