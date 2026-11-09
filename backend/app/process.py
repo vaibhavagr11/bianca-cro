@@ -449,6 +449,19 @@ def reconcile_commitments(x_ingest_token: str | None = Header(default=None)) -> 
     return reconcile(None)
 
 
+def _own_record_ids(item: dict) -> list:
+    """The origin message, or every record of the unit for an item extracted before origins existed."""
+    return [item["origin_record_id"]] if item["origin_record_id"] else list(item["source_record_ids"] or [])
+
+
+def _own_context(item: dict, own: dict) -> dict:
+    """What the checker reads as the item's own source, and the record an "event passed" verdict cites."""
+    ids = _own_record_ids(item)
+    records = [own[rid] for rid in ids if rid in own]
+    return {"record_id": ids[-1] if ids else None,
+            "own_text": " ".join(f"{r.get('subject') or ''} {r.get('body') or ''}" for r in records)}
+
+
 def reconcile(opportunity_ids: list[str] | None) -> dict:
     """The completion check for the given deals (all deals when None)."""
     client = _claude()
@@ -457,15 +470,18 @@ def reconcile(opportunity_ids: list[str] | None) -> dict:
     with db.connect() as conn:
         workspace_id = _workspace_id(conn)
         conn.row_factory = dict_row
+        # Items without a single origin message or a reliable origin date (legacy rows, undated notes) are still
+        # checked, against their whole unit and their stored date, as before origins existed.
         targets = conn.execute(
             "select i.id, i.company_id, c.name as company, i.text, i.quote, i.due_date, i.source,"
-            " i.origin_record_id, i.origin_occurred_at as occurred_at, i.updated_at"
-            " from insights i join companies c on c.id = i.company_id"
+            " i.origin_record_id, i.source_record_ids, coalesce(i.origin_occurred_at, i.occurred_at) as occurred_at,"
+            " i.updated_at from insights i join companies c on c.id = i.company_id"
             " where i.workspace_id = %s and i.type in ('commitment', 'next_step') and i.owner_side = 'bianca'"
-            " and i.status = 'open' and i.origin_record_id is not null"
-            " and i.origin_occurred_at between now() - interval '45 days' and now()"
+            " and i.status = 'open'"
+            " and coalesce(i.origin_occurred_at, i.occurred_at) between now() - interval '45 days' and now()"
             " and (%s::text[] is null or i.opportunity_id::text = any(%s))"
-            " order by i.company_id, i.origin_occurred_at", (workspace_id, opportunity_ids, opportunity_ids)).fetchall()
+            " order by i.company_id, coalesce(i.origin_occurred_at, i.occurred_at)",
+            (workspace_id, opportunity_ids, opportunity_ids)).fetchall()
         by_company: dict[str, list[dict]] = {}
         for t in targets:
             by_company.setdefault(str(t["company_id"]), []).append(t)
@@ -473,12 +489,9 @@ def reconcile(opportunity_ids: list[str] | None) -> dict:
         for company_id, items in by_company.items():
             own = {r["id"]: r for r in conn.execute(
                 "select id, subject, body from source_records where workspace_id = %s and id = any(%s)",
-                (workspace_id, [it["origin_record_id"] for it in items]))}
-            item_map = {}
-            for n, it in enumerate(items, start=1):
-                record = own.get(it["origin_record_id"], {})
-                item_map[f"T{n}"] = {**it, "ref": f"T{n}", "record_id": it["origin_record_id"],
-                                     "own_text": f"{record.get('subject') or ''} {record.get('body') or ''}"}
+                (workspace_id, [rid for it in items for rid in _own_record_ids(it)]))}
+            item_map = {f"T{n}": {**it, "ref": f"T{n}", **_own_context(it, own)}
+                        for n, it in enumerate(items, start=1)}
             later = conn.execute(
                 "select id, source, subject, body, occurred_at from source_records where workspace_id = %s"
                 " and company_id = %s and status = 'classified' and body is not null and occurred_at > %s"

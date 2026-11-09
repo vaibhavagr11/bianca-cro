@@ -60,3 +60,14 @@ def test_ordinary_completion_cannot_cite_the_original_source():
     result = Verdicts(verdicts=[ItemVerdict(item="T1", state="done", record="S",
                                            quote="Reunión de entrega el 14/10", reason="Event passed.")])
     assert validate(result, ITEMS, RECORDS) == []
+
+
+def test_items_without_an_origin_are_checked_against_their_whole_unit():
+    from app.process import _own_context, _own_record_ids
+
+    own = {"a": {"subject": "Propuesta", "body": "Te mando la propuesta"}, "b": {"subject": "Re:", "body": "Gracias"}}
+    legacy = {"origin_record_id": None, "source_record_ids": ["a", "b"]}
+    assert _own_record_ids(legacy) == ["a", "b"]
+    assert _own_context(legacy, own) == {"record_id": "b", "own_text": "Propuesta Te mando la propuesta Re: Gracias"}
+    anchored = {"origin_record_id": "a", "source_record_ids": ["a", "b"]}
+    assert _own_context(anchored, own) == {"record_id": "a", "own_text": "Propuesta Te mando la propuesta"}
