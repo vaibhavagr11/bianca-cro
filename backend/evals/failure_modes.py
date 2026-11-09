@@ -363,14 +363,13 @@ def v1_rows(sections: list[dict]):
 def v2_shown(s) -> list:
     """Items the v2 email shows for one founder: needs-you-today rows and every deal move that points at an item."""
     by_id = {i.id: i for i in s.all_items}
-    ids = [r.item_id for r in s.today] + [m.item_id for _, m, _ in s.highlights] + \
-          [m.item_id for _, m in s.customers] + [m.item_id for m in s.followups]
+    ids = [r.item_id for r in s.today] + [m.item_id for _, m, _ in s.highlights] + [m.item_id for m in s.followups]
     return [by_id[i] for i in ids if i and i in by_id]
 
 
 def v2_deals(s) -> set[str]:
     return ({r.deal for r in s.today} | {v.deal for v, _, _ in s.highlights} | set(s.also_active)
-            | {v.deal for v, _ in s.customers} | set(s.followup_deals) | {v.deal for v in s.unclear}
+            | set(s.followup_deals) | {v.deal for v in s.unclear}
             | {m.deal for m, _ in s.meetings if m.deal})
 
 

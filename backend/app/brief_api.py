@@ -325,20 +325,28 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
             " where i.workspace_id = %s and i.type in ('commitment', 'next_step') and i.owner_side = 'bianca'"
             " and i.status = 'possibly_done' group by o.owner_code", (workspace_id,))}
 
-        # Each email thread's latest real message (auto-replies, bounces and notification bots skipped) decides it:
-        # from the customer = unanswered customer email (v1 window), newest per deal; from us = waiting on their reply.
+        # An inbound last message may be unanswered; an outbound last message needs a verified reply expectation.
         unanswered: dict[str, brief_v2.Unanswered] = {}
         unanswered_src: dict[str, tuple[str, str]] = {}  # deal -> (thread id, latest customer message body)
         threads: dict[str, list[dict]] = {}
+        unclassified_latest: dict[str, datetime] = {}
         for t in conn.execute(
-                "select thread_id, company_id, subject, body, occurred_at, participants from source_records"
-                " where workspace_id = %s and source = 'gmail' and company_id is not null and occurred_at <= now()"
-                " and (classification->>'is_commercial')::bool order by thread_id, occurred_at", (workspace_id,)):
+                "select thread_id, company_id, subject, body, occurred_at, participants, external_id, content_hash,"
+                " classification is null as unclassified, classification->'reply_expectation' as reply_expectation"
+                " from source_records where workspace_id = %s and source = 'gmail' and occurred_at <= now()"
+                " and (classification is null or (company_id is not null and (classification->>'is_commercial')::bool))"
+                " order by thread_id, occurred_at, external_id", (workspace_id,)):
             p = t["participants"] or {}
             frm = [x["address"] for x in p.get("from") or []]
+            automated = brief_v2.is_automated(frm, t["subject"])
+            if t["unclassified"]:
+                if not automated:
+                    unclassified_latest[t["thread_id"]] = t["occurred_at"]
+                continue
             threads.setdefault(t["thread_id"], []).append(
                 {"at": t["occurred_at"], "from": frm, "to": p.get("to") or [], "cc": p.get("cc") or [],
-                 "automated": brief_v2.is_automated(frm, t["subject"]), "row": t})
+                 "automated": automated, "row": t, "external_id": t["external_id"], "content_hash": t["content_hash"],
+                 "reply_expectation": t["reply_expectation"]})
         from_customer = lambda m: bool(m["from"]) and all(domain(a) not in internal for a in m["from"])
         last_reply: dict[str, datetime] = {}         # deal -> the customer's latest real email, any thread
         last_ours: dict[str, datetime] = {}          # deal -> our latest email, any thread
@@ -370,6 +378,9 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
             if not d or (handled and handled[0] == "done" and handled[1] >= t["occurred_at"]):
                 continue  # a founder marked it handled after its latest real message
             if not from_customer(real[-1]):
+                unclassified_at = unclassified_latest.get(thread_id)
+                if unclassified_at is not None and unclassified_at >= t["occurred_at"]:
+                    continue  # newer real mail can resolve or change the request before it is classified
                 w = brief_v2.waiting_on_them(msgs, internal, now)
                 if (not w or last_reply.get(d["name"], t["occurred_at"]) > t["occurred_at"]
                         or last_ours.get(d["name"], t["occurred_at"]) > t["occurred_at"]):
@@ -560,7 +571,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
     # chosen and writes meeting prep lines. It cannot add, remove or reorder deals.
     client = _claude()
     for s in sections:
-        moves = [(v, m) for v, m, _ in s.highlights] + list(s.customers)
+        moves = [(v, m) for v, m, _ in s.highlights]
         picked = [(v, m) for v, m in moves if m.tag == "AI recommendation" and not m.text.endswith("(profile not verified)")]
         ai = {f"C{n}": m for n, (_, m) in enumerate(picked, start=1)}
         cands = [brief.Candidate(f"C{n}", v.deal, v.stage or "", s.code, "recommended", "Recommended next move", m.text, 50)

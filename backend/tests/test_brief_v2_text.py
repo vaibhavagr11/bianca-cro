@@ -42,8 +42,8 @@ def test_v2_prepares_every_table_from_full_source_and_renders_the_same_wording()
     section = brief_v2.Section(
         code="NC", name="Nico Casaux", short="Nico", today=[due, quick, boundary],
         highlights=[(brief_v2.DealView("Pilot", stage, 4, "NC"), move, note)], also_active=[],
-        customers=[(brief_v2.DealView("Customer", stage, 5, "NC"), customer)], meetings=[(meeting, prep)],
-        followups=[], followup_deals=[], more_followups=0, unclear=[], dormant=0, backlog=brief_v2.Backlog(),
+        meetings=[(meeting, prep)],
+        followups=[customer], followup_deals=[], more_followups=0, unclear=[], dormant=0, backlog=brief_v2.Backlog(),
         waiting=[waiting],
     )
     sections, ndl_rows, changes = [section], [ndl], [change]
@@ -97,11 +97,10 @@ def test_v2_prepares_every_table_from_full_source_and_renders_the_same_wording()
     assert brief_v2.to_payload(sections, ndl_rows, changes) == before
 
 
-def test_v2_build_returns_review_status_instead_of_an_over_limit_brief(monkeypatch):
+def test_v2_build_never_fails_on_over_limit_text(monkeypatch):
     def build(dry_run):
-        return read_table_text(TableText("Situation", "Confidential evidence " * 10))
+        return {"situation": read_table_text(TableText("Situation", "Confidential evidence " * 10))}
 
     monkeypatch.setattr(brief_api, "build_brief_v2", build)
     response = TestClient(app).post("/brief/build?version=v2&dry_run=true", headers={"X-Ingest-Token": "test-token"})
-    assert response.status_code == 503
-    assert response.json() == {"detail": {"code": "brief_text_review_required", "field": "Situation"}}
+    assert response.status_code == 200 and len(response.json()["situation"]) <= TABLE_TEXT_LIMIT
