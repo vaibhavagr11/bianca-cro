@@ -35,3 +35,21 @@ works on both.
 
 The behavioural checks that still pass include: approve / ignore semantics, revision and idempotency handling,
 applying / retry recovery, mirror-sync notice flow, lineage validation, empty live page, no credentials in HTML.
+
+## 11/09/2026 - Next Step rows with a date, and the write-mode switch on the card
+
+Still generated only by `patch_artifact.py` (same command as above); `BiancaLive` / `BiancaCore` are untouched.
+
+- **Editor:** the Next Step textarea is hidden and kept as the value the page submits. In its place: one row per next
+  step with a text field and a date field, `+ Add next step`, remove per row, and a preview of what will be written.
+  A date is appended to its step as `(complete by Nov 4, 2026)` - same Next Step cell, no new Sheet column. A
+  trailing `- due YYYY-MM-DD` on a suggested bullet pre-fills the date field. A row nobody touched is sent back
+  byte-for-byte, so its source link (lineage) survives; an edited row is a founder edit, as before.
+- **Replace Next Step / Keep current bullets + add these:** now on the card (inside Suggested next steps) and mirrored
+  in the editor. It works, client side: in Keep + add the page sends the bullets already in the Sheet cell followed by
+  the new ones (identical lines not repeated), through the normal approve call with `edited=true`.
+- **Backend follow-up (Vaibhav):** the backend still rotates the old Next Step into Last progress on every approve.
+  In Keep + add that means Last progress is overwritten with bullets that are also still in Next Step. If founders
+  keep this mode, add a `mode: "append"` field to the approve payload and skip the rotation server side; the page
+  can then stop re-sending the current bullets. Kept bullets also arrive as founder edits (no source link).
+- Tests: `verify-live.cjs` 45 / 55 and `verify-demo.cjs` 23 / 36, unchanged from the restyle baseline.
