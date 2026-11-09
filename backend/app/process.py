@@ -246,10 +246,16 @@ def _write_extracted_insights(conn, workspace_id, unit: dict, deal: dict, record
     def identity(row: dict) -> tuple:
         return row["origin_record_id"], *extractor.insight_key(row["type"], row["quote"])
 
+    def same_action(old: dict, new: dict, field: str) -> bool:
+        """Same type and quote (or one-line text), on the same message or on a legacy row not yet tied to one."""
+        return (old["origin_record_id"] in (None, new["origin_record_id"])
+                and extractor.insight_key(old["type"], old[field]) == extractor.insight_key(new["type"], new[field]))
+
     prior = {}
     for row in existing:
         prior.setdefault(identity(row), row)
-    # Reserve all exact matches before allowing a uniquely matching reworded quote on the same source.
+    # Reserve all exact matches before allowing a unique looser match (a reworded quote, or a legacy row
+    # without an origin); otherwise the old row survives as an "omitted" action next to its new copy.
     new_keys = {identity(i) for i in kept}
     seen, matched = set(), set()
     for i in kept:
@@ -258,12 +264,13 @@ def _write_extracted_insights(conn, workspace_id, unit: dict, deal: dict, record
             continue
         seen.add(item_key)
         old = prior.get(item_key)
-        if old is None and i["origin_record_id"] is not None:
-            action_key = (i["origin_record_id"], extractor.insight_key(i["type"], i["text"]))
+        for field in ("quote", "text"):
+            if old is not None:
+                break
             variants = [r for r in existing if r["id"] not in matched and identity(r) not in new_keys
-                        and (r["origin_record_id"], extractor.insight_key(r["type"], r["text"])) == action_key]
-            incoming = {identity(r) for r in kept
-                        if (r["origin_record_id"], extractor.insight_key(r["type"], r["text"])) == action_key}
+                        and same_action(r, i, field)]
+            incoming = {identity(k) for k in kept if k["type"] == i["type"]
+                        and extractor.insight_key(k["type"], k[field]) == extractor.insight_key(i["type"], i[field])}
             if len(variants) == 1 and len(incoming) == 1:
                 old = variants[0]
         when = i["origin_occurred_at"] or records[-1]["occurred_at"]
@@ -274,10 +281,11 @@ def _write_extracted_insights(conn, workspace_id, unit: dict, deal: dict, record
                 " text = %s, quote = %s, owner_side = %s, owner_name = %s, due_date = %s, confidence = %s,"
                 " occurred_at = case when origin_occurred_at is not null then occurred_at else %s end,"
                 " origin_occurred_at = coalesce(origin_occurred_at, %s),"
+                " origin_record_id = coalesce(origin_record_id, %s),"
                 " extractor_version = %s, last_extracted_at = now() where id = %s",
                 (unit["company_id"], deal["id"], record_ids, i["text"], i["quote"], i["owner_side"],
                  i["owner_name"], i["due_date"], i["confidence"], when, i["origin_occurred_at"],
-                 extractor.EXTRACTOR_VERSION, old["id"]),
+                 i["origin_record_id"], extractor.EXTRACTOR_VERSION, old["id"]),
             )
         else:
             conn.execute(
@@ -297,7 +305,8 @@ def _write_extracted_insights(conn, workspace_id, unit: dict, deal: dict, record
         sources = records
         if origin is not None:
             sources = [by_id[origin]] if origin in by_id else []
-        if (identity(old) not in seen and old["type"] in ("commitment", "next_step")
+        covered = any(same_action(old, i, field) for i in kept for field in ("quote", "text"))
+        if (identity(old) not in seen and not covered and old["type"] in ("commitment", "next_step")
                 and any(extractor.quote_in_record(old["quote"], r) for r in sources)):
             # A newer reply can make the extractor omit an existing action. Keep it for evidence-based review.
             conn.execute(

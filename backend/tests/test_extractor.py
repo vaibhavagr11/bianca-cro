@@ -113,7 +113,7 @@ def test_reextraction_updates_existing_action_without_resetting_identity_or_revi
     assert sql.startswith("update insights")
     assert "created_at" not in sql and "status" not in sql and "completion" not in sql
     assert params[-1] == "stable"
-    assert params[-3] == "2026-10-06"
+    assert params[-4] == "2026-10-06"
 
     # The updated thread's extractor may omit the action because the later reply fulfills it.
     old["status"] = "open"
@@ -122,3 +122,59 @@ def test_reextraction_updates_existing_action_without_resetting_identity_or_revi
     [(sql, params)] = conn.writes
     assert sql.startswith("update insights")
     assert params[-1] == "stable"
+
+
+class _Rows:
+    """A connection stub: returns the given insights for the select, records every write."""
+
+    def __init__(self, rows):
+        self.rows, self.writes = rows, []
+
+    def execute(self, sql, params):
+        if not sql.startswith("select"):
+            self.writes.append((sql, params))
+        return self
+
+    def fetchall(self):
+        return self.rows
+
+
+def _rewrite(existing, insights, records):
+    from app.process import _write_extracted_insights
+
+    refs = {f"M{n}": r for n, r in enumerate(records, start=1)}
+    kept, _ = validate(Extraction(insights=insights), " ".join(r["body"] for r in records), refs)
+    conn = _Rows(existing)
+    _write_extracted_insights(conn, "workspace", {"source": "gmail", "thread_id": "t", "company_id": "c"},
+                              {"id": "deal"}, records, kept)
+    return [(sql.split()[0], params) for sql, params in conn.writes]
+
+
+THREAD = [{"id": "first", "occurred_at": "2026-10-06", "body": "Les mando la propuesta el jueves. Saludos"},
+          {"id": "later", "occurred_at": "2026-10-09", "body": "Any update on the proposal?"}]
+
+
+def test_legacy_action_without_origin_is_updated_not_duplicated():
+    legacy = {"id": "legacy", "origin_record_id": None, "type": "commitment", "status": "possibly_done",
+              "text": "Send the proposal on Thursday.", "quote": "Les mando la propuesta el jueves"}
+    writes = _rewrite([legacy], [ins(source_ref="M1", quote="Les mando la propuesta el jueves",
+                                     text="Send the proposal on Thursday.")], THREAD)
+    assert [(verb, params[-1]) for verb, params in writes] == [("update", "legacy")]
+    assert writes[0][1][-3] == "first"   # the legacy row is now tied to its message
+
+
+def test_reworded_quote_on_the_same_message_is_one_action():
+    old = {"id": "stable", "origin_record_id": "first", "type": "commitment", "status": "open",
+           "text": "Send the proposal on Thursday.", "quote": "Les mando la propuesta el jueves"}
+    writes = _rewrite([old], [ins(source_ref="M1", quote="mando la propuesta el jueves. Saludos",
+                                  text="Send the proposal on Thursday.")], THREAD)
+    assert [(verb, params[-1]) for verb, params in writes] == [("update", "stable")]
+
+
+def test_an_action_the_extractor_omits_is_still_kept_for_review():
+    old = {"id": "stable", "origin_record_id": "first", "type": "commitment", "status": "open",
+           "text": "Send the proposal on Thursday.", "quote": "Les mando la propuesta el jueves"}
+    writes = _rewrite([old], [ins(type="need", source_ref="M2", quote="Any update on the proposal",
+                                  text="Customer wants an update.")], THREAD)
+    assert ("update", "stable") in [(verb, params[-1]) for verb, params in writes]
+    assert not any(verb == "delete" for verb, _ in writes)
