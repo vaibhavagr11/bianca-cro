@@ -21,12 +21,6 @@ class TableText:
     fallback: str | None = None
 
 
-class BriefTextReview(ValueError):
-    def __init__(self, kind: str):
-        self.kind = kind
-        super().__init__(f"Daily Brief table text needs review ({kind}).")
-
-
 class _Summary(BaseModel):
     id: str
     text: str
@@ -64,13 +58,37 @@ def _valid_shortening(field: TableText, text: str) -> bool:
     return shorter[-1] in ".!?" and original.startswith(shorter) and original[len(shorter):len(shorter) + 1].isspace()
 
 
+def _has(text: str, fact: str) -> bool:
+    return fact.casefold() in text.casefold()
+
+
+def cut_table_text(field: TableText) -> str:
+    """Deterministic shortening, so a brief always sends: the first complete sentence that fits and keeps the
+    required values, else whole words with an ellipsis and any required value that was cut appended."""
+    text = " ".join(field.text.split())
+    first = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0]
+    if len(first) <= TABLE_TEXT_LIMIT and all(_has(first, fact) for fact in field.required):
+        return first
+    for budget in range(TABLE_TEXT_LIMIT - 1, 0, -10):
+        head = text[:budget]
+        if len(text) > budget and " " in head:
+            head = head.rsplit(" ", 1)[0]
+        head = head.rstrip(" ,;:—–-(") + "…"
+        missing = [f"({fact})" if f"({fact})" in text else fact for fact in field.required if not _has(head, fact)]
+        shown = " ".join([head, *missing])
+        if len(shown) <= TABLE_TEXT_LIMIT:
+            return shown
+    return text[:TABLE_TEXT_LIMIT - 1] + "…"
+
+
 def read_table_text(field: TableText) -> str:
+    """The field's own text when it fits; else its validated fallback; else a word-boundary cut. Never raises."""
     if len(field.text) <= TABLE_TEXT_LIMIT:
         return field.text
     fallback = (field.fallback or "").strip()
     if _valid_shortening(field, fallback):
         return fallback
-    raise BriefTextReview(field.kind)
+    return cut_table_text(field)
 
 
 def _batch(fields: Iterable[TableText]) -> tuple[dict[str, TableText], str]:

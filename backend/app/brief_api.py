@@ -7,12 +7,12 @@ from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import anthropic
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from app import actions, brief, brief_v2, db, timeline
-from app.brief_text import BriefTextReview, prepare_table_text
+from app.brief_text import prepare_table_text
 from app.config import settings
 from app.gmail import domain
 from app.ingest import _workspace_id, require_token
@@ -33,13 +33,9 @@ DISPLAY = {"RG": ("Ramiro", "Ramiro Godfrid"), "NC": ("Nico", "Nico Casaux"), "N
 @router.post("/build")
 def build_brief(dry_run: bool = False, version: str = "v1", x_ingest_token: str | None = Header(default=None)) -> dict:
     require_token(x_ingest_token)
-    try:
-        if version == "v2":
-            return build_brief_v2(dry_run)
-        return build_brief_v1(dry_run)
-    except BriefTextReview as exc:
-        log.warning("brief needs table text review: %s", exc.kind)
-        raise HTTPException(503, {"code": "brief_text_review_required", "field": exc.kind}) from exc
+    if version == "v2":
+        return build_brief_v2(dry_run)
+    return build_brief_v1(dry_run)
 
 
 def build_brief_v1(dry_run: bool = False, since: datetime | None = None) -> dict:

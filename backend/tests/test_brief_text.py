@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import anthropic
 import pytest
 
-from app.brief_text import TABLE_TEXT_LIMIT, BriefTextReview, TableText, prepare_table_text, read_table_text
+from app.brief_text import TABLE_TEXT_LIMIT, TableText, prepare_table_text, read_table_text
 
 
 LONG_TEXT = "Ask the customer to confirm the meeting and provide the documents before Nov 5. " * 4
@@ -94,16 +94,14 @@ def test_missing_unknown_and_duplicate_ids_use_fallback(ids):
     assert prepare_table_text([field], client, "test-model")(field) == FALLBACK
 
 
-def test_service_error_uses_fallback_or_reports_only_the_field_type():
+def test_service_error_uses_fallback_or_a_word_boundary_cut_so_the_brief_still_sends():
     field = TableText("What", LONG_TEXT, ("Nov 5",), FALLBACK)
-    needs_review = TableText("Situation", LONG_TEXT)
+    no_fallback = TableText("Situation", LONG_TEXT)
     client = StubClaude(error=anthropic.AnthropicError("Provider failure"))
-    display = prepare_table_text([field, needs_review], client, "test-model")
+    display = prepare_table_text([field, no_fallback], client, "test-model")
     assert display(field) == FALLBACK
-    with pytest.raises(BriefTextReview) as exc:
-        display(needs_review)
-    assert exc.value.kind == "Situation"
-    assert str(exc.value) == "Daily Brief table text needs review (Situation)."
+    cut = display(no_fallback)
+    assert len(cut) <= TABLE_TEXT_LIMIT and LONG_TEXT.startswith(cut.rstrip("…").split(". ")[0])
 
 
 def test_oversized_input_is_not_sent_or_sliced():
@@ -116,7 +114,7 @@ def test_oversized_input_is_not_sent_or_sliced():
 @pytest.mark.parametrize("fallback", [
     None, " ", "See the email.", "See the email before Nov 5…", LONG_TEXT, LONG_TEXT[:TABLE_TEXT_LIMIT - 5],
 ])
-def test_local_resolution_rejects_missing_or_invalid_fallback(fallback):
+def test_local_resolution_ignores_an_invalid_fallback_and_cuts_keeping_required_values(fallback):
     field = TableText("What", LONG_TEXT, ("Nov 5",), fallback)
-    with pytest.raises(BriefTextReview, match="What"):
-        read_table_text(field)
+    shown = read_table_text(field)
+    assert shown != fallback and len(shown) <= TABLE_TEXT_LIMIT and "Nov 5" in shown

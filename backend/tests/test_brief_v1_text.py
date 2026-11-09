@@ -3,7 +3,7 @@ from datetime import date, datetime
 import pytest
 
 from app import brief
-from app.brief_text import BriefTextReview, read_table_text
+from app.brief_text import TABLE_TEXT_LIMIT, read_table_text
 
 
 TODAY = date(2026, 11, 5)
@@ -53,5 +53,5 @@ def test_legacy_planner_fallback_keeps_original_detail_for_text_preparation():
     fallback = brief.fallback_plan([candidate], [])
     assert fallback.actions[0].do_today == LONG_ACTION
     rows = brief.priority_rows(brief.resolve_plan(fallback, [candidate]))
-    with pytest.raises(BriefTextReview):
-        brief.rows_table(rows, TODAY)
+    html = brief.rows_table(rows, TODAY)   # Claude unavailable for both calls: the row is cut, never blocks the brief
+    assert LONG_ACTION not in html and "Bianca will send the complete data plan to the customer on Friday." in html
