@@ -1,8 +1,8 @@
 """Morning brief v2: compact, deal-level, owner-checked. Pure rules and rendering; brief_api gathers the data.
 
 Per founder, in reading order: needs you today (time-critical only), deals to move (one line per prospect or
-pilot: situation, one next move, date, evidence), customer accounts (one line each), meetings, follow-ups that may
-be needed, deals whose status to confirm, and a one-line backlog summary. Shared: what changed (from new,
+pilot: situation, one next move, date, evidence), waiting on their reply, meetings, follow-ups that may be
+needed, deals whose status to confirm, and a one-line backlog summary. Shared: what changed (from new,
 quote-checked insights) and Nico de León's urgent items.
 
 Every rule here is deterministic. The existing planner call only shortens the suggested moves it picks and writes
@@ -23,7 +23,7 @@ UNCLEAR_DAYS = 45           # 15..45 days = status unclear (confirm); older = do
 REPLY_DAYS = 7              # customer email this recent + a question/request = reply needed
 PROPOSAL_FOLLOWUP_DAYS = (7, 30)   # our proposal with no reply after this many days = follow-up may be needed
 UNDATED_WINDOW_DAYS = 45
-MAX_HIGHLIGHTS, MAX_CUSTOMERS, MAX_FOLLOWUPS, MAX_EXCEPTIONS, MAX_NAMES = 4, 4, 3, 1, 3
+MAX_HIGHLIGHTS, MAX_FOLLOWUPS, MAX_EXCEPTIONS, MAX_NAMES = 4, 3, 1, 3
 MAX_WAITING = 6
 IN_TALKS_RANK = 2
 REQUEST_FRESH_DAYS = 21       # a customer request this recent still counts as outstanding
@@ -577,7 +577,6 @@ class Section:
     today: list[TodayRow]
     highlights: list[tuple[DealView, Move, Note | None]]
     also_active: list[str]
-    customers: list[tuple[DealView, Move]]
     meetings: list[tuple[Meeting, str]]
     followups: list[Move]
     followup_deals: list[str]
@@ -648,7 +647,6 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
             audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
                                          f"not eligible: status {status}" + (f", last record {_date(v.last_contact)}"
                                                                              if v.last_contact else "")))
-    recency = lambda v: -(v.last_contact.toordinal()) if v.last_contact else 0
     highlights = []
     for v in selected:
         m = primary_move(v, today, used)
@@ -656,14 +654,6 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
             used.add(m.item_id)
         highlights.append((v, m, situation(v)))
     shown = {v.deal for v, _, _ in highlights}
-
-    customers = []
-    for v in sorted((v for v in owned if v.rank == CUSTOMER_RANK), key=lambda v: (v.deal not in in_today, recency(v), v.deal)):
-        if len(customers) < MAX_CUSTOMERS:
-            m = primary_move(v, today, used)
-            if m.item_id:
-                used.add(m.item_id)
-            customers.append((v, m))
 
     # Follow-ups that may be needed (not today): unanswered without a request or older, recent overdue promises,
     # our proposals with no reply, customer requests on deals not shown above.
@@ -708,7 +698,7 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
 
     return Section(code, name, short, today_rows, highlights, [r.deal for r in audit if r.position is None
                                                                 and not r.reason.startswith("not eligible")],
-                   customers, meetings, follow_shown, [], len(follow) - len(follow_shown), unclear, dormant, b,
+                   meetings, follow_shown, [], len(follow) - len(follow_shown), unclear, dormant, b,
                    hidden, routed, audit)
 
 
@@ -827,12 +817,6 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None) -> 
         if s.more_waiting:
             out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">+ {s.more_waiting} more on record</p>')
 
-    if s.customers:
-        out.append(_h("Customer accounts", AMBER, len(s.customers)))
-        out.append(_table(_th("Account", "20%") + _th("Next move") + _th("Source", "12%") + done_th,
-                          ["<tr>" + _td(_deal_cell(v.deal, v.stage)) + _td(f"{_tag(m.tag)} {_e(first_sentence(m.text))} {_muted(_e(m.when))}")
-                           + _td(_src(m.source)) + done_td(m.done) + "</tr>" for v, m in s.customers]))
-
     out.append(_h("Meetings today & tomorrow", BLUE, len(s.meetings)))
     out.append(meetings_table(s.meetings) if s.meetings else _empty("No customer meetings today or tomorrow."))
 
@@ -882,7 +866,7 @@ def completable(sections: list[Section], ndl_rows: list[TodayRow]) -> dict[str, 
     out: dict[str, tuple[str, str]] = {}
     for s in sections:
         rows = [(r.done, r.deal, r.text) for r in s.today]
-        rows += [(m.done, v.deal, m.text) for v, m, _ in s.highlights] + [(m.done, v.deal, m.text) for v, m in s.customers]
+        rows += [(m.done, v.deal, m.text) for v, m, _ in s.highlights]
         rows += [(m.done, m.text.split(":", 1)[0], m.text.split(":", 1)[-1].strip()) for m in s.followups]
         rows += [(f"thread:{w.thread_id}" if w.thread_id else None, w.deal, f"Waiting on their reply: {waiting_text(w)}")
                  for w in s.waiting]
@@ -935,7 +919,6 @@ def plain_text(sections: list[Section], today: date) -> str:
         lines += [f"• [{r.tag}] {r.deal} — {r.text} ({r.when})" for r in s.today]
         lines.append(f"Deals to move ({len(s.highlights)})")
         lines += [f"• {v.deal} ({stage_short(v.stage)}): [{m.tag}] {m.text} ({m.when})" for v, m, _ in s.highlights]
-        lines += [f"• {v.deal} (customer): [{m.tag}] {m.text}" for v, m in s.customers]
         lines += [f"• {m.at:%a %H:%M} {m.title} — {p}" for m, p in s.meetings]
         lines += [f"• [{m.tag}] {m.text} ({m.when})" for m in s.followups]
         if s.waiting:
@@ -960,7 +943,7 @@ def to_payload(sections: list[Section], ndl_rows: list[TodayRow], changes: list[
         "selection_audit": [{"deal": r.deal, "stage": r.stage, "selected": r.selected, "position": r.position,
                              "time_critical": r.critical, "signals": r.signals, "reason": r.reason} for r in s.audit],
         "also_active": s.also_active,
-        "customers": [{"deal": v.deal, "move": move(m)} for v, m in s.customers],
+        "customers": [],  # retain the response key for callers of v2
         "followups": [move(m) for m in s.followups], "more_followups": s.more_followups,
         "waiting": [{"deal": w.deal, "to": w.to, "sent": w.sent, "days": w.days, "nudges": w.nudges,
                      "replied_before": w.replied_before, "auto_reply": w.auto_reply, "thread_id": w.thread_id}

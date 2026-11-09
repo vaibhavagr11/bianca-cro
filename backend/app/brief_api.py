@@ -565,7 +565,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None) -> dict
     # chosen and writes meeting prep lines. It cannot add, remove or reorder deals.
     client = _claude()
     for s in sections:
-        moves = [(v, m) for v, m, _ in s.highlights] + list(s.customers)
+        moves = [(v, m) for v, m, _ in s.highlights]
         picked = [(v, m) for v, m in moves if m.tag == "AI recommendation" and not m.text.endswith("(profile not verified)")]
         ai = {f"C{n}": m for n, (_, m) in enumerate(picked, start=1)}
         cands = [brief.Candidate(f"C{n}", v.deal, v.stage or "", s.code, "recommended", "Recommended next move", m.text, 50)
