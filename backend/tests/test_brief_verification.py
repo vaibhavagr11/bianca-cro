@@ -178,3 +178,15 @@ def test_load_uses_original_cutoff_and_considers_exact_contacts_and_canonical_th
     conn = SimpleNamespace(cursor=lambda **_: Cursor())
     prepared = verification.load(conn, "workspace", [ACTION], as_of=START + timedelta(days=1))
     assert [record.id for record in prepared.candidates[ACTION.key]] == ["reply", "sent"]
+
+
+def test_an_email_to_another_contact_at_the_company_is_not_a_reply():
+    reply = replace(ACTION, kind="reply", text="Reply to the customer's email (Pricing request)")
+    colleague = replace(activity("invoice", "Attached is invoice INV-21 for October."),
+                        recipients=frozenset({"accounts@customer.test"}))
+    client = FakeClaude(lambda payload: [model_verdict("handled", "R1", "Attached is invoice INV-21 for October.")])
+    assert review(reply, [colleague], client).verdicts[reply.key].reason == "invalid_model_citation"
+
+    answer = activity("answer", "Pricing for the pilot is $500 per month.")   # to the person who asked
+    client = FakeClaude(lambda payload: [model_verdict("handled", "R1", "Pricing for the pilot is $500 per month.")])
+    assert review(reply, [answer], client).verdicts[reply.key].state == "handled"

@@ -227,7 +227,8 @@ def _can_cite(action: VerificationAction, origin: Activity, row: Activity, state
     if row.id == origin.id or not row.reliable_date or not action.origin_at or row.occurred_at <= action.origin_at:
         return False
     if action.kind == "reply":
-        return row.direction == "outbound" and (bool(row.recipients & origin.senders) or row.company_id == action.company_id)
+        # Only an email to the person who asked, or in their thread; another contact at the company is not a reply.
+        return row.direction == "outbound" and (bool(row.recipients & origin.senders) or _same_thread(origin, row))
     if action.kind == "waiting" and state == "handled":
         return row.direction == "notes" or (row.direction == "inbound" and
                (bool(row.senders & origin.recipients) or row.company_id == action.company_id))
