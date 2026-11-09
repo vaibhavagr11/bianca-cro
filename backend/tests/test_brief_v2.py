@@ -483,13 +483,14 @@ def test_dark_mode_rules_preserve_both_badge_colors_without_opting_in_the_whole_
             assert selector + "{background-color:" + background + "!important;color:" + foreground + "!important}" in css
 
 
-def test_stage_badges_sit_below_escaped_company_names_in_all_four_company_tables():
+def test_stage_badges_sit_below_escaped_company_names():
     paused = item("Cedar & Co", due=TODAY, deal_owner="RG", id="paused")
     opening = item("Harbor Foods", due=TODAY + timedelta(days=2), deal_owner="RG", id="opening")
+    customer = item("Willow Retail", due=TODAY, deal_owner="RG", id="customer")
     views = [view("Cedar & Co", 0, owner="RG"), view("Harbor Foods", 1, owner="RG")]
     views += [view(label + " Co", rank, owner="RG") for rank, (label, _, _) in enumerate(BADGE_PALETTE[2:5], start=2)]
     views += [view("Willow Retail", 5, owner="RG")]
-    s = section("RG", views, [paused, opening])
+    s = section("RG", views, [paused, opening, customer])
     urgent = TodayRow("Nico <Urgent>", "4. Pilot", "Due now", "Review the file", "due today", "Nico DL", None)
     html = render([s], [urgent], [], TODAY, 7, "c", False, action_url=lambda ref: f"https://x/done?r={ref}")
     for company, label in (("Cedar &amp; Co", "Paused"), ("Harbor Foods", "Opening"), ("In Talks Co", "In Talks"),
