@@ -131,10 +131,11 @@ def _summarize(by_id: dict[str, TableText], data: str, client: anthropic.Anthrop
     return summaries
 
 
-def prepare_table_text(fields: Iterable[TableText], client: anthropic.Anthropic, model: str) -> Callable[[TableText], str]:
-    """Summarize only over-limit fields. Resolve all other fields locally."""
+def prepare_table_text(fields: Iterable[TableText], client: anthropic.Anthropic | None,
+                       model: str) -> Callable[[TableText], str]:
+    """Summarize only over-limit fields. Resolve all other fields locally (always, when there is no client)."""
     by_id, data = _batch(fields)
-    if not by_id:
+    if not by_id or client is None:
         return read_table_text
     summaries = _summarize(by_id, data, client, model)
 

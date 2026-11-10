@@ -53,3 +53,127 @@ def test_insight_key_ignores_whitespace_and_case():
     from app.extractor import insight_key
     assert insight_key("commitment", "Te mando  las\nslides") == insight_key("commitment", "te mando las slides")
     assert insight_key("commitment", "x") != insight_key("next_step", "x")
+
+
+def test_exact_source_ref_controls_anchor_when_the_quote_is_repeated():
+    refs = {
+        "M1": {"id": "first", "occurred_at": "2026-10-06", "subject": None, "body": "Mandar mail next steps"},
+        "M2": {"id": "last", "occurred_at": "2026-10-07", "subject": None, "body": "Mandar mail next steps"},
+    }
+    kept, dropped = validate(Extraction(insights=[ins(source_ref="M1"), ins(source_ref="M9"), ins()]), TEXT, refs)
+    assert dropped == 0   # a wrong label never drops a verbatim quote
+    assert kept[0]["origin_record_id"] == "first"
+    assert kept[0]["origin_occurred_at"] == "2026-10-06"
+    assert [k["origin_record_id"] for k in kept[1:]] == [None, None]   # in both messages: no single origin
+
+
+def test_unique_legacy_quote_keeps_its_origin_and_inferred_dates_are_unverified():
+    refs = {
+        "M1": {"id": "first", "occurred_at": "2026-10-06", "subject": None, "body": "Mandar mail next steps",
+               "meta": {"date_inferred": True}},
+        "M2": {"id": "last", "occurred_at": "2026-10-07", "subject": None, "body": "The requested email was sent."},
+    }
+    kept, dropped = validate(Extraction(insights=[ins(), ins(source_ref="M2")]), TEXT, refs)
+    assert dropped == 0
+    assert [k["origin_record_id"] for k in kept] == ["first", "first"]   # mislabeled M2: the quote is only in M1
+    assert kept[0]["origin_occurred_at"] is None
+
+
+def test_reextraction_updates_existing_action_without_resetting_identity_or_review():
+    from app.process import _write_extracted_insights
+
+    unit = {"source": "gmail", "thread_id": "thread", "company_id": "company"}
+    deal = {"id": "deal"}
+    records = [
+        {"id": "first", "occurred_at": "2026-10-06", "body": "Mandar mail next steps mañana"},
+        {"id": "later", "occurred_at": "2026-10-07", "body": "I sent the next steps."},
+    ]
+    old = {"id": "stable", "origin_record_id": "first", "type": "commitment", "status": "done",
+           "text": "Send the next-steps email.", "quote": "Mandar mail next steps"}
+    kept, _ = validate(Extraction(insights=[ins(source_ref="M1", quote="Mandar mail next steps mañana")]),
+                       records[0]["body"], {"M1": records[0], "M2": records[1]})
+
+    class Conn:
+        def __init__(self):
+            self.writes = []
+
+        def execute(self, sql, params):
+            if sql.startswith("select"):
+                return self
+            self.writes.append((sql, params))
+            return self
+
+        def fetchall(self):
+            return [old]
+
+    conn = Conn()
+    _write_extracted_insights(conn, "workspace", unit, deal, records, kept)
+    [(sql, params)] = conn.writes
+    assert sql.startswith("update insights")
+    assert "created_at" not in sql and "status" not in sql and "completion" not in sql
+    assert params[-1] == "stable"
+    assert params[-4] == "2026-10-06"
+
+    # The updated thread's extractor may omit the action because the later reply fulfills it.
+    old["status"] = "open"
+    conn.writes.clear()
+    _write_extracted_insights(conn, "workspace", unit, deal, records, [])
+    [(sql, params)] = conn.writes
+    assert sql.startswith("update insights")
+    assert params[-1] == "stable"
+
+
+class _Rows:
+    """A connection stub: returns the given insights for the select, records every write."""
+
+    def __init__(self, rows):
+        self.rows, self.writes = rows, []
+
+    def execute(self, sql, params):
+        if not sql.startswith("select"):
+            self.writes.append((sql, params))
+        return self
+
+    def fetchall(self):
+        return self.rows
+
+
+def _rewrite(existing, insights, records):
+    from app.process import _write_extracted_insights
+
+    refs = {f"M{n}": r for n, r in enumerate(records, start=1)}
+    kept, _ = validate(Extraction(insights=insights), " ".join(r["body"] for r in records), refs)
+    conn = _Rows(existing)
+    _write_extracted_insights(conn, "workspace", {"source": "gmail", "thread_id": "t", "company_id": "c"},
+                              {"id": "deal"}, records, kept)
+    return [(sql.split()[0], params) for sql, params in conn.writes]
+
+
+THREAD = [{"id": "first", "occurred_at": "2026-10-06", "body": "Les mando la propuesta el jueves. Saludos"},
+          {"id": "later", "occurred_at": "2026-10-09", "body": "Any update on the proposal?"}]
+
+
+def test_legacy_action_without_origin_is_updated_not_duplicated():
+    legacy = {"id": "legacy", "origin_record_id": None, "type": "commitment", "status": "possibly_done",
+              "text": "Send the proposal on Thursday.", "quote": "Les mando la propuesta el jueves"}
+    writes = _rewrite([legacy], [ins(source_ref="M1", quote="Les mando la propuesta el jueves",
+                                     text="Send the proposal on Thursday.")], THREAD)
+    assert [(verb, params[-1]) for verb, params in writes] == [("update", "legacy")]
+    assert writes[0][1][-3] == "first"   # the legacy row is now tied to its message
+
+
+def test_reworded_quote_on_the_same_message_is_one_action():
+    old = {"id": "stable", "origin_record_id": "first", "type": "commitment", "status": "open",
+           "text": "Send the proposal on Thursday.", "quote": "Les mando la propuesta el jueves"}
+    writes = _rewrite([old], [ins(source_ref="M1", quote="mando la propuesta el jueves. Saludos",
+                                  text="Send the proposal on Thursday.")], THREAD)
+    assert [(verb, params[-1]) for verb, params in writes] == [("update", "stable")]
+
+
+def test_an_action_the_extractor_omits_is_still_kept_for_review():
+    old = {"id": "stable", "origin_record_id": "first", "type": "commitment", "status": "open",
+           "text": "Send the proposal on Thursday.", "quote": "Les mando la propuesta el jueves"}
+    writes = _rewrite([old], [ins(type="need", source_ref="M2", quote="Any update on the proposal",
+                                  text="Customer wants an update.")], THREAD)
+    assert ("update", "stable") in [(verb, params[-1]) for verb, params in writes]
+    assert not any(verb == "delete" for verb, _ in writes)
