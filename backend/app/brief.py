@@ -5,12 +5,15 @@ Kept short on purpose: per founder at most 3 actions, 5 attention rows; at most 
 
 import html
 import re
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Literal
 
 import anthropic
 from pydantic import BaseModel, Field
+
+from app.brief_text import TableText, read_table_text
 
 MAX_ACTIONS, MAX_ATTENTION, MAX_CHANGES, MAX_NDL = 3, 5, 8, 3
 QUIET_DAYS = 21
@@ -30,6 +33,7 @@ class Candidate:
     due: date | None = None
     link: str | None = None
     source: str | None = None
+    verification_ref: str | None = None
 
 
 @dataclass
@@ -142,12 +146,14 @@ def plan_for(client: anthropic.Anthropic, model: str, founder: str, cands: list[
     return r.parsed_output
 
 
-def fallback_plan(cands: list[Candidate], meetings: list[Meeting]) -> FounderPlan:
+def fallback_plan(cands: list[Candidate], meetings: list[Meeting], *, source_wording: bool = False) -> FounderPlan:
     """If Claude is unavailable: top candidates by score, deterministic wording."""
     top = sorted((c for c in cands), key=lambda c: -c.score)[:MAX_ACTIONS]
     return FounderPlan(
-        actions=[ChosenAction(candidate_id=c.id, do_today=c.detail[:60], why=c.label) for c in top],
-        preps=[PrepLine(meeting_index=n, prep="Review deal timeline before the call") for n in range(len(meetings))],
+        actions=[ChosenAction(candidate_id=c.id, do_today=c.detail, why=c.label) for c in top],
+        preps=[] if source_wording else [
+            PrepLine(meeting_index=n, prep="Review deal timeline before the call") for n in range(len(meetings))
+        ],
     )
 
 
@@ -179,6 +185,7 @@ class Row:
     link: str | None = None
     why: str | None = None    # set for undated priorities chosen by Claude
     owner_code: str | None = None  # deal owner, for routing to a founder's section
+    verification_ref: str | None = None
 
 
 def split_dated(rows: list[Row], today: date) -> tuple[list[Row], list[Row]]:
@@ -189,8 +196,18 @@ def split_dated(rows: list[Row], today: date) -> tuple[list[Row], list[Row]]:
 
 
 def priority_rows(chosen: list[tuple[Candidate, ChosenAction]]) -> list[Row]:
-    return [Row(c.deal, a.do_today, None, None, c.stage, c.source or "Deal profile", c.link, a.why)
+    return [Row(c.deal, a.do_today, None, None, c.stage, c.source or "Deal profile", c.link, a.why,
+                verification_ref=c.verification_ref)
             for c, a in chosen]
+
+
+@dataclass
+class VerificationNotes:
+    waiting: list[tuple[str, str]] = field(default_factory=list)
+    unclear: list[tuple[str, str]] = field(default_factory=list)
+
+    def sections(self) -> list[tuple[str, list[tuple[str, str]]]]:
+        return [("Waiting on the customer", self.waiting), ("Needs verification", self.unclear)]
 
 
 # ---------------------------------------------------------------- rendering (matches the approved v2 email)
@@ -244,12 +261,47 @@ def due_cell(due: date | None, today: date) -> str:
     return f"{_e(f'{due:%b} {due.day}')}{tail}"
 
 
-def rows_table(rows: list[Row], today: date) -> str:
+def _row_text(row: Row) -> TableText:
+    return TableText("What", f"{row.what} — {row.why}" if row.why else row.what)
+
+
+def _meeting_fields(meeting: Meeting, prep: str) -> tuple[TableText, TableText]:
+    return TableText("Meeting title", meeting.title), TableText("Prep", prep)
+
+
+def meeting_text_fields(meetings: list[tuple[Meeting, str]]) -> Iterator[TableText]:
+    for meeting, prep in meetings:
+        yield from _meeting_fields(meeting, prep)
+
+
+def meeting_text_rows(
+    meetings: list[tuple[Meeting, str]], display: Callable[[TableText], str],
+) -> Iterator[tuple[Meeting, str, str]]:
+    for meeting, prep in meetings:
+        title_field, prep_field = _meeting_fields(meeting, prep)
+        yield meeting, display(title_field), display(prep_field)
+
+
+def table_text_fields(sections: list[dict], ndl_rows: list[Row], changes: list[Change]) -> Iterator[TableText]:
+    for section in sections:
+        for rows in (section["today"], section["week"]):
+            yield from (_row_text(row) for row in rows[:MAX_ROWS])
+        yield from meeting_text_fields(section["meetings"])
+    yield from (_row_text(row) for row in ndl_rows[:MAX_ROWS])
+    yield from (TableText("What changed", change.text) for change in changes[:MAX_CHANGES])
+
+
+def rows_table(rows: list[Row], today: date, *, display: Callable[[TableText], str] = read_table_text) -> str:
     shown = rows[:MAX_ROWS]
     body = []
     for r in shown:
-        what = (f'<b>Priority:</b> {_e(r.what)}<br><span style="color:{MUTED};font-size:12px">{_e(r.why)}</span>'
-                if r.why else _e(r.what))
+        field = _row_text(r)
+        wording = display(field)
+        what = _e(wording)
+        if r.why:
+            if wording == field.text:
+                what = f'{_e(r.what)}<br><span style="color:{MUTED};font-size:12px">{_e(r.why)}</span>'
+            what = f'<b>Priority:</b> {what}'
         body.append("<tr>" + _td(f"<b>{_e(r.company)}</b>") + _td(what) + _td(due_cell(r.due, today), "white-space:nowrap")
                     + _td(_e(r.owner or "—")) + _td(_e(stage_short(r.stage)))
                     + _td(f'<span style="color:{MUTED};font-size:12px">{_link(r.source, r.link)}</span>') + "</tr>")
@@ -259,17 +311,36 @@ def rows_table(rows: list[Row], today: date) -> str:
             f"<tr>{head}</tr>{''.join(body)}</table>{_more(len(rows) - len(shown))}")
 
 
-def meetings_table(meetings: list[tuple["Meeting", str]]) -> str:
+def meetings_table(meetings: list[tuple[Meeting, str]], *, display: Callable[[TableText], str] = read_table_text) -> str:
     body = "".join(
-        "<tr>" + _td(_e(f"{m.at:%a} {m.at:%H:%M}"), "white-space:nowrap") + _td(_link(m.title, m.link))
+        "<tr>" + _td(_e(f"{m.at:%a} {m.at:%H:%M}"), "white-space:nowrap") + _td(_link(title, m.link))
         + _td(f"<b>{_e(m.deal or '—')}</b>") + _td(_e(stage_short(m.stage))) + _td(_e(prep)) + "</tr>"
-        for m, prep in meetings)
+        for m, title, prep in meeting_text_rows(meetings, display)
+    )
     head = _th("When", "11%") + _th("Meeting", "22%") + _th("Company", "17%") + _th("Sheet status", "12%") + _th("Prep")
     return (f'<table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%">'
             f"<tr>{head}</tr>{body}</table>")
 
 
-def render(sections: list[dict], ndl_rows: list[Row], changes: list[Change], today: date, active_deals: int) -> str:
+def verification_html(notes: VerificationNotes | None) -> str:
+    if notes is None:
+        return ""
+    return "".join(_h(title, AMBER, len(rows)) + "".join(
+        f'<p style="margin:3px 0;font:13px {FONT}"><b>{_e(deal)}</b> · {_e(action)}</p>'
+        for deal, action in rows
+    ) for title, rows in notes.sections() if rows)
+
+
+def verification_text(notes: VerificationNotes | None) -> list[str]:
+    if notes is None:
+        return []
+    return [line for title, rows in notes.sections() if rows
+            for line in (f"{title} ({len(rows)})", *(f"• {deal} — {action}" for deal, action in rows))]
+
+
+def render(sections: list[dict], ndl_rows: list[Row], changes: list[Change], today: date, active_deals: int,
+           ndl_review: VerificationNotes | None = None, *,
+           display: Callable[[TableText], str] = read_table_text) -> str:
     counts = " · ".join(f"{s['short']}: {len(s['today'])} to do today, {len(s['week'])} due this week" for s in sections)
     out = [f'<div style="max-width:720px;margin:0 auto;padding:8px 4px">',
            f'<p style="font:600 18px {FONT};margin:0 0 2px;color:{INK}">Pipeline brief · {_e(f"{today:%a}, {today:%b} {today.day}")}</p>',
@@ -278,23 +349,29 @@ def render(sections: list[dict], ndl_rows: list[Row], changes: list[Change], tod
         out.append(f'<p style="margin:24px 0 0;padding:6px 10px;background:#f2f4f7;border-left:3px solid {BLUE};'
                    f'font:600 14px {FONT};color:{INK}">{_e(s["name"])}</p>')
         out.append(_h("To do today", RED, len(s["today"])))
-        out.append(rows_table(s["today"], today) if s["today"] else _empty("Nothing overdue, due today, or prioritized."))
+        out.append(rows_table(s["today"], today, display=display) if s["today"]
+                   else _empty("Nothing overdue, due today, or prioritized."))
         if s.get("hidden"):
             n = s["hidden"]
             out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">{n} item{"s" if n != 1 else ""} '
                        f'hidden: later emails/notes suggest {"they were" if n != 1 else "it was"} done.</p>')
         out.append(_h("Due this week", AMBER, len(s["week"])))
-        out.append(rows_table(s["week"], today) if s["week"] else _empty("Nothing else due in the next 7 days."))
+        out.append(rows_table(s["week"], today, display=display) if s["week"]
+                   else _empty("Nothing else due in the next 7 days."))
         out.append(_h("Meetings today & tomorrow", BLUE, len(s["meetings"])))
-        out.append(meetings_table(s["meetings"]) if s["meetings"] else _empty("No customer meetings today or tomorrow."))
-    if ndl_rows:
+        out.append(meetings_table(s["meetings"], display=display) if s["meetings"]
+                   else _empty("No customer meetings today or tomorrow."))
+        out.append(verification_html(s.get("verification")))
+    if ndl_rows or (ndl_review and (ndl_review.waiting or ndl_review.unclear)):
         out.append(f'<p style="margin:24px 0 0;padding:6px 10px;background:#f2f4f7;border-left:3px solid {MUTED};'
                    f'font:600 14px {FONT};color:{INK}">Nico de León\'s deals · urgent only</p>')
-        out.append(rows_table(ndl_rows, today))
+        if ndl_rows:
+            out.append(rows_table(ndl_rows, today, display=display))
+        out.append(verification_html(ndl_review))
     out.append(_h("Changed since last brief", MUTED, len(changes[:MAX_CHANGES])))
     if changes:
-        body = "".join("<tr>" + _td(f"<b>{_e(c.deal)}</b>") + _td(_link(c.text, c.link)) + _td(_e(c.owner_code or "—"))
-                       + "</tr>" for c in changes[:MAX_CHANGES])
+        body = "".join("<tr>" + _td(f"<b>{_e(c.deal)}</b>") + _td(_link(display(TableText("What changed", c.text)), c.link))
+                       + _td(_e(c.owner_code or "—")) + "</tr>" for c in changes[:MAX_CHANGES])
         out.append(f'<table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%">'
                    f'<tr>{_th("Company", "22%")}{_th("What changed")}{_th("Owner", "10%")}</tr>{body}</table>')
     else:
@@ -309,7 +386,8 @@ def subject(sections: list[dict], today: date) -> str:
     return f"Bianca pipeline · {today:%a}, {today:%b} {today.day} · " + " · ".join(bits)
 
 
-def plain_text(sections: list[dict], today: date) -> str:
+def plain_text(sections: list[dict], today: date, ndl_review: VerificationNotes | None = None, *,
+               display: Callable[[TableText], str] = read_table_text) -> str:
     lines = [f"Pipeline brief · {today:%a}, {today:%b} {today.day}"]
     for s in sections:
         lines.append(f"\n{s['name'].upper()}")
@@ -317,7 +395,10 @@ def plain_text(sections: list[dict], today: date) -> str:
             lines.append(f"{title} ({len(rows)})")
             for r in rows[:MAX_ROWS]:
                 due = f"due {r.due:%b} {r.due.day}" if r.due else "priority"
-                lines.append(f"• {r.company} — {r.what} ({due}) — {r.source}")
-        for m, prep in s["meetings"]:
-            lines.append(f"• {m.at:%a %H:%M} {m.title} — {prep}")
+                lines.append(f"• {r.company} — {display(_row_text(r))} ({due}) — {r.source}")
+        for m, title, prep in meeting_text_rows(s["meetings"], display):
+            lines.append(f"• {m.at:%a %H:%M} {title} — {prep}")
+        lines.extend(verification_text(s.get("verification")))
+    if ndl_review and (ndl_review.waiting or ndl_review.unclear):
+        lines += ["\nNICO DE LEÓN", *verification_text(ndl_review)]
     return "\n".join(lines)

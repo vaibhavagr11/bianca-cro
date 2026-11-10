@@ -1,8 +1,8 @@
 """Morning brief v2: compact, deal-level, owner-checked. Pure rules and rendering; brief_api gathers the data.
 
 Per founder, in reading order: needs you today (time-critical only), deals to move (one line per prospect or
-pilot: situation, one next move, date, evidence), customer accounts (one line each), meetings, follow-ups that may
-be needed, deals whose status to confirm, and a one-line backlog summary. Shared: what changed (from new,
+pilot: situation, one next move, date, evidence), waiting on their reply, meetings, follow-ups that may be
+needed, deals whose status to confirm, and a one-line backlog summary. Shared: what changed (from new,
 quote-checked insights) and Nico de León's urgent items.
 
 Every rule here is deterministic. The existing planner call only shortens the suggested moves it picks and writes
@@ -15,15 +15,18 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 from app.brief import (
-    AMBER, BLUE, FONT, INK, MUTED, RED, Meeting, _e, _empty, _h, _link, _td, _th, meetings_table, stage_short,
+    AMBER, BLUE, FONT, INK, MUTED, RED, Meeting, VerificationNotes, _e, _empty, _h, _link, _td, _th,
+    meeting_text_fields, meeting_text_rows, meetings_table, stage_short, verification_html, verification_text,
 )
+from app.brief_text import TableText, read_table_text
 
 ACTIVE_DAYS = 14            # last recorded interaction within this = active
 UNCLEAR_DAYS = 45           # 15..45 days = status unclear (confirm); older = dormant
 REPLY_DAYS = 7              # customer email this recent + a question/request = reply needed
 PROPOSAL_FOLLOWUP_DAYS = (7, 30)   # our proposal with no reply after this many days = follow-up may be needed
 UNDATED_WINDOW_DAYS = 45
-MAX_HIGHLIGHTS, MAX_CUSTOMERS, MAX_FOLLOWUPS, MAX_EXCEPTIONS, MAX_NAMES = 4, 4, 3, 1, 3
+MAX_HIGHLIGHTS, MAX_FOLLOWUPS, MAX_EXCEPTIONS, MAX_NAMES = 4, 3, 1, 3
+MAX_WAITING = 6
 IN_TALKS_RANK = 2
 REQUEST_FRESH_DAYS = 21       # a customer request this recent still counts as outstanding
 CHANGE_QUOTA = {0: 3, 1: 2, 2: 0}  # what changed: prospects/pilots, customers, other
@@ -107,6 +110,7 @@ class Move:
     item_id: str | None = None
     source: str = ""                # where it comes from and when, e.g. "Email · Oct 6"
     done: str | None = None         # what "Mark as complete" closes: insight:<id> | thread:<id> | rec:<ref>
+    deal: str | None = None
 
 
 @dataclass
@@ -132,6 +136,7 @@ class ChangeRow:
     link: str | None
     kind: str = "new"               # new | late | sheet
     event: date | None = None       # when it happened (from the source, not when we stored it)
+    title_only: bool = False        # only the subject/title is established, not what was agreed
 
 
 @dataclass
@@ -230,7 +235,108 @@ def reply_label(u: Unanswered) -> str:
 def reply_text(u: Unanswered) -> str:
     """What to do about an unanswered customer email: the extracted request if there is one, otherwise a neutral
     instruction. Never an action invented from the subject line."""
-    return u.action or f"Review the customer's email and decide the response needed ({u.subject[:60]})"
+    instruction = "Review the customer's email and decide the response needed"
+    if u.action:
+        return u.action
+    return f"{instruction} ({u.subject})." if u.subject else f"{instruction}."
+
+
+# Mail no person wrote: out-of-office replies, bounces, meeting-notes bots and no-reply notifications. They never
+# mean a customer is waiting on us, and an out-of-office does not mean the customer answered.
+AUTO_SUBJECT_RE = re.compile(
+    r"^\s*(automatic reply|auto[- ]?reply|autoreply|auto[- ]?response|out of (the )?office|ooo\b|"
+    r"respuesta autom[aá]tica|resposta autom[aá]tica|r[ée]ponse automatique|fuera de (la )?oficina|"
+    r"abwesenheitsnotiz|undeliverable|delivery status notification|mail delivery (failed|subsystem))", re.I)
+AUTO_SENDER_RE = re.compile(
+    r"(no-?reply|do-?not-?reply|^mailer-daemon@|^postmaster@|^bounces?[+@-]|^gemini-notes@|^calendar-notification@"
+    r"|@([^@]*\.)?notifications?\.)", re.I)
+WAITING_DAYS = (7, 60)      # whole elapsed days since our latest real outbound message
+
+
+def is_automated(senders: list[str], subject: str | None) -> bool:
+    return bool(AUTO_SUBJECT_RE.match(subject or "")) or any(AUTO_SENDER_RE.search(a or "") for a in senders)
+
+
+@dataclass
+class Waiting:
+    """A thread where we wrote last and are still expecting the customer's response."""
+    deal: str
+    stage: str | None
+    to: str                         # who we wrote to
+    sent: date                      # our latest email
+    days: int
+    nudges: int                     # our emails in a row since their last real reply
+    replied_before: bool            # they had answered earlier in this thread
+    auto_reply: bool                # an out-of-office came back after our latest email
+    link: str | None
+    source: str = ""
+    thread_id: str | None = None
+    owner: str | None = None        # whose section it goes to: who sent it, else the deal owner
+    rank: int | None = None
+
+
+def waiting_on_them(thread: list[dict], internal: set[str], now: datetime) -> dict | None:
+    """The latest real message is our 7–60 day old outbound with a verified open reply expectation.
+
+    Each message: {"at": datetime, "from": [address], "to": [{"address", "name"}], "cc": [...], "automated": bool},
+    oldest first. Returns {"last", "to", "days", "nudges", "replied_before", "auto_reply"} or None.
+    """
+    dom = lambda a: (a or "").rsplit("@", 1)[-1].lower()
+    ours = lambda m: bool(m["from"]) and all(dom(a) in internal for a in m["from"])
+    real = [m for m in thread if not m["automated"]]
+    if not real or not ours(real[-1]):
+        return None
+    last = real[-1]
+    days = (now - last["at"]).days
+    if not WAITING_DAYS[0] <= days <= WAITING_DAYS[1]:
+        return None
+    people = [p for p in (last.get("to") or []) + (last.get("cc") or [])
+              if dom(p.get("address")) not in internal and not AUTO_SENDER_RE.search(p.get("address") or "")]
+    if not people:
+        return None                 # an internal-only thread: nobody outside to wait for
+    expectation = last.get("reply_expectation")
+    if not isinstance(expectation, dict) or expectation.get("state") != "expected":
+        return None
+    if (not last.get("external_id") or not last.get("content_hash")
+            or expectation.get("latest_message_id") != last["external_id"]
+            or expectation.get("latest_content_hash") != last["content_hash"]):
+        return None
+    evidence_id, evidence_hash = expectation.get("evidence_message_id"), expectation.get("evidence_content_hash")
+    if not evidence_id or not evidence_hash or not any(
+        m.get("external_id") == evidence_id and m.get("content_hash") == evidence_hash for m in real
+    ):
+        return None
+    nudges = 0
+    for m in reversed(real):
+        if not ours(m):
+            break
+        nudges += 1
+    names = [(p.get("name") or "").strip() or p["address"] for p in people[:2]]
+    to = ", ".join(names) + (f" +{len(people) - 2}" if len(people) > 2 else "")
+    return {"last": last, "to": to, "days": days, "nudges": nudges,
+            "replied_before": any(not ours(m) for m in real),
+            "auto_reply": any(m["automated"] and m["at"] > last["at"] for m in thread)}
+
+
+def pick_waiting(waiting: list[Waiting], code: str) -> tuple[list[Waiting], int]:
+    """This founder's waits: prospects and pilots first, then the most recent silence (still worth a nudge)."""
+    mine = sorted((w for w in waiting if w.owner == code), key=lambda w: (w.rank not in PROSPECT_RANKS, w.days, w.deal))
+    return mine[:MAX_WAITING], max(0, len(mine) - MAX_WAITING)
+
+
+def waiting_text(w: Waiting) -> str:
+    """What the founder needs: who, since when, and what came back."""
+    return f"To {w.to} · {_waiting_status(w)}"
+
+
+def _waiting_status(w: Waiting) -> str:
+    if w.replied_before:
+        bits = [f"{w.nudges} emails since their last reply" if w.nudges > 1 else "no reply to our last email"]
+    else:
+        bits = [f"no reply to our {w.nudges} emails" if w.nudges > 1 else "no reply yet"]
+    if w.auto_reply:
+        bits.append("out-of-office received")
+    return ", ".join(bits)
 
 
 def first_sentence(text: str, limit: int = 95) -> str:
@@ -249,11 +355,11 @@ def addresses(evidence: frozenset, blocker: Note) -> bool:
 
 
 def item_move(tag: str, text: str, when: str, i: Item) -> Move:
-    return Move(tag, text, when, i.link, i.id, i.source, f"insight:{i.id}")
+    return Move(tag, text, when, i.link, i.id, i.source, f"insight:{i.id}", i.deal)
 
 
-def email_move(tag: str, text: str, when: str, u: Unanswered) -> Move:
-    return Move(tag, text, when, u.link, None, u.source, f"thread:{u.thread_id}" if u.thread_id else None)
+def email_move(tag: str, text: str, when: str, u: Unanswered, deal: str | None = None) -> Move:
+    return Move(tag, text, when, u.link, None, u.source, f"thread:{u.thread_id}" if u.thread_id else None, deal)
 
 
 def note_move(tag: str, text: str, when: str, n: Note, link: str | None) -> Move:
@@ -278,7 +384,7 @@ def primary_move(d: DealView, today: date, used: set[str]) -> Move:
             return item_move(tag, i.text, when, i)
         for r in d.recommendations:
             if r.verified and addresses(r.evidence, b):
-                return note_move("AI recommendation", first_sentence(r.text), _last(d, today), r, r.link)
+                return note_move("AI recommendation", r.text, _last(d, today), r, r.link)
         return Move("Clarify next action", "No recorded action or suggestion addresses this blocker yet",
                     _last(d, today), b.link, None, b.source)
     for i in sorted((i for i in open_items if i.kind == "owed" and i.bucket in ("overdue", "week")),
@@ -289,16 +395,16 @@ def primary_move(d: DealView, today: date, used: set[str]) -> Move:
                     key=lambda i: -i.recorded.toordinal()):
         return item_move("Customer asked", i.text, f"asked {_date(i.recorded)}", i)
     if d.unanswered and reply_label(d.unanswered) == "follow_up":
-        return email_move("Follow up", reply_text(d.unanswered), f"email {d.unanswered.days}d ago", d.unanswered)
+        return email_move("Follow up", reply_text(d.unanswered), f"email {d.unanswered.days}d ago", d.unanswered, d.deal)
     if d.recommendation and d.recommendation.verified:
-        return note_move("AI recommendation", first_sentence(d.recommendation.text), _last(d, today), d.recommendation,
+        return note_move("AI recommendation", d.recommendation.text, _last(d, today), d.recommendation,
                          d.recommendation.link)
     for i in sorted((i for i in open_items if i.kind == "proposed"), key=lambda i: -i.recorded.toordinal()):
         age = (today - i.recorded).days
         if PROPOSAL_FOLLOWUP_DAYS[0] <= age <= PROPOSAL_FOLLOWUP_DAYS[1] and (d.last_contact or i.recorded) <= i.recorded:
             return item_move("Follow up", f"No reply since we proposed: {i.text}", f"proposed {_date(i.recorded)}", i)
     if d.recommendation:
-        return note_move("AI recommendation", first_sentence(d.recommendation.text) + " (profile not verified)",
+        return note_move("AI recommendation", d.recommendation.text + " (profile not verified)",
                          _last(d, today), d.recommendation, None)
     return Move("Confirm status", "Check where this deal stands", _last(d, today), None)
 
@@ -308,10 +414,10 @@ def _last(d: DealView, today: date) -> str:
 
 
 def situation(d: DealView) -> Note | None:
-    """One evidence-backed line: the blocker if verified, else the profile summary's first sentence if verified."""
+    """The verified blocker or summary, with full wording for the display pass."""
     for n in (d.blocker, d.summary):
         if n and n.verified:
-            return Note(first_sentence(n.text), verified=True, link=n.link)
+            return n
     return None
 
 
@@ -443,7 +549,7 @@ def describe_change(type_: str, owner_side: str | None, kind: str | None, title_
         cat = "progress"
     else:
         cat = type_
-    return cat, f"{CHANGE_LABELS.get(cat, cat)}: {first_sentence(text, 140)}"
+    return cat, f"{CHANGE_LABELS.get(cat, cat)}: {text}"
 
 
 def change_group(rank: int | None) -> int:
@@ -482,7 +588,6 @@ class Section:
     today: list[TodayRow]
     highlights: list[tuple[DealView, Move, Note | None]]
     also_active: list[str]
-    customers: list[tuple[DealView, Move]]
     meetings: list[tuple[Meeting, str]]
     followups: list[Move]
     followup_deals: list[str]
@@ -493,6 +598,9 @@ class Section:
     hidden: int = 0
     all_items: list[Item] = field(default_factory=list)   # everything routed here, for the payload
     audit: list[SelectionRecord] = field(default_factory=list)
+    waiting: list["Waiting"] = field(default_factory=list)  # we wrote last, no answer yet (set after selection)
+    more_waiting: int = 0
+    verification: VerificationNotes | None = None
 
 
 def build_section(code: str, name: str, short: str, views: dict[str, DealView], items: list[Item],
@@ -551,7 +659,6 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
             audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
                                          f"not eligible: status {status}" + (f", last record {_date(v.last_contact)}"
                                                                              if v.last_contact else "")))
-    recency = lambda v: -(v.last_contact.toordinal()) if v.last_contact else 0
     highlights = []
     for v in selected:
         m = primary_move(v, today, used)
@@ -559,14 +666,6 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
             used.add(m.item_id)
         highlights.append((v, m, situation(v)))
     shown = {v.deal for v, _, _ in highlights}
-
-    customers = []
-    for v in sorted((v for v in owned if v.rank == CUSTOMER_RANK), key=lambda v: (v.deal not in in_today, recency(v), v.deal)):
-        if len(customers) < MAX_CUSTOMERS:
-            m = primary_move(v, today, used)
-            if m.item_id:
-                used.add(m.item_id)
-            customers.append((v, m))
 
     # Follow-ups that may be needed (not today): unanswered without a request or older, recent overdue promises,
     # our proposals with no reply, customer requests on deals not shown above.
@@ -582,7 +681,7 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
             continue
         if v.unanswered and reply_label(v.unanswered) == "follow_up":
             follow.append(email_move("Follow up", f"{v.deal}: {reply_text(v.unanswered)}",
-                                     f"email {v.unanswered.days}d ago", v.unanswered))
+                                      f"email {v.unanswered.days}d ago", v.unanswered, v.deal))
         for i in v.items:
             if i.id in used:
                 continue
@@ -611,7 +710,7 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
 
     return Section(code, name, short, today_rows, highlights, [r.deal for r in audit if r.position is None
                                                                 and not r.reason.startswith("not eligible")],
-                   customers, meetings, follow_shown, [], len(follow) - len(follow_shown), unclear, dormant, b,
+                   meetings, follow_shown, [], len(follow) - len(follow_shown), unclear, dormant, b,
                    hidden, routed, audit)
 
 
@@ -619,6 +718,50 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
 
 TAG_COLOR = {"Due now": RED, "Reply needed": BLUE, "We owe": INK, "Customer asked": BLUE,
              "AI recommendation": PURPLE, "Follow up": AMBER, "Confirm status": MUTED, "Clarify next action": AMBER}
+
+# sRGB background/foreground pairs sampled from the pipeline Sheet. Each pair has at least 4.5:1 contrast.
+STAGE_BADGES = {
+    "paused": ("Paused", "#ffcfc8", "#b10202"),
+    "opening": ("Opening", "#bfe1f6", "#0953a8"),
+    "in talks": ("In Talks", "#ffe59f", "#473821"),
+    "proposal": ("Proposal", "#e6cff3", "#5b3286"),
+    "pilot": ("Pilot", "#d4edbb", "#13734b"),
+    "working client": ("Working Client", "#13734b", "#d4edbb"),
+}
+UNKNOWN_STAGE_COLORS = ("#e5e7eb", "#344054")
+
+
+def _stage_badge(stage: str | None) -> str:
+    label = " ".join(stage_short((stage or "").strip()).split())
+    key = label.casefold()
+    label, background, foreground = STAGE_BADGES.get(key, (label, *UNKNOWN_STAGE_COLORS))
+    suffix = key.replace(" ", "-") if key in STAGE_BADGES else "unknown"
+    return (f'<span class="deal-stage deal-stage--{suffix}" style="display:inline-block;margin-top:4px;'
+            f'padding:2px 6px;border-radius:4px;background-color:{background};color:{foreground};'
+            f'font:600 12px/1.4 {FONT};white-space:nowrap">{_e(label)}</span>')
+
+
+def _deal_cell(company: str, stage: str | None) -> str:
+    return f"<b>{_e(company)}</b><br>{_stage_badge(stage)}"
+
+
+def _stage_css() -> str:
+    """Keep both badge colors together in clients supporting dark CSS; inline styles are the fallback.
+
+    The sender accepts an HTML fragment, so do not opt the rest of the email into dark mode with head metadata.
+    Clients that force their own color changes still need inbox checks.
+    """
+    colors = [(key.replace(" ", "-"), background, foreground) for key, (_, background, foreground) in STAGE_BADGES.items()]
+    colors.append(("unknown", *UNKNOWN_STAGE_COLORS))
+
+    def rule(selector: str, background: str, foreground: str) -> str:
+        return f"{selector}{{background-color:{background}!important;color:{foreground}!important}}"
+
+    dark = "".join(rule(f".bianca-brief .deal-stage--{key}", background, foreground)
+                   for key, background, foreground in colors)
+    outlook = "".join(rule(f"[data-ogsc] .bianca-brief .deal-stage--{key},[data-ogsb] .bianca-brief .deal-stage--{key}",
+                           background, foreground) for key, background, foreground in colors)
+    return f"<style>@media (prefers-color-scheme:dark){{{dark}}}{outlook}</style>"
 
 
 def _tag(text: str) -> str:
@@ -649,15 +792,53 @@ def _done(ref: str | None, action_url) -> str:
             f'border-radius:4px;font:12px {FONT};color:#344054;text-decoration:none;white-space:nowrap">✓ Done</a>')
 
 
-def render_section(s: Section, today: date, nico_gap: bool, action_url=None) -> str:
+def _what_text(row: TodayRow) -> TableText:
+    if row.tag == "Reply needed" and row.text.startswith("Review the customer's email and decide the response needed"):
+        return TableText("What (reply needed, email subject only)", row.text,
+                         required=("Review the customer's email",))
+    return TableText(f"What ({row.tag})", row.text)
+
+
+def _move_text(move: Move) -> TableText:
+    required = ("profile not verified",) if move.text.endswith("(profile not verified)") else ()
+    return TableText(f"Next move ({move.tag})", move.text, required=required)
+
+
+def _waiting_text(waiting: Waiting) -> TableText:
+    status = _waiting_status(waiting)
+    return TableText("Who · status", waiting_text(waiting), required=(status,),
+                     fallback=f"Waiting for their reply · {status}")
+
+
+def _change_text(change: ChangeRow) -> TableText:
+    kind = "What changed (recorded subject or title only)" if change.title_only else "What changed"
+    return TableText(kind, change.text)
+
+
+def table_text_fields(sections: list[Section], ndl_rows: list[TodayRow], changes: list[ChangeRow]):
+    """Narrative fields from the same rows that appear in the v2 tables."""
+    for section in sections:
+        yield from map(_what_text, section.today)
+        for _, move, situation in section.highlights:
+            if situation:
+                yield TableText("Situation", situation.text)
+            yield _move_text(move)
+        yield from map(_move_text, section.followups)
+        yield from map(_waiting_text, section.waiting)
+        yield from meeting_text_fields(section.meetings)
+    yield from map(_what_text, ndl_rows)
+    yield from map(_change_text, changes)
+
+
+def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, display=read_table_text) -> str:
     done_th = _th("", "9%") if action_url else ""
     done_td = (lambda ref: _td(_done(ref, action_url))) if action_url else (lambda ref: "")
     out = [f'<p style="margin:24px 0 0;padding:6px 10px;background:#f2f4f7;border-left:3px solid {BLUE};'
            f'font:600 14px {FONT};color:{INK}">{_e(s.name)}</p>']
     out.append(_h("Needs you today", RED, len(s.today)))
     out.append(_table(_th("Deal", "20%") + _th("What") + _th("When", "13%") + _th("Source", "12%") + done_th,
-                      ["<tr>" + _td(f"<b>{_e(r.deal)}</b> {_muted(_e(stage_short(r.stage)))}")
-                       + _td(f"{_tag(r.tag)} {_e(first_sentence(r.text))}") + _td(_muted(_e(r.when))) + _td(_src(r.source))
+                      ["<tr>" + _td(_deal_cell(r.deal, r.stage))
+                       + _td(f"{_tag(r.tag)} {_e(display(_what_text(r)))}") + _td(_muted(_e(r.when))) + _td(_src(r.source))
                        + done_td(r.done) + "</tr>"
                        for r in s.today]) if s.today else _empty("Nothing due now or waiting on your reply."))
 
@@ -666,10 +847,10 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None) -> 
         rows = []
         for v, m, sit in s.highlights:
             gap = " · Nico's inbox not connected" if nico_gap and v.owner == "NC" else ""
-            sit_html = _e(sit.text) if sit else _muted("—")
-            rows.append("<tr>" + _td(f"<b>{_e(v.deal)}</b><br>{_muted(_e(stage_short(v.stage)))}", "width:16%")
+            sit_html = _e(display(TableText("Situation", sit.text))) if sit else _muted("—")
+            rows.append("<tr>" + _td(_deal_cell(v.deal, v.stage), "width:16%")
                         + _td(sit_html, "width:30%")
-                        + _td(f"{_tag(m.tag)} {_e(first_sentence(m.text))}<br>{_muted(_e(m.when + gap))}")
+                        + _td(f"{_tag(m.tag)} {_e(display(_move_text(m)))}<br>{_muted(_e(m.when + gap))}")
                         + _td(_src(m.source), "width:12%") + done_td(m.done) + "</tr>")
         out.append(_table(_th("Deal") + _th("Situation") + _th("Next move") + _th("Source") + done_th, rows))
     else:
@@ -677,18 +858,21 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None) -> 
     if s.also_active:
         out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">Also active: {_e(", ".join(s.also_active))}</p>')
 
-    if s.customers:
-        out.append(_h("Customer accounts", AMBER, len(s.customers)))
-        out.append(_table(_th("Account", "20%") + _th("Next move") + _th("Source", "12%") + done_th,
-                          ["<tr>" + _td(f"<b>{_e(v.deal)}</b>") + _td(f"{_tag(m.tag)} {_e(first_sentence(m.text))} {_muted(_e(m.when))}")
-                           + _td(_src(m.source)) + done_td(m.done) + "</tr>" for v, m in s.customers]))
+    if s.waiting:
+        out.append(_h("Waiting on their reply", AMBER, len(s.waiting) + s.more_waiting))
+        out.append(_table(_th("Deal", "20%") + _th("Who · status") + _th("Waiting", "13%") + _th("Source", "12%") + done_th,
+                          ["<tr>" + _td(_deal_cell(w.deal, w.stage)) + _td(_e(display(_waiting_text(w))))
+                           + _td(_muted(_e(f"{w.days}d since {_date(w.sent)}"))) + _td(_src(w.source))
+                           + done_td(f"thread:{w.thread_id}" if w.thread_id else None) + "</tr>" for w in s.waiting]))
+        if s.more_waiting:
+            out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">+ {s.more_waiting} more on record</p>')
 
     out.append(_h("Meetings today & tomorrow", BLUE, len(s.meetings)))
-    out.append(meetings_table(s.meetings) if s.meetings else _empty("No customer meetings today or tomorrow."))
+    out.append(meetings_table(s.meetings, display=display) if s.meetings else _empty("No customer meetings today or tomorrow."))
 
     if s.followups:
         out.append(_h("Follow-ups that may be needed", AMBER, len(s.followups) + s.more_followups))
-        lines = "".join(f'<p style="margin:3px 0;font:13px/1.4 {FONT};color:{INK}">{_tag(m.tag)} {_e(first_sentence(m.text))} '
+        lines = "".join(f'<p style="margin:3px 0;font:13px/1.4 {FONT};color:{INK}">{_tag(m.tag)} {_e(display(_move_text(m)))} '
                         f'{_muted(_e(m.when + (" · " + m.source if m.source else "")))} {_done(m.done, action_url)}</p>'
                         for m in s.followups)
         more = (f'<p style="margin:3px 0;font:12px {FONT};color:{MUTED}">+ {s.more_followups} more on record</p>'
@@ -707,7 +891,8 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None) -> 
     b = s.backlog
     if b.count:
         top = f", most on {b.top[0]} ({b.top[1]})" if b.top else ""
-        notes.append(f"<b>Backlog:</b> {b.count} older open items, {b.deals} deals{_e(top)}, since {_date(b.oldest)}. "
+        label = "older items on record" if s.verification is not None else "older open items"
+        notes.append(f"<b>Backlog:</b> {b.count} {label}, {b.deals} deals{_e(top)}, since {_date(b.oldest)}. "
                      f"Kept on record; may be done outside our sources.")
         for i in b.exceptions:
             notes.append(f"&nbsp;&nbsp;• Promised to {_e(i.deal)}: {_e(i.text)} "
@@ -718,7 +903,7 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None) -> 
         notes.append(f"{s.hidden} item(s) hidden: later emails/notes suggest they were done.")
     if notes:
         out.append("".join(f'<p style="margin:6px 0 0;font:12px/1.5 {FONT};color:{MUTED}">{n}</p>' for n in notes))
-    return "".join(out)
+    return "".join(out) + verification_html(s.verification)
 
 
 def change_label(c: ChangeRow) -> str:
@@ -732,8 +917,10 @@ def completable(sections: list[Section], ndl_rows: list[TodayRow]) -> dict[str, 
     out: dict[str, tuple[str, str]] = {}
     for s in sections:
         rows = [(r.done, r.deal, r.text) for r in s.today]
-        rows += [(m.done, v.deal, m.text) for v, m, _ in s.highlights] + [(m.done, v.deal, m.text) for v, m in s.customers]
+        rows += [(m.done, v.deal, m.text) for v, m, _ in s.highlights]
         rows += [(m.done, m.text.split(":", 1)[0], m.text.split(":", 1)[-1].strip()) for m in s.followups]
+        rows += [(f"thread:{w.thread_id}" if w.thread_id else None, w.deal, f"Waiting on their reply: {waiting_text(w)}")
+                 for w in s.waiting]
         for ref, deal, text in rows:
             if ref:
                 out.setdefault(ref, (deal, text))
@@ -744,24 +931,28 @@ def completable(sections: list[Section], ndl_rows: list[TodayRow]) -> dict[str, 
 
 
 def render(sections: list[Section], ndl_rows: list[TodayRow], changes: list[ChangeRow], today: date,
-           active_deals: int, coverage: str, nico_gap: bool, backfill: str | None = None, action_url=None) -> str:
+           active_deals: int, coverage: str, nico_gap: bool, backfill: str | None = None, action_url=None,
+           ndl_review: VerificationNotes | None = None, *, display=read_table_text) -> str:
     """action_url(ref) -> link for a row's "Mark as complete" button; None leaves the buttons out."""
     counts = " · ".join(f"{s.short}: {len(s.today)} today, {len(s.highlights)} deals" for s in sections)
-    out = [f'<div style="max-width:760px;margin:0 auto;padding:8px 4px">',
+    out = [_stage_css(), f'<div class="bianca-brief" style="max-width:760px;margin:0 auto;padding:8px 4px">',
            f'<p style="font:600 18px {FONT};margin:0 0 2px;color:{INK}">Pipeline brief · {_e(f"{today:%a}, {today:%b} {today.day}")}</p>',
            f'<p style="font:13px {FONT};margin:0;color:{MUTED}">{_e(counts)} · {active_deals} deals in the Sheet</p>']
-    out += [render_section(s, today, nico_gap, action_url) for s in sections]
-    if ndl_rows:
+    out += [render_section(s, today, nico_gap, action_url, display=display) for s in sections]
+    if ndl_rows or (ndl_review and (ndl_review.waiting or ndl_review.unclear)):
         out.append(f'<p style="margin:24px 0 0;padding:6px 10px;background:#f2f4f7;border-left:3px solid {MUTED};'
                    f'font:600 14px {FONT};color:{INK}">Nico de León · urgent only</p>')
-        out.append(_table(_th("Deal", "20%") + _th("What") + _th("When", "13%") + _th("Source", "12%")
-                          + (_th("", "9%") if action_url else ""),
-                          ["<tr>" + _td(f"<b>{_e(r.deal)}</b>") + _td(f"{_tag(r.tag)} {_e(r.text)}")
-                           + _td(_muted(_e(r.when))) + _td(_src(r.source))
-                           + (_td(_done(r.done, action_url)) if action_url else "") + "</tr>" for r in ndl_rows]))
+        if ndl_rows:
+            out.append(_table(_th("Deal", "20%") + _th("What") + _th("When", "13%") + _th("Source", "12%")
+                              + (_th("", "9%") if action_url else ""),
+                              ["<tr>" + _td(_deal_cell(r.deal, r.stage)) + _td(f"{_tag(r.tag)} {_e(display(_what_text(r)))}")
+                               + _td(_muted(_e(r.when))) + _td(_src(r.source))
+                               + (_td(_done(r.done, action_url)) if action_url else "") + "</tr>" for r in ndl_rows]))
+        out.append(verification_html(ndl_review))
     out.append(_h("What changed since the last brief", MUTED, len(changes)))
     out.append(_table(_th("Deal", "20%") + _th("What changed (from the source)") + _th("Source", "12%"),
-                      ["<tr>" + _td(f"<b>{_e(c.deal)}</b>") + _td(f"{_e(first_sentence(c.text, 100))} {_muted(_e(change_label(c)))}")
+                      ["<tr>" + _td(f"<b>{_e(c.deal)}</b>")
+                       + _td(f"{_e(display(_change_text(c)))} {_muted(_e(change_label(c)))}")
                        + _td(_src(f"{c.source} · {_date(c.event)}" if c.event else c.source)) + "</tr>" for c in changes])
                 if changes else _empty("No notable changes."))
     if backfill:
@@ -776,16 +967,23 @@ def subject(sections: list[Section], today: date) -> str:
     return f"Bianca pipeline · {today:%a}, {today:%b} {today.day} · " + " · ".join(bits)
 
 
-def plain_text(sections: list[Section], today: date) -> str:
+def plain_text(sections: list[Section], today: date, ndl_review: VerificationNotes | None = None, *,
+               display=read_table_text) -> str:
     lines = [f"Pipeline brief · {today:%a}, {today:%b} {today.day}"]
     for s in sections:
         lines.append(f"\n{s.name.upper()}\nNeeds you today ({len(s.today)})")
-        lines += [f"• [{r.tag}] {r.deal} — {r.text} ({r.when})" for r in s.today]
+        lines += [f"• [{r.tag}] {r.deal} — {display(_what_text(r))} ({r.when})" for r in s.today]
         lines.append(f"Deals to move ({len(s.highlights)})")
-        lines += [f"• {v.deal} ({stage_short(v.stage)}): [{m.tag}] {m.text} ({m.when})" for v, m, _ in s.highlights]
-        lines += [f"• {v.deal} (customer): [{m.tag}] {m.text}" for v, m in s.customers]
-        lines += [f"• {m.at:%a %H:%M} {m.title} — {p}" for m, p in s.meetings]
-        lines += [f"• [{m.tag}] {m.text} ({m.when})" for m in s.followups]
+        lines += [f"• {v.deal} ({stage_short(v.stage)}): [{m.tag}] {display(_move_text(m))} ({m.when})"
+                  for v, m, _ in s.highlights]
+        lines += [f"• {m.at:%a %H:%M} {title} — {prep}" for m, title, prep in meeting_text_rows(s.meetings, display)]
+        lines += [f"• [{m.tag}] {display(_move_text(m))} ({m.when})" for m in s.followups]
+        if s.waiting:
+            lines.append(f"Waiting on their reply ({len(s.waiting) + s.more_waiting})")
+            lines += [f"• {w.deal}: {display(_waiting_text(w))} ({w.days}d since {_date(w.sent)})" for w in s.waiting]
+        lines.extend(verification_text(s.verification))
+    if ndl_review and (ndl_review.waiting or ndl_review.unclear):
+        lines += ["\nNICO DE LEÓN", *verification_text(ndl_review)]
     return "\n".join(lines)
 
 
@@ -805,13 +1003,17 @@ def to_payload(sections: list[Section], ndl_rows: list[TodayRow], changes: list[
         "selection_audit": [{"deal": r.deal, "stage": r.stage, "selected": r.selected, "position": r.position,
                              "time_critical": r.critical, "signals": r.signals, "reason": r.reason} for r in s.audit],
         "also_active": s.also_active,
-        "customers": [{"deal": v.deal, "move": move(m)} for v, m in s.customers],
+        "customers": [],  # retain the response key for callers of v2
         "followups": [move(m) for m in s.followups], "more_followups": s.more_followups,
+        "waiting": [{"deal": w.deal, "to": w.to, "sent": w.sent, "days": w.days, "nudges": w.nudges,
+                     "replied_before": w.replied_before, "auto_reply": w.auto_reply, "thread_id": w.thread_id}
+                    for w in s.waiting], "more_waiting": s.more_waiting,
         "unclear": [v.deal for v in s.unclear], "dormant": s.dormant,
         "backlog": {"count": s.backlog.count, "deals": s.backlog.deals, "oldest": s.backlog.oldest,
                     "exceptions": [item(i) for i in s.backlog.exceptions]},
         "meetings": [{"at": m.at.isoformat(), "title": m.title, "deal": m.deal, "prep": p} for m, p in s.meetings],
         "all_items": [item(i) for i in s.all_items],
+        **({"verification": s.verification.sections()} if s.verification is not None else {}),
     } for s in sections], "ndl": [{"deal": r.deal, "text": r.text, "when": r.when} for r in ndl_rows],
         "changes": [{"deal": c.deal, "text": c.text, "kind": c.kind, "event": c.event} for c in changes]}
 

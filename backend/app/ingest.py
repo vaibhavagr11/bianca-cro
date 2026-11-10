@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import logging
 from datetime import date
+from uuid import UUID
 
 import psycopg
 from fastapi import APIRouter, Header, HTTPException
@@ -28,28 +29,53 @@ log = logging.getLogger("bianca_cro.ingest")
 router = APIRouter(prefix="/ingest")
 
 
-class PipelinePayload(BaseModel):
+class FeedPayload(BaseModel):
+    sync_batch_id: UUID | None = None
+    # n8n attests that the upstream fetch finished, including all pages and successful empty fetches.
+    coverage_complete: bool = False
+
+
+class PipelinePayload(FeedPayload):
     rows: list[dict]
 
 
-class GmailPayload(BaseModel):
+class GmailPayload(FeedPayload):
     messages: list[dict]
     mailbox: str = "RG"  # whose inbox this batch came from (team owner code)
+    includes_sent: bool = False
 
 
-class NotesPayload(BaseModel):
+class NotesPayload(FeedPayload):
     documentId: str
     content: str
 
 
-class CalendarPayload(BaseModel):
+class CalendarPayload(FeedPayload):
     events: list[dict]
+    mailbox: str | None = None
 
 
 def require_token(token: str | None) -> None:
     expected = settings.ingest_token.get_secret_value()
     if not token or not hmac.compare_digest(token, expected):
         raise HTTPException(status_code=401, detail="invalid ingest token")
+
+
+def _start_sync(conn, workspace_id, source: str, payload: FeedPayload, received: int,
+                *, mailbox: str | None = None, includes_sent: bool = True):
+    if payload.sync_batch_id is not None and source in ("gmail", "calendar") and not (mailbox or "").strip():
+        raise HTTPException(status_code=422, detail="mailbox is required for a mail or calendar receipt")
+    feed = f"{source}:{mailbox.strip().upper()}" if mailbox else source
+    if payload.sync_batch_id is None:
+        return conn.execute(
+            "insert into sync_runs (workspace_id, source, rows_received) values (%s, %s, %s) returning id",
+            (workspace_id, source, received),
+        ).fetchone()[0]
+    return conn.execute(
+        "insert into sync_runs (workspace_id, source, rows_received, sync_batch_id, feed_key, coverage_complete)"
+        " values (%s, %s, %s, %s, %s, %s) returning id",
+        (workspace_id, source, received, payload.sync_batch_id, feed, payload.coverage_complete and includes_sent),
+    ).fetchone()[0]
 
 
 @router.post("/pipeline")
@@ -70,10 +96,7 @@ def ingest_pipeline(payload: PipelinePayload, dry_run: bool = False,
 
     with db.connect() as conn:
         workspace_id = _workspace_id(conn)
-        run_id = conn.execute(
-            "insert into sync_runs (workspace_id, source, rows_received) values (%s, 'pipeline', %s) returning id",
-            (workspace_id, len(payload.rows)),
-        ).fetchone()[0]
+        run_id = _start_sync(conn, workspace_id, "pipeline", payload, len(payload.rows))
         conn.commit()  # the run is recorded even if everything below fails
 
         try:
@@ -185,10 +208,8 @@ def ingest_gmail(payload: GmailPayload, x_ingest_token: str | None = Header(defa
         internal = conn.execute("select internal_domains from workspaces where id = %s", (workspace_id,)).fetchone()[0]
         internal_domains = {d.lower() for d in internal}
         project_domains = {d.lower() for d in settings.project_team_domains}
-        run_id = conn.execute(
-            "insert into sync_runs (workspace_id, source, rows_received) values (%s, 'gmail', %s) returning id",
-            (workspace_id, len(payload.messages)),
-        ).fetchone()[0]
+        run_id = _start_sync(conn, workspace_id, "gmail", payload, len(payload.messages),
+                             mailbox=payload.mailbox, includes_sent=payload.includes_sent)
         conn.commit()
 
         try:
@@ -229,10 +250,7 @@ def ingest_notes(payload: NotesPayload, x_ingest_token: str | None = Header(defa
 
     with db.connect() as conn:
         workspace_id = _workspace_id(conn)
-        run_id = conn.execute(
-            "insert into sync_runs (workspace_id, source, rows_received) values (%s, 'notes', %s) returning id",
-            (workspace_id, len(sections)),
-        ).fetchone()[0]
+        run_id = _start_sync(conn, workspace_id, "notes", payload, len(sections))
         conn.commit()
 
         try:
@@ -292,10 +310,8 @@ def ingest_calendar(payload: CalendarPayload, x_ingest_token: str | None = Heade
         internal = conn.execute("select internal_domains from workspaces where id = %s", (workspace_id,)).fetchone()[0]
         internal_domains = {d.lower() for d in internal}
         project_domains = {d.lower() for d in settings.project_team_domains}
-        run_id = conn.execute(
-            "insert into sync_runs (workspace_id, source, rows_received) values (%s, 'calendar', %s) returning id",
-            (workspace_id, len(payload.events)),
-        ).fetchone()[0]
+        run_id = _start_sync(conn, workspace_id, "calendar", payload, len(payload.events),
+                             mailbox=payload.mailbox)
         conn.commit()
 
         try:

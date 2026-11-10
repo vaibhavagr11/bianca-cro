@@ -68,7 +68,9 @@ def validate(verdicts: Verdicts, items: dict[str, dict], records: dict[str, dict
         item = items.get(v.item)
         if item is None or v.state not in ("done", "possibly_done", "event_passed") or not v.quote:
             continue
-        if v.state == "event_passed" or v.record == "S":
+        if v.state == "event_passed":
+            if v.record != "S":
+                continue
             haystack, record_id = item["own_text"], item["record_id"]
         else:
             rec = records.get(v.record or "")

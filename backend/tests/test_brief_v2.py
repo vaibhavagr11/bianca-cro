@@ -1,15 +1,18 @@
 """Regression tests for brief v2. Each mirrors a failure seen in the Oct 28 briefs (v1, then the first v2 draft)."""
 
+import re
 from datetime import date, datetime, timedelta, timezone
+from html.parser import HTMLParser
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.brief import Meeting
 from app.brief_v2 import (
-    ChangeRow, DealView, Item, Note, Unanswered, bucket, build_section, classify_event, completable, deal_status,
-    describe_change,
+    ChangeRow, DealView, Item, Note, TodayRow, Unanswered, _stage_badge, bucket, build_section, classify_event, completable,
+    deal_status, describe_change,
     reply_text, first_sentence, has_request,
-    is_new_insight, item_kind, norm, primary_move, render, reply_label, resolve_owner, select_changes, subject,
+    is_new_insight, item_kind, norm, plain_text, primary_move, render, reply_label, resolve_owner, select_changes, subject,
     to_payload,
 )
 from app.main import app
@@ -92,6 +95,23 @@ def test_due_now_only_for_promises_due_within_three_days_or_tomorrow():
                 [item("Smearcase", "Send fix", due=TODAY, id="a"),
                  item("Smearcase", "Review data", kind="next_step", id="b")])        # notes next step: not "Due now"
     assert [r.text for r in s.today] == ["Send fix"]
+
+
+def test_working_clients_use_existing_action_sections_without_a_standalone_table():
+    overdue = item("Willow Retail", "Send the overdue report", due=TODAY - timedelta(days=5), id="overdue")
+    due_now = item("Willow Retail", "Confirm today's delivery", due=TODAY, id="today")
+    recommendation = Note("Schedule a routine account review", verified=True)
+    s = section("NC", [view("Willow Retail", 5), view("Birch Retail", 5, recommendation=recommendation)],
+                [overdue, due_now])
+
+    assert [(row.deal, row.item_id) for row in s.today] == [("Willow Retail", "today")]
+    assert [move.item_id for move in s.followups] == ["overdue"]
+    assert to_payload([s], [], [])["sections"][0]["customers"] == []
+    html = render([s], [], [], TODAY, 2, "c", False)
+    assert "Follow-ups that may be needed" in html and overdue.text in html
+    for body in (html, plain_text([s], TODAY)):
+        assert "Customer accounts" not in body
+        assert recommendation.text not in body
 
 
 # ---- stale opportunities and coverage (point 4)
@@ -415,6 +435,90 @@ def test_calendar_change_without_a_link_is_named_not_invented():
     assert "Meeting · Oct 26" in row and "href" not in row
 
 
+# ---- Sheet status highlights (Nov 3 request)
+
+class _BadgeParser(HTMLParser):
+    def __init__(self, html):
+        super().__init__()
+        self.spans = []
+        self.label = ""
+        self.feed(html)
+
+    def handle_starttag(self, tag, attrs):
+        assert tag == "span"
+        self.spans.append(dict(attrs))
+
+    def handle_data(self, data):
+        self.label += data
+
+
+BADGE_PALETTE = [
+    ("Paused", "#ffcfc8", "#b10202"),
+    ("Opening", "#bfe1f6", "#0953a8"),
+    ("In Talks", "#ffe59f", "#473821"),
+    ("Proposal", "#e6cff3", "#5b3286"),
+    ("Pilot", "#d4edbb", "#13734b"),
+    ("Working Client", "#13734b", "#d4edbb"),
+]
+
+
+def _luminance(hex_color):
+    rgb = [int(hex_color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in rgb]
+    return sum(c * weight for c, weight in zip(linear, (0.2126, 0.7152, 0.0722)))
+
+
+@pytest.mark.parametrize("label,background,foreground", BADGE_PALETTE)
+def test_stage_badges_match_sheet_palette_and_have_readable_text(label, background, foreground):
+    for raw in (label, f"2. {label}", f"  2.  {label.upper().replace(' ', '   ')}  "):
+        parsed = _BadgeParser(_stage_badge(raw))
+        assert len(parsed.spans) == 1 and parsed.label == label
+        styles = dict(part.split(":", 1) for part in parsed.spans[0]["style"].split(";") if part)
+        assert styles["background-color"] == background and styles["color"] == foreground
+        light, dark = sorted((_luminance(styles["color"]), _luminance(styles["background-color"])), reverse=True)
+        assert (light + 0.05) / (dark + 0.05) >= 4.5
+
+
+@pytest.mark.parametrize("stage,expected", [(None, "—"), ("  ", "—"), ("9. On Hold", "On Hold"),
+                                            ('<img src=x onerror="bad()">', '<img src=x onerror="bad()">')])
+def test_missing_and_unknown_stage_badges_are_neutral_and_escape_html(stage, expected):
+    parsed = _BadgeParser(_stage_badge(stage))
+    assert len(parsed.spans) == 1 and parsed.label == expected
+    assert parsed.spans[0]["class"] == "deal-stage deal-stage--unknown"
+    assert "background-color:#e5e7eb;color:#344054" in parsed.spans[0]["style"]
+
+
+def test_dark_mode_rules_preserve_both_badge_colors_without_opting_in_the_whole_email():
+    html = render([], [], [], TODAY, 0, "c", False)
+    css = html.split("<style>", 1)[1].split("</style>", 1)[0]
+    assert "@media (prefers-color-scheme:dark)" in css
+    assert '<meta' not in html and '<div class="bianca-brief"' in html
+    for label, background, foreground in BADGE_PALETTE:
+        suffix = label.lower().replace(" ", "-")
+        for selector in (f".bianca-brief .deal-stage--{suffix}",
+                         f"[data-ogsc] .bianca-brief .deal-stage--{suffix},[data-ogsb] .bianca-brief .deal-stage--{suffix}"):
+            assert selector + "{background-color:" + background + "!important;color:" + foreground + "!important}" in css
+
+
+def test_stage_badges_sit_below_escaped_company_names():
+    paused = item("Cedar & Co", due=TODAY, deal_owner="RG", id="paused")
+    opening = item("Harbor Foods", due=TODAY + timedelta(days=2), deal_owner="RG", id="opening")
+    customer = item("Willow Retail", due=TODAY, deal_owner="RG", id="customer")
+    views = [view("Cedar & Co", 0, owner="RG"), view("Harbor Foods", 1, owner="RG")]
+    views += [view(label + " Co", rank, owner="RG") for rank, (label, _, _) in enumerate(BADGE_PALETTE[2:5], start=2)]
+    views += [view("Willow Retail", 5, owner="RG")]
+    s = section("RG", views, [paused, opening, customer])
+    urgent = TodayRow("Nico <Urgent>", "4. Pilot", "Due now", "Review the file", "due today", "Nico DL", None)
+    html = render([s], [urgent], [], TODAY, 7, "c", False, action_url=lambda ref: f"https://x/done?r={ref}")
+    for company, label in (("Cedar &amp; Co", "Paused"), ("Harbor Foods", "Opening"), ("In Talks Co", "In Talks"),
+                           ("Proposal Co", "Proposal"), ("Pilot Co", "Pilot"), ("Willow Retail", "Working Client"),
+                           ("Nico &lt;Urgent&gt;", "Pilot")):
+        cell = re.search(r"<td[^>]*><b>" + re.escape(company) + r"</b><br>(.*?)</td>", html).group(1)
+        assert _BadgeParser(cell).label == label
+    assert "https://x/done?r=insight:paused" in html and "https://x/done?r=insight:opening" in html
+    assert "Notes · Oct 5" in html and ">Source<" in html
+
+
 # ---- plain Source column, no evidence links, "Mark as complete" buttons (Nov 2 request)
 
 def _brief_with_rows():
@@ -444,3 +548,113 @@ def test_done_buttons_link_each_closable_row_and_skip_the_rest():
     assert "https://x/done?r=insight:c" in html and "https://x/done?r=thread:t1" in html
     no_target = primary_move(view("Quiet Co", 2, owner="RG"), TODAY, set())
     assert no_target.tag == "Confirm status" and no_target.done is None
+
+
+# ---------------------------------------------------------------- Nov 4 founder feedback: automated mail, waiting list
+
+from app.brief_v2 import Waiting, is_automated, pick_waiting, waiting_on_them, waiting_text  # noqa: E402
+
+NOV4 = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
+INTERNAL = {"bianca-ai.com"}
+
+
+@pytest.mark.parametrize("senders,subject", [
+    (["juan@andina.cl"], "Respuesta automática: Bianca"),          # Andina Chile, Nov 4 "Reply needed"
+    (["ana@campari.com"], "Automatic reply: [EXTERNAL] Re: Pilot"),  # Campari, Nov 4 "Reply needed"
+    (["x@pernod-ricard.com"], "Out of Office Re: Bianca"),
+    (["gemini-notes@google.com"], "Notes: “Menús PRA” Oct 29, 2026"),  # Pernod, Nov 4: internal meeting notes
+    (["noreplysupplierportal@coca-cola.com"], "Supplier registration"),
+    (["mailer-daemon@googlemail.com"], "Delivery Status Notification (Failure)"),
+])
+def test_auto_replies_and_bots_are_not_people(senders, subject):
+    assert is_automated(senders, subject)
+
+
+@pytest.mark.parametrize("senders,subject", [
+    (["juan@andina.cl"], "Fwd: Out of Office: Business review"),   # a person forwarded it
+    (["juan@andina.cl"], "Re: Automatic replenishment pilot"),
+    (["support@vtinfo.zendesk.com"], "Re: VIP data access"),
+])
+def test_people_are_not_automated(senders, subject):
+    assert not is_automated(senders, subject)
+
+
+def msg(days_ago, frm, to=("juan@andina.cl",), automated=False, name="Juan Pérez"):
+    return {"at": NOV4 - timedelta(days=days_ago), "from": [frm], "automated": automated,
+            "to": [{"address": a, "name": name if "andina" in a else ""} for a in to], "cc": [],
+            "external_id": f"m-{days_ago}", "content_hash": f"hash-{days_ago}"}
+
+
+def expect_reply(latest, evidence=None, **overrides):
+    evidence = latest if evidence is None else evidence
+    latest["reply_expectation"] = {
+        "state": "expected",
+        "latest_message_id": latest["external_id"],
+        "latest_content_hash": latest["content_hash"],
+        "evidence_message_id": evidence["external_id"],
+        "evidence_content_hash": evidence["content_hash"],
+        "evidence_quote": "Could you send the signed agreement?",
+        "response": "Send the signed agreement",
+        **overrides,
+    }
+    return latest
+
+
+def test_waiting_counts_our_unanswered_emails_and_sees_through_an_out_of_office():
+    ask = msg(20, "ramiro@bianca-ai.com")
+    nudge = expect_reply(msg(9, "ramiro@bianca-ai.com"), evidence=ask)
+    thread = [msg(40, "juan@andina.cl", to=("ramiro@bianca-ai.com",)), ask, nudge,
+              msg(8.9, "juan@andina.cl", to=("ramiro@bianca-ai.com",), automated=True)]
+    w = waiting_on_them(thread, INTERNAL, NOV4)
+    assert (w["to"], w["days"], w["nudges"], w["replied_before"], w["auto_reply"]) == ("Juan Pérez", 9, 2, True, True)
+
+
+def test_no_wait_when_they_answered_last_or_latest_email_is_internal_only():
+    ask = expect_reply(msg(10, "ramiro@bianca-ai.com"))
+    assert waiting_on_them([ask, msg(5, "juan@andina.cl")], INTERNAL, NOV4) is None
+    internal = expect_reply(msg(10, "ramiro@bianca-ai.com", to=("nico@bianca-ai.com",)))
+    assert waiting_on_them([internal], INTERNAL, NOV4) is None
+
+
+@pytest.mark.parametrize("days,eligible", [(6, False), (7, True), (60, True), (61, False)])
+def test_waiting_age_is_seven_through_sixty_days(days, eligible):
+    waiting = waiting_on_them([expect_reply(msg(days, "ramiro@bianca-ai.com"))], INTERNAL, NOV4)
+    assert (waiting is not None) is eligible
+
+
+@pytest.mark.parametrize("overrides", [
+    {"state": "closed"},
+    {"state": "unclear"},
+    {"latest_message_id": "old-outbound"},
+    {"latest_content_hash": "old-outbound-body"},
+    {"evidence_message_id": "missing-message"},
+    {"evidence_content_hash": "old-evidence-body"},
+])
+def test_waiting_requires_current_expected_reply_with_current_evidence(overrides):
+    outbound = expect_reply(msg(10, "ramiro@bianca-ai.com"), **overrides)
+    assert waiting_on_them([outbound], INTERNAL, NOV4) is None
+
+
+def test_waiting_omits_outbound_with_no_reply_expectation():
+    assert waiting_on_them([msg(10, "ramiro@bianca-ai.com")], INTERNAL, NOV4) is None
+
+
+def wait(deal, days, owner="RG", rank=2, **kw):
+    return Waiting(deal, STAGES[rank], "Juan Pérez", (NOV4 - timedelta(days=days)).date(), days, kw.get("nudges", 1),
+                   kw.get("replied", False), kw.get("auto", False), "https://mail/t", "Email · Oct 1", f"t-{deal}", owner, rank)
+
+
+def test_waiting_list_is_per_founder_prospects_first_newest_silence_first():
+    ws = [wait("Customer Co", 60, rank=5), wait("Andina Chile", 9), wait("Arca Peru", 50), wait("Nico deal", 7, owner="NC")]
+    shown, more = pick_waiting(ws, "RG")
+    assert [w.deal for w in shown] == ["Andina Chile", "Arca Peru", "Customer Co"] and more == 0
+    assert waiting_text(wait("Arca Peru", 50, nudges=3, auto=True)) == "To Juan Pérez · no reply to our 3 emails, out-of-office received"
+    assert waiting_text(wait("Farmater", 7, nudges=8, replied=True)) == "To Juan Pérez · 8 emails since their last reply"
+
+
+def test_waiting_list_renders_with_a_done_button():
+    s = section("RG", [], [])
+    s.waiting = [wait("Andina Chile", 9, auto=True)]
+    html = render([s], [], [], TODAY, 1, "c", False, action_url=lambda ref: f"https://x/done?r={ref}")
+    assert "Waiting on their reply" in html and "out-of-office received" in html and "r=thread:t-Andina Chile" in html
+    assert "thread:t-Andina Chile" in completable([s], [])
