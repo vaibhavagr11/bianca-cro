@@ -11,6 +11,8 @@ backend/   FastAPI service (Python 3.12, managed with uv)
 
 n8n (Cloud) fetches data from Google and posts it to the backend; all business logic lives in `backend/`.
 
+For changes to Daily Brief wording or delivery, see the [Daily Brief review handoff](DAILY_BRIEF_REVIEW.md).
+
 ## Run the backend locally
 
 ```bash

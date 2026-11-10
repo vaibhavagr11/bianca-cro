@@ -136,7 +136,6 @@ def verify_v2(sections: list[brief_v2.Section], ndl: list[brief_v2.TodayRow], co
         notes = section.verification = brief.VerificationNotes()
         inventory.add(section.today, describe, notes)
         inventory.add(section.highlights, lambda row: (row[0].deal, row[1].text, row[1].done), notes)
-        inventory.add(section.customers, lambda row: (row[0].deal, row[1].text, row[1].done), notes)
         inventory.add(section.followups, lambda row: (row.deal or "", row.text, row.done), notes)
         inventory.add(section.waiting, lambda row: (row.deal, brief_v2.waiting_text(row), f"wait:{row.thread_id}"),
                       notes, waiting=True)

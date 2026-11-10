@@ -1,6 +1,7 @@
 """Processing endpoints called by n8n after ingestion. Each call handles a bounded batch and is safe to repeat."""
 
 import logging
+from datetime import timedelta
 
 import anthropic
 from fastapi import APIRouter, Header, HTTPException
@@ -8,7 +9,7 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel
 from psycopg.types.json import Jsonb
 
-from app import classifier, db, extractor, opportunities, profiler, reconciler, resolution, timeline
+from app import brief_v2, classifier, db, extractor, opportunities, profiler, reconciler, resolution, timeline
 from app.config import settings
 from app.ingest import _fail, _workspace_id, require_token
 from app.pipeline import normalize_name
@@ -19,21 +20,16 @@ router = APIRouter(prefix="/process")
 
 @router.post("/classify")
 def classify_threads(x_ingest_token: str | None = Header(default=None)) -> dict:
-    """Classify up to classify_batch_threads pending units: Gmail threads and notes-doc meetings, newest first."""
+    """Classify a bounded batch of pending units or existing Gmail waits that need a reply expectation."""
     require_token(x_ingest_token)
-    if settings.anthropic_api_key is None:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
-    workspace_header = (
-        {"anthropic-workspace-id": settings.anthropic_workspace_id} if settings.anthropic_workspace_id else None
-    )
-    client = anthropic.Anthropic(
-        api_key=settings.anthropic_api_key.get_secret_value(), default_headers=workspace_header
-    )
+    client = _claude()
 
     with db.connect() as conn:
         workspace_id = _workspace_id(conn)
         conn.row_factory = dict_row
         system_prompt, company_ids = _context(conn, workspace_id)
+        ws = conn.execute("select internal_domains from workspaces where id = %s", (workspace_id,)).fetchone()
+        internal = {d.lower() for d in ws["internal_domains"] + settings.project_team_domains}
         threads = [
             (r["source"], r["thread_id"])
             for r in conn.execute(
@@ -48,19 +44,23 @@ def classify_threads(x_ingest_token: str | None = Header(default=None)) -> dict:
         ).fetchone()["id"]
         conn.commit()
 
-        counts = {"classified": 0, "commercial": 0, "linked_to_company": 0, "failed": 0}
+        counts = {"classified": 0, "commercial": 0, "linked_to_company": 0, "failed": 0,
+                  "reply_expectations_backfilled": 0, "reply_expectation_errors": 0}
         try:
             for source, thread_id in threads:
                 records = conn.execute(
-                    "select id, external_id, occurred_at::text, subject, participants, body, meta from source_records"
+                    "select id, external_id, occurred_at, subject, participants, body, meta, content_hash from source_records"
                     " where workspace_id = %s and source = %s and thread_id = %s",
                     (workspace_id, source, thread_id),
                 ).fetchall()
                 renderers = {"notes": lambda r: classifier.render_note(r[0]),
                              "calendar": lambda r: classifier.render_event(r[0])}
-                thread_text = renderers.get(source, classifier.render_thread)(records)
+                latest = classifier.latest_reply_message(records, internal) if source == "gmail" else None
+                thread_text = (classifier.render_thread(records, reply_internal_domains=internal if latest else None)
+                               if source == "gmail" else renderers[source](records))
                 try:
-                    result = classifier.classify(client, settings.anthropic_model, system_prompt, thread_text, source)
+                    result = classifier.classify(client, settings.anthropic_model, system_prompt, thread_text, source,
+                                                 latest_reply_message_id=latest["external_id"] if latest else None)
                 except (anthropic.APIStatusError, anthropic.APIConnectionError, ValueError) as exc:
                     # One bad thread doesn't stop the batch; it stays visible as failed.
                     log.warning("classify thread failed: %s", type(exc).__name__)
@@ -79,6 +79,9 @@ def classify_threads(x_ingest_token: str | None = Header(default=None)) -> dict:
                 discard = stored["category"] in classifier.DISCARD_TEXT_CATEGORIES
                 if discard:
                     stored["evidence_quote"] = None  # keep only the label; the text is not sales data
+                if latest and stored["is_commercial"]:
+                    stored["reply_expectation"] = classifier.check_reply_expectation(
+                        result.reply_expectation, records, latest)
                 conn.execute(
                     "update source_records set status = 'classified', classification = %s, company_id = %s,"
                     " body = case when %s then null else body end"
@@ -89,16 +92,21 @@ def classify_threads(x_ingest_token: str | None = Header(default=None)) -> dict:
                 counts["classified"] += 1
                 counts["commercial"] += stored["is_commercial"]
                 counts["linked_to_company"] += company_id is not None
+
+            remaining = conn.execute(
+                "select count(distinct (source, thread_id)) as n from source_records"
+                " where workspace_id = %s and status = 'pending'",
+                (workspace_id,),
+            ).fetchone()["n"]
+            if not remaining:
+                # Let the daily run finish the rollout backfill before moving to the next stage.
+                remaining = _backfill_reply_expectations(
+                    conn, client, workspace_id, internal, settings.classify_batch_threads - len(threads), counts)
         except Exception as exc:
             _fail(conn, run_id, type(exc).__name__)
             log.exception("classify run %s failed", run_id)
             raise HTTPException(status_code=500, detail="classify failed")
 
-        remaining = conn.execute(
-            "select count(distinct (source, thread_id)) as n from source_records"
-            " where workspace_id = %s and status = 'pending'",
-            (workspace_id,),
-        ).fetchone()["n"]
         conn.execute(
             "update sync_runs set status = 'succeeded', finished_at = now(), rows_created = %s, rows_skipped = %s"
             " where id = %s",
@@ -108,6 +116,67 @@ def classify_threads(x_ingest_token: str | None = Header(default=None)) -> dict:
 
     log.info("classify run %s: %s remaining_threads=%s", run_id, counts, remaining)
     return {"sync_run_id": str(run_id), "threads": len(threads), **counts, "remaining_threads": remaining}
+
+
+def _backfill_reply_expectations(conn, client, workspace_id, internal: set[str], limit: int, counts: dict) -> int:
+    """Fill missing metadata on recent classified outbound messages without reclassifying their sales context."""
+    now = timeline.utcnow()
+    first_day, last_day = brief_v2.WAITING_DAYS
+    threads: dict[str, list[dict]] = {}
+    for row in conn.execute(
+            "select r.id, r.thread_id, r.external_id, r.content_hash, r.occurred_at, r.subject, r.participants,"
+            " r.status, r.classification->'reply_expectation' as reply_expectation,"
+            " (r.classification->>'is_commercial')::bool and exists (select 1 from opportunities o"
+            " where o.workspace_id = r.workspace_id and o.company_id = r.company_id and o.removed_at is null)"
+            " as commercial_deal from source_records r where r.workspace_id = %s and r.source = 'gmail'"
+            " and r.occurred_at > %s and r.occurred_at <= %s and r.thread_id is not null"
+            " order by r.occurred_at desc, r.external_id desc",
+            (workspace_id, now - timedelta(days=last_day + 1), now)):
+        threads.setdefault(row["thread_id"], []).append(row)
+
+    candidates = []
+    for records in threads.values():
+        latest = classifier.latest_reply_message(records, internal)
+        if not latest or latest["status"] != "classified" or not latest["commercial_deal"]:
+            continue
+        if not first_day <= (now - latest["occurred_at"]).days <= last_day:
+            continue
+        checked = latest["reply_expectation"] or {}
+        if (checked.get("latest_message_id") == latest["external_id"]
+                and checked.get("latest_content_hash") == latest["content_hash"]
+                and (not checked.get("retry_after") or checked["retry_after"] > now.isoformat())):
+            continue
+        candidates.append(latest)
+
+    batch = candidates[:limit]
+    for latest in batch:
+        records = conn.execute(
+            "select id, external_id, occurred_at, subject, body, participants, content_hash from source_records"
+            " where workspace_id = %s and source = 'gmail' and thread_id = %s and occurred_at <= %s",
+            (workspace_id, latest["thread_id"], now)).fetchall()
+        current = classifier.latest_reply_message(records, internal)
+        if not current or (current["id"], current["content_hash"]) != (latest["id"], latest["content_hash"]):
+            continue
+        try:
+            expectation = classifier.classify_reply_expectation(client, settings.anthropic_model, records, current, internal)
+        except (anthropic.APIStatusError, anthropic.APIConnectionError, ValueError) as exc:
+            log.warning("reply expectation backfill failed: %s", type(exc).__name__)
+            counts["reply_expectation_errors"] += 1
+            # Retry transient errors in a later run without holding up this batch.
+            expectation = {"state": "unclear", "latest_message_id": current["external_id"],
+                           "latest_content_hash": current["content_hash"],
+                           "retry_after": (now + timedelta(days=1)).isoformat()}
+        updated = conn.execute(
+            "update source_records set classification = jsonb_set(classification, '{reply_expectation}', %s)"
+            " where id = %s and content_hash = %s and status = 'classified'"
+            " and (classification->>'is_commercial')::bool"
+            " and (classification->'reply_expectation'->>'latest_message_id' is distinct from external_id"
+            " or classification->'reply_expectation'->>'latest_content_hash' is distinct from content_hash"
+            " or (classification->'reply_expectation'->>'retry_after')::timestamptz <= %s)",
+            (Jsonb(expectation), current["id"], current["content_hash"], now))
+        counts["reply_expectations_backfilled"] += updated.rowcount
+        conn.commit()
+    return len(candidates) - len(batch)
 
 
 def _context(conn, workspace_id) -> tuple[str, dict[str, tuple[str, str]]]:

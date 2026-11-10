@@ -44,14 +44,13 @@ def test_v2_checks_every_action_section_and_only_keeps_verified_done_links():
     reply = brief_v2.TodayRow("Acme", "Pilot", "Reply needed", "Reply to the customer", "today", "RG", None,
                               done="thread:reply")
     recommendation = brief_v2.Move("AI recommendation", "Offer a demo", "soon", None, done="rec:one")
-    customer = brief_v2.Move("Clarify next action", "Clarify the account plan", "soon", None)
     followup = brief_v2.Move("We owe", "Acme: send documents", "soon", None, done="insight:follow", deal="Acme")
     backlog = brief_v2.Item("old", "Acme", "Share report", NOW.date(), NOW.date(), "RG")
     waiting = brief_v2.Waiting("Acme", "Pilot", "Ana", NOW.date(), 4, 1, False, False, None, thread_id="sent")
     deal = brief_v2.DealView("Acme", "Pilot", 3, "RG")
     meeting = brief.Meeting(NOW, "Acme meeting", "Acme", "Pilot", ["RG"])
     section = brief_v2.Section("RG", "Ramiro", "Ramiro", [due, reply], [(deal, recommendation, None)], [],
-                               [(deal, customer)], [(meeting, "Send a prep deck")], [followup], [], 2, [deal], 0,
+                               [(meeting, "Send a prep deck")], [followup], [], 2, [deal], 0,
                                brief_v2.Backlog(1, 1, NOW.date(), exceptions=[backlog]), waiting=[waiting])
     ndl = [brief_v2.TodayRow("Acme", "Pilot", "Due now", "Send link", "today", "NDL", None, done="insight:ndl")]
     sources = {"insight:due": source("commitment", "m1"), "thread:reply": source("reply", "m2"),
@@ -67,8 +66,8 @@ def test_v2_checks_every_action_section_and_only_keeps_verified_done_links():
         return {a.key: Verdict(states[a.origin_record_id], "fixture") for a in actions}
 
     ndl_review = brief_review.verify_v2([section], ndl, COMPANIES, sources, gate)
-    assert len(checked) == 10
-    assert section.today == section.highlights == section.customers == section.unclear == []
+    assert len(checked) == 9   # master removed the Customer accounts section
+    assert section.today == section.highlights == section.unclear == []
     assert section.meetings == [(meeting, "")]
     assert section.backlog.exceptions == []
     assert set(brief_v2.completable([section], ndl)) == {"insight:follow", "thread:sent", "insight:ndl"}
