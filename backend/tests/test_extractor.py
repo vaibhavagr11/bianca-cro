@@ -61,11 +61,10 @@ def test_exact_source_ref_controls_anchor_when_the_quote_is_repeated():
         "M2": {"id": "last", "occurred_at": "2026-10-07", "subject": None, "body": "Mandar mail next steps"},
     }
     kept, dropped = validate(Extraction(insights=[ins(source_ref="M1"), ins(source_ref="M9"), ins()]), TEXT, refs)
-    assert dropped == 1
+    assert dropped == 0   # a wrong label never drops a verbatim quote
     assert kept[0]["origin_record_id"] == "first"
     assert kept[0]["origin_occurred_at"] == "2026-10-06"
-    assert kept[1]["origin_record_id"] is None
-    assert kept[1]["origin_occurred_at"] is None
+    assert [k["origin_record_id"] for k in kept[1:]] == [None, None]   # in both messages: no single origin
 
 
 def test_unique_legacy_quote_keeps_its_origin_and_inferred_dates_are_unverified():
@@ -75,8 +74,8 @@ def test_unique_legacy_quote_keeps_its_origin_and_inferred_dates_are_unverified(
         "M2": {"id": "last", "occurred_at": "2026-10-07", "subject": None, "body": "The requested email was sent."},
     }
     kept, dropped = validate(Extraction(insights=[ins(), ins(source_ref="M2")]), TEXT, refs)
-    assert dropped == 1
-    assert kept[0]["origin_record_id"] == "first"
+    assert dropped == 0
+    assert [k["origin_record_id"] for k in kept] == ["first", "first"]   # mislabeled M2: the quote is only in M1
     assert kept[0]["origin_occurred_at"] is None
 
 

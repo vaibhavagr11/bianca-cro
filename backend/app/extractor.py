@@ -123,12 +123,11 @@ def validate(extraction: Extraction, text: str, records: dict[str, dict] | None 
             continue
         origin = None
         if records is not None:
+            # The quote is verbatim in the input, so a wrong or missing M-number never drops it: use the labeled
+            # record if it holds the quote, else the only record that does, else keep it without an origin.
             matches = {ref: rec for ref, rec in records.items() if quote_in_record(i.quote, rec)}
-            if i.source_ref:
-                origin = matches.get(i.source_ref)
-                if origin is None:
-                    dropped += 1
-                    continue
+            if i.source_ref in matches:
+                origin = matches[i.source_ref]
             elif len(matches) == 1:
                 origin = next(iter(matches.values()))
         actionable = i.type in ("commitment", "next_step")
