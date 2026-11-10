@@ -1,6 +1,7 @@
 """Processing endpoints called by n8n after ingestion. Each call handles a bounded batch and is safe to repeat."""
 
 import logging
+from datetime import timedelta
 
 import anthropic
 from fastapi import APIRouter, Header, HTTPException
@@ -8,7 +9,7 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel
 from psycopg.types.json import Jsonb
 
-from app import classifier, db, extractor, gmail, opportunities, profiler, reconciler, resolution, timeline
+from app import brief_v2, classifier, db, extractor, gmail, opportunities, profiler, reconciler, resolution, timeline
 from app.config import settings
 from app.ingest import _fail, _workspace_id, require_token
 from app.pipeline import normalize_name
@@ -19,21 +20,16 @@ router = APIRouter(prefix="/process")
 
 @router.post("/classify")
 def classify_threads(x_ingest_token: str | None = Header(default=None)) -> dict:
-    """Classify up to classify_batch_threads pending units: Gmail threads and notes-doc meetings, newest first."""
+    """Classify a bounded batch of pending units or existing Gmail waits that need a reply expectation."""
     require_token(x_ingest_token)
-    if settings.anthropic_api_key is None:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
-    workspace_header = (
-        {"anthropic-workspace-id": settings.anthropic_workspace_id} if settings.anthropic_workspace_id else None
-    )
-    client = anthropic.Anthropic(
-        api_key=settings.anthropic_api_key.get_secret_value(), default_headers=workspace_header
-    )
+    client = _claude()
 
     with db.connect() as conn:
         workspace_id = _workspace_id(conn)
         conn.row_factory = dict_row
         system_prompt, company_ids = _context(conn, workspace_id)
+        ws = conn.execute("select internal_domains from workspaces where id = %s", (workspace_id,)).fetchone()
+        internal = {d.lower() for d in ws["internal_domains"] + settings.project_team_domains}
         threads = [
             (r["source"], r["thread_id"])
             for r in conn.execute(
@@ -48,19 +44,23 @@ def classify_threads(x_ingest_token: str | None = Header(default=None)) -> dict:
         ).fetchone()["id"]
         conn.commit()
 
-        counts = {"classified": 0, "commercial": 0, "linked_to_company": 0, "failed": 0}
+        counts = {"classified": 0, "commercial": 0, "linked_to_company": 0, "failed": 0,
+                  "reply_expectations_backfilled": 0, "reply_expectation_errors": 0}
         try:
             for source, thread_id in threads:
                 records = conn.execute(
-                    "select id, external_id, occurred_at::text, subject, participants, body, meta from source_records"
+                    "select id, external_id, occurred_at, subject, participants, body, meta, content_hash from source_records"
                     " where workspace_id = %s and source = %s and thread_id = %s",
                     (workspace_id, source, thread_id),
                 ).fetchall()
                 renderers = {"notes": lambda r: classifier.render_note(r[0]),
                              "calendar": lambda r: classifier.render_event(r[0])}
-                thread_text = renderers.get(source, classifier.render_thread)(records)
+                latest = classifier.latest_reply_message(records, internal) if source == "gmail" else None
+                thread_text = (classifier.render_thread(records, reply_internal_domains=internal if latest else None)
+                               if source == "gmail" else renderers[source](records))
                 try:
-                    result = classifier.classify(client, settings.anthropic_model, system_prompt, thread_text, source)
+                    result = classifier.classify(client, settings.anthropic_model, system_prompt, thread_text, source,
+                                                 latest_reply_message_id=latest["external_id"] if latest else None)
                 except (anthropic.APIStatusError, anthropic.APIConnectionError, ValueError) as exc:
                     # One bad thread doesn't stop the batch; it stays visible as failed.
                     log.warning("classify thread failed: %s", type(exc).__name__)
@@ -79,6 +79,9 @@ def classify_threads(x_ingest_token: str | None = Header(default=None)) -> dict:
                 discard = stored["category"] in classifier.DISCARD_TEXT_CATEGORIES
                 if discard:
                     stored["evidence_quote"] = None  # keep only the label; the text is not sales data
+                if latest and stored["is_commercial"]:
+                    stored["reply_expectation"] = classifier.check_reply_expectation(
+                        result.reply_expectation, records, latest)
                 conn.execute(
                     "update source_records set status = 'classified', classification = %s, company_id = %s,"
                     " body = case when %s then null else body end"
@@ -89,16 +92,21 @@ def classify_threads(x_ingest_token: str | None = Header(default=None)) -> dict:
                 counts["classified"] += 1
                 counts["commercial"] += stored["is_commercial"]
                 counts["linked_to_company"] += company_id is not None
+
+            remaining = conn.execute(
+                "select count(distinct (source, thread_id)) as n from source_records"
+                " where workspace_id = %s and status = 'pending'",
+                (workspace_id,),
+            ).fetchone()["n"]
+            if not remaining:
+                # Let the daily run finish the rollout backfill before moving to the next stage.
+                remaining = _backfill_reply_expectations(
+                    conn, client, workspace_id, internal, settings.classify_batch_threads - len(threads), counts)
         except Exception as exc:
             _fail(conn, run_id, type(exc).__name__)
             log.exception("classify run %s failed", run_id)
             raise HTTPException(status_code=500, detail="classify failed")
 
-        remaining = conn.execute(
-            "select count(distinct (source, thread_id)) as n from source_records"
-            " where workspace_id = %s and status = 'pending'",
-            (workspace_id,),
-        ).fetchone()["n"]
         conn.execute(
             "update sync_runs set status = 'succeeded', finished_at = now(), rows_created = %s, rows_skipped = %s"
             " where id = %s",
@@ -108,6 +116,67 @@ def classify_threads(x_ingest_token: str | None = Header(default=None)) -> dict:
 
     log.info("classify run %s: %s remaining_threads=%s", run_id, counts, remaining)
     return {"sync_run_id": str(run_id), "threads": len(threads), **counts, "remaining_threads": remaining}
+
+
+def _backfill_reply_expectations(conn, client, workspace_id, internal: set[str], limit: int, counts: dict) -> int:
+    """Fill missing metadata on recent classified outbound messages without reclassifying their sales context."""
+    now = timeline.utcnow()
+    first_day, last_day = brief_v2.WAITING_DAYS
+    threads: dict[str, list[dict]] = {}
+    for row in conn.execute(
+            "select r.id, r.thread_id, r.external_id, r.content_hash, r.occurred_at, r.subject, r.participants,"
+            " r.status, r.classification->'reply_expectation' as reply_expectation,"
+            " (r.classification->>'is_commercial')::bool and exists (select 1 from opportunities o"
+            " where o.workspace_id = r.workspace_id and o.company_id = r.company_id and o.removed_at is null)"
+            " as commercial_deal from source_records r where r.workspace_id = %s and r.source = 'gmail'"
+            " and r.occurred_at > %s and r.occurred_at <= %s and r.thread_id is not null"
+            " order by r.occurred_at desc, r.external_id desc",
+            (workspace_id, now - timedelta(days=last_day + 1), now)):
+        threads.setdefault(row["thread_id"], []).append(row)
+
+    candidates = []
+    for records in threads.values():
+        latest = classifier.latest_reply_message(records, internal)
+        if not latest or latest["status"] != "classified" or not latest["commercial_deal"]:
+            continue
+        if not first_day <= (now - latest["occurred_at"]).days <= last_day:
+            continue
+        checked = latest["reply_expectation"] or {}
+        if (checked.get("latest_message_id") == latest["external_id"]
+                and checked.get("latest_content_hash") == latest["content_hash"]
+                and (not checked.get("retry_after") or checked["retry_after"] > now.isoformat())):
+            continue
+        candidates.append(latest)
+
+    batch = candidates[:limit]
+    for latest in batch:
+        records = conn.execute(
+            "select id, external_id, occurred_at, subject, body, participants, content_hash from source_records"
+            " where workspace_id = %s and source = 'gmail' and thread_id = %s and occurred_at <= %s",
+            (workspace_id, latest["thread_id"], now)).fetchall()
+        current = classifier.latest_reply_message(records, internal)
+        if not current or (current["id"], current["content_hash"]) != (latest["id"], latest["content_hash"]):
+            continue
+        try:
+            expectation = classifier.classify_reply_expectation(client, settings.anthropic_model, records, current, internal)
+        except (anthropic.APIStatusError, anthropic.APIConnectionError, ValueError) as exc:
+            log.warning("reply expectation backfill failed: %s", type(exc).__name__)
+            counts["reply_expectation_errors"] += 1
+            # Retry transient errors in a later run without holding up this batch.
+            expectation = {"state": "unclear", "latest_message_id": current["external_id"],
+                           "latest_content_hash": current["content_hash"],
+                           "retry_after": (now + timedelta(days=1)).isoformat()}
+        updated = conn.execute(
+            "update source_records set classification = jsonb_set(classification, '{reply_expectation}', %s)"
+            " where id = %s and content_hash = %s and status = 'classified'"
+            " and (classification->>'is_commercial')::bool"
+            " and (classification->'reply_expectation'->>'latest_message_id' is distinct from external_id"
+            " or classification->'reply_expectation'->>'latest_content_hash' is distinct from content_hash"
+            " or (classification->'reply_expectation'->>'retry_after')::timestamptz <= %s)",
+            (Jsonb(expectation), current["id"], current["content_hash"], now))
+        counts["reply_expectations_backfilled"] += updated.rowcount
+        conn.commit()
+    return len(candidates) - len(batch)
 
 
 def _context(conn, workspace_id) -> tuple[str, dict[str, tuple[str, str]]]:
@@ -247,62 +316,91 @@ _PENDING_EXTRACTION = """
 """
 
 
-def _write_insights(conn, key: tuple, deal: dict, records: list[dict], kept: list[dict], backfill_scope: bool) -> None:
-    """Keep matching row IDs and review states, even if a legacy request had the wrong action type."""
+def _write_extracted_insights(conn, workspace_id, unit: dict, deal: dict, records: list[dict],
+                             kept: list[dict]) -> None:
+    """Update matching insights in place so existing IDs, first-log times and reviews survive."""
+    key = (workspace_id, unit["source"], unit["thread_id"])
     record_ids = [r["id"] for r in records]
-    occurred_at = {r["id"]: r["occurred_at"] for r in records}
+    by_id = {r["id"]: r for r in records}
     existing = conn.execute(
         "select id, type, text, quote, status, origin_record_id from insights"
         " where workspace_id = %s and source = %s and unit_id = %s"
-        " order by (status <> 'open') desc, created_at, id for update", key,
+        " order by (status in ('done', 'dismissed')) desc, (status = 'possibly_done') desc, created_at, id for update",
+        key,
     ).fetchall()
 
     def identity(row: dict) -> tuple:
-        return (*extractor.insight_key(row["type"], row["quote"]), extractor.insight_key(row["type"], row["text"])[1])
+        return row["origin_record_id"], *extractor.insight_key(row["type"], row["quote"])
 
-    incoming = {identity(item): item for item in kept}
-    matched = set()
-    for item_key, item in incoming.items():
-        origin = item["origin_record_id"]
-        candidates = [row for row in existing if row["id"] not in matched and row["origin_record_id"] in (None, origin)]
-        old = next((row for row in candidates if identity(row) == item_key), None)
-        if old is None:
-            same_quote = [row for row in candidates if identity(row)[1] == item_key[1]]
-            same_type = [row for row in same_quote if row["type"] == item["type"]]
-            if len(same_type) == 1 and sum(k[:2] == item_key[:2] for k in incoming) == 1:
-                old = same_type[0]
-            elif item["confidence"] == "high" and item["type"] in ("commitment", "next_step"):
-                actions = [row for row in same_quote if row["type"] in ("commitment", "next_step")]
-                if len(actions) == 1 and sum(k[1] == item_key[1] for k in incoming) == 1:
-                    old = actions[0]
-            if old is None and any(row["status"] != "open" for row in same_quote):
-                # An ambiguous rewrite must not reopen a reviewed action.
-                continue
+    def same_action(old: dict, new: dict, field: str) -> bool:
+        """Same type and quote (or one-line text), on the same message or on a legacy row not yet tied to one."""
+        return (old["origin_record_id"] in (None, new["origin_record_id"])
+                and extractor.insight_key(old["type"], old[field]) == extractor.insight_key(new["type"], new[field]))
 
-        fields = (deal["company_id"], deal["id"], record_ids, item["type"], item["text"], item["quote"],
-                  item["owner_side"], item["owner_name"], item["due_date"], occurred_at[origin] or records[-1]["occurred_at"],
-                  item["confidence"], extractor.EXTRACTOR_VERSION, item["action_scope"], origin)
+    prior = {}
+    for row in existing:
+        prior.setdefault(identity(row), row)
+    # Reserve all exact matches before allowing a unique looser match (a reworded quote, or a legacy row
+    # without an origin); otherwise the old row survives as an "omitted" action next to its new copy.
+    new_keys = {identity(i) for i in kept}
+    seen, matched = set(), set()
+    for i in kept:
+        item_key = identity(i)
+        if item_key in seen:
+            continue
+        seen.add(item_key)
+        old = prior.get(item_key)
+        for field in ("quote", "text"):
+            if old is not None:
+                break
+            variants = [r for r in existing if r["id"] not in matched and identity(r) not in new_keys
+                        and same_action(r, i, field)]
+            incoming = {identity(k) for k in kept if k["type"] == i["type"]
+                        and extractor.insight_key(k["type"], k[field]) == extractor.insight_key(i["type"], i[field])}
+            if len(variants) == 1 and len(incoming) == 1:
+                old = variants[0]
+        when = i["origin_occurred_at"] or records[-1]["occurred_at"]
         if old:
             matched.add(old["id"])
             conn.execute(
-                "update insights set company_id = %s, opportunity_id = %s, source_record_ids = %s, type = %s,"
-                " text = %s, quote = %s, owner_side = %s, owner_name = %s, due_date = %s, occurred_at = %s,"
-                " confidence = %s, extractor_version = %s, action_scope = %s, origin_record_id = %s where id = %s",
-                (*fields, old["id"]),
+                "update insights set company_id = %s, opportunity_id = %s, source_record_ids = %s,"
+                " text = %s, quote = %s, owner_side = %s, owner_name = %s, due_date = %s, confidence = %s,"
+                " occurred_at = case when origin_occurred_at is not null then occurred_at else %s end,"
+                " origin_occurred_at = coalesce(origin_occurred_at, %s),"
+                " origin_record_id = coalesce(origin_record_id, %s), action_scope = %s,"
+                " extractor_version = %s, last_extracted_at = now() where id = %s",
+                (unit["company_id"], deal["id"], record_ids, i["text"], i["quote"], i["owner_side"],
+                 i["owner_name"], i["due_date"], i["confidence"], when, i["origin_occurred_at"],
+                 i["origin_record_id"], i.get("action_scope"), extractor.EXTRACTOR_VERSION, old["id"]),
             )
         else:
             conn.execute(
-                "insert into insights (workspace_id, source, unit_id, company_id, opportunity_id, source_record_ids,"
+                "insert into insights (workspace_id, company_id, opportunity_id, source, unit_id, source_record_ids,"
                 " type, text, quote, owner_side, owner_name, due_date, occurred_at, confidence, extractor_version,"
-                " action_scope, origin_record_id) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (*key, *fields),
+                " origin_record_id, origin_occurred_at, action_scope) values"
+                " (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (workspace_id, unit["company_id"], deal["id"], unit["source"], unit["thread_id"], record_ids,
+                 i["type"], i["text"], i["quote"], i["owner_side"], i["owner_name"], i["due_date"], when,
+                 i["confidence"], extractor.EXTRACTOR_VERSION, i["origin_record_id"], i["origin_occurred_at"],
+                 i.get("action_scope")),
             )
 
     for old in existing:
         if old["id"] in matched or old["status"] in ("done", "dismissed"):
             continue
-        if backfill_scope:
-            conn.execute("update insights set action_scope = null where id = %s and action_scope is not null", (old["id"],))
+        origin = old["origin_record_id"]
+        sources = records
+        if origin is not None:
+            sources = [by_id[origin]] if origin in by_id else []
+        covered = any(same_action(old, i, field) for i in kept for field in ("quote", "text"))
+        if (identity(old) not in seen and not covered and old["type"] in ("commitment", "next_step")
+                and any(extractor.quote_in_record(old["quote"], r) for r in sources)):
+            # A newer reply can make the extractor omit an existing action. Keep it for evidence-based review.
+            conn.execute(
+                "update insights set company_id = %s, opportunity_id = %s, source_record_ids = %s,"
+                " last_extracted_at = now() where id = %s",
+                (unit["company_id"], deal["id"], record_ids, old["id"]),
+            )
         else:
             conn.execute("delete from insights where id = %s", (old["id"],))
 
@@ -370,7 +468,7 @@ def extract_insights(payload: ExtractRequest, x_ingest_token: str | None = Heade
                 )}
                 if current != {r["id"]: r["updated_at"] for r in records}:
                     continue
-                _write_insights(conn, key, deal, records, kept, payload.backfill_scope)
+                _write_extracted_insights(conn, workspace_id, unit, deal, records, kept)
                 conn.execute("update source_records set extracted_version = %s where id = any(%s)",
                              (extractor.EXTRACTOR_VERSION, list(current)))
             counts["insights"] += len(kept)
@@ -438,6 +536,19 @@ def reconcile_commitments(x_ingest_token: str | None = Header(default=None)) -> 
     return reconcile(None)
 
 
+def _own_record_ids(item: dict) -> list:
+    """The origin message, or every record of the unit for an item extracted before origins existed."""
+    return [item["origin_record_id"]] if item["origin_record_id"] else list(item["source_record_ids"] or [])
+
+
+def _own_context(item: dict, own: dict) -> dict:
+    """What the checker reads as the item's own source, and the record an "event passed" verdict cites."""
+    ids = _own_record_ids(item)
+    records = [own[rid] for rid in ids if rid in own]
+    return {"record_id": ids[-1] if ids else None,
+            "own_text": " ".join(f"{r.get('subject') or ''} {r.get('body') or ''}" for r in records)}
+
+
 def reconcile(opportunity_ids: list[str] | None) -> dict:
     """The completion check for the given deals (all deals when None)."""
     client = _claude()
@@ -446,26 +557,28 @@ def reconcile(opportunity_ids: list[str] | None) -> dict:
     with db.connect() as conn:
         workspace_id = _workspace_id(conn)
         conn.row_factory = dict_row
+        # Items without a single origin message or a reliable origin date (legacy rows, undated notes) are still
+        # checked, against their whole unit and their stored date, as before origins existed.
         targets = conn.execute(
-            "select i.id, i.company_id, c.name as company, i.text, i.quote, i.due_date, i.occurred_at, i.source,"
-            " i.source_record_ids from insights i join companies c on c.id = i.company_id"
+            "select i.id, i.company_id, c.name as company, i.text, i.quote, i.due_date, i.source,"
+            " i.origin_record_id, i.source_record_ids, coalesce(i.origin_occurred_at, i.occurred_at) as occurred_at,"
+            " i.updated_at from insights i join companies c on c.id = i.company_id"
             " where i.workspace_id = %s and i.type in ('commitment', 'next_step') and i.owner_side = 'bianca'"
-            " and i.status = 'open' and i.occurred_at >= now() - interval '45 days'"
+            " and i.status = 'open'"
+            " and coalesce(i.origin_occurred_at, i.occurred_at) between now() - interval '45 days' and now()"
             " and (%s::text[] is null or i.opportunity_id::text = any(%s))"
-            " order by i.company_id, i.occurred_at", (workspace_id, opportunity_ids, opportunity_ids)).fetchall()
+            " order by i.company_id, coalesce(i.origin_occurred_at, i.occurred_at)",
+            (workspace_id, opportunity_ids, opportunity_ids)).fetchall()
         by_company: dict[str, list[dict]] = {}
         for t in targets:
             by_company.setdefault(str(t["company_id"]), []).append(t)
 
         for company_id, items in by_company.items():
-            own = {str(r["id"]): r for r in conn.execute(
-                "select id, subject, body from source_records where id = any(%s)",
-                ([rid for it in items for rid in it["source_record_ids"]],))}
-            item_map = {}
-            for n, it in enumerate(items, start=1):
-                recs = [own.get(str(rid)) for rid in it["source_record_ids"]]
-                item_map[f"T{n}"] = {**it, "ref": f"T{n}", "id": it["id"], "record_id": it["source_record_ids"][-1],
-                                     "own_text": " ".join(f"{r['subject'] or ''} {r['body'] or ''}" for r in recs if r)}
+            own = {r["id"]: r for r in conn.execute(
+                "select id, subject, body from source_records where workspace_id = %s and id = any(%s)",
+                (workspace_id, [rid for it in items for rid in _own_record_ids(it)]))}
+            item_map = {f"T{n}": {**it, "ref": f"T{n}", **_own_context(it, own)}
+                        for n, it in enumerate(items, start=1)}
             later = conn.execute(
                 "select id, source, subject, body, occurred_at from source_records where workspace_id = %s"
                 " and company_id = %s and status = 'classified' and body is not null and occurred_at > %s"
@@ -474,6 +587,7 @@ def reconcile(opportunity_ids: list[str] | None) -> dict:
             ).fetchall()[::-1]
             rec_map = {f"R{n}": {**r, "ref": f"R{n}"} for n, r in enumerate(later, start=1)}
             body = reconciler.render(today, items[0]["company"], list(item_map.values()), list(rec_map.values()))
+            conn.commit()
             try:
                 verdicts = reconciler.check(client, settings.anthropic_model, body)
             except (anthropic.APIStatusError, anthropic.APIConnectionError, ValueError) as exc:
@@ -481,17 +595,22 @@ def reconcile(opportunity_ids: list[str] | None) -> dict:
                 counts["failed_deals"] += 1
                 continue
             accepted = reconciler.validate(verdicts, item_map, rec_map)
+            by_id = {it["id"]: it for it in items}
             with conn.transaction():
                 for a in accepted:
+                    item = by_id[a["insight_id"]]
                     evidence = {k: a[k] for k in ("state", "record_id", "quote", "reason")}
                     evidence.update(checked_at=timeline.utcnow().isoformat(), checker_version=reconciler.CHECKER_VERSION)
-                    conn.execute("update insights set status = 'possibly_done', completion = %s where id = %s",
-                                 (Jsonb(evidence), a["insight_id"]))
+                    updated = conn.execute(
+                        "update insights set status = 'possibly_done', completion = %s"
+                        " where id = %s and status = 'open' and updated_at = %s",
+                        (Jsonb(evidence), item["id"], item["updated_at"]),
+                    )
+                    if updated.rowcount:
+                        counts["marked"] += 1
+                        results.append({"deal": item["company"], "item": item["text"], "state": a["state"],
+                                        "reason": a["reason"]})
             counts["deals"] += 1
             counts["items_checked"] += len(items)
-            counts["marked"] += len(accepted)
-            text_of = {str(v["id"]): v["text"] for v in item_map.values()}
-            results += [{"deal": items[0]["company"], "item": text_of[str(a["insight_id"])], "state": a["state"],
-                         "reason": a["reason"]} for a in accepted]
     log.info("reconcile: %s", counts)
     return {**counts, "marked_items": results}

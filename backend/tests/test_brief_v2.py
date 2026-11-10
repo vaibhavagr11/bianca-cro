@@ -12,7 +12,7 @@ from app.brief_v2 import (
     ChangeRow, DealView, Item, Note, TodayRow, Unanswered, _stage_badge, bucket, build_section, classify_event, completable,
     deal_status, describe_change,
     reply_text, first_sentence, has_request,
-    is_new_insight, item_kind, norm, primary_move, render, reply_label, resolve_owner, select_changes, subject,
+    is_new_insight, item_kind, norm, plain_text, primary_move, render, reply_label, resolve_owner, select_changes, subject,
     to_payload,
 )
 from app.main import app
@@ -110,6 +110,23 @@ def test_dated_customer_request_remains_visible_as_a_request():
     assert s.highlights[0][1].when == "requested by Oct 29"
 
 
+def test_working_clients_use_existing_action_sections_without_a_standalone_table():
+    overdue = item("Willow Retail", "Send the overdue report", due=TODAY - timedelta(days=5), id="overdue")
+    due_now = item("Willow Retail", "Confirm today's delivery", due=TODAY, id="today")
+    recommendation = Note("Schedule a routine account review", verified=True)
+    s = section("NC", [view("Willow Retail", 5), view("Birch Retail", 5, recommendation=recommendation)],
+                [overdue, due_now])
+
+    assert [(row.deal, row.item_id) for row in s.today] == [("Willow Retail", "today")]
+    assert [move.item_id for move in s.followups] == ["overdue"]
+    assert to_payload([s], [], [])["sections"][0]["customers"] == []
+    html = render([s], [], [], TODAY, 2, "c", False)
+    assert "Follow-ups that may be needed" in html and overdue.text in html
+    for body in (html, plain_text([s], TODAY)):
+        assert "Customer accounts" not in body
+        assert recommendation.text not in body
+
+
 # ---- stale opportunities and coverage (point 4)
 
 def test_old_last_contact_means_confirm_status_not_active():
@@ -172,7 +189,7 @@ def test_delegated_never_today_and_other_founders_deal_not_duplicated():
 def test_unverified_recommendation_does_not_become_a_move():
     v = view("FEMSA MX", 2, recommendation=Note("Re-engage the buyer", verified=False))
     m = primary_move(v, TODAY, set())
-    assert m.tag == "Status" and m.text == "No eligible sales action recorded" and m.link is None
+    assert m.tag == "Confirm status" and m.text == "Check where this deal stands" and m.link is None
 
 
 def test_first_sentence_keeps_moves_short():
@@ -401,7 +418,7 @@ def test_reply_needed_uses_the_extracted_request_without_duplicating_it_as_a_mov
     s = section("RG", [view("Pernod", 3, owner="RG", unanswered=specific)], [request])
     assert [(row.tag, row.text) for row in s.today] == [("Reply needed", request.text)]
     assert s.today[0].done == "insight:i"
-    assert s.highlights[0][1].text == "No additional sales action recorded"
+    assert s.highlights[0][1].text == "Check where this deal stands"
 
 
 def test_semantic_fixes_do_not_change_deal_selection():
@@ -502,13 +519,14 @@ def test_dark_mode_rules_preserve_both_badge_colors_without_opting_in_the_whole_
             assert selector + "{background-color:" + background + "!important;color:" + foreground + "!important}" in css
 
 
-def test_stage_badges_sit_below_escaped_company_names_in_all_four_company_tables():
+def test_stage_badges_sit_below_escaped_company_names():
     paused = item("Cedar & Co", due=TODAY, deal_owner="RG", id="paused")
     opening = item("Harbor Foods", due=TODAY + timedelta(days=2), deal_owner="RG", id="opening")
+    customer = item("Willow Retail", due=TODAY, deal_owner="RG", id="customer")
     views = [view("Cedar & Co", 0, owner="RG"), view("Harbor Foods", 1, owner="RG")]
     views += [view(label + " Co", rank, owner="RG") for rank, (label, _, _) in enumerate(BADGE_PALETTE[2:5], start=2)]
     views += [view("Willow Retail", 5, owner="RG")]
-    s = section("RG", views, [paused, opening])
+    s = section("RG", views, [paused, opening, customer])
     urgent = TodayRow("Nico <Urgent>", "4. Pilot", "Due now", "Review the file", "due today", "Nico DL", None)
     html = render([s], [urgent], [], TODAY, 7, "c", False, action_url=lambda ref: f"https://x/done?r={ref}")
     for company, label in (("Cedar &amp; Co", "Paused"), ("Harbor Foods", "Opening"), ("In Talks Co", "In Talks"),
@@ -549,7 +567,7 @@ def test_done_buttons_link_each_closable_row_and_skip_the_rest():
     assert html.count("✓ Done") >= len(refs)
     assert "https://x/done?r=insight:c" in html and "https://x/done?r=thread:t1" in html
     no_target = primary_move(view("Quiet Co", 2, owner="RG"), TODAY, set())
-    assert no_target.tag == "Status" and no_target.done is None
+    assert no_target.tag == "Confirm status" and no_target.done is None
 
 
 # ---------------------------------------------------------------- Nov 4 founder feedback: automated mail, waiting list
@@ -583,21 +601,62 @@ def test_people_are_not_automated(senders, subject):
 
 def msg(days_ago, frm, to=("juan@andina.cl",), automated=False, name="Juan Pérez"):
     return {"at": NOV4 - timedelta(days=days_ago), "from": [frm], "automated": automated,
-            "to": [{"address": a, "name": name if "andina" in a else ""} for a in to], "cc": []}
+            "to": [{"address": a, "name": name if "andina" in a else ""} for a in to], "cc": [],
+            "external_id": f"m-{days_ago}", "content_hash": f"hash-{days_ago}"}
+
+
+def expect_reply(latest, evidence=None, **overrides):
+    evidence = latest if evidence is None else evidence
+    latest["reply_expectation"] = {
+        "state": "expected",
+        "latest_message_id": latest["external_id"],
+        "latest_content_hash": latest["content_hash"],
+        "evidence_message_id": evidence["external_id"],
+        "evidence_content_hash": evidence["content_hash"],
+        "evidence_quote": "Could you send the signed agreement?",
+        "response": "Send the signed agreement",
+        **overrides,
+    }
+    return latest
 
 
 def test_waiting_counts_our_unanswered_emails_and_sees_through_an_out_of_office():
-    thread = [msg(40, "juan@andina.cl", to=("ramiro@bianca-ai.com",)), msg(20, "ramiro@bianca-ai.com"),
-              msg(9, "ramiro@bianca-ai.com"), msg(8.9, "juan@andina.cl", to=("ramiro@bianca-ai.com",), automated=True)]
+    ask = msg(20, "ramiro@bianca-ai.com")
+    nudge = expect_reply(msg(9, "ramiro@bianca-ai.com"), evidence=ask)
+    thread = [msg(40, "juan@andina.cl", to=("ramiro@bianca-ai.com",)), ask, nudge,
+              msg(8.9, "juan@andina.cl", to=("ramiro@bianca-ai.com",), automated=True)]
     w = waiting_on_them(thread, INTERNAL, NOV4)
     assert (w["to"], w["days"], w["nudges"], w["replied_before"], w["auto_reply"]) == ("Juan Pérez", 9, 2, True, True)
 
 
-def test_no_wait_when_they_answered_last_too_recent_or_internal_only():
-    assert waiting_on_them([msg(10, "ramiro@bianca-ai.com"), msg(5, "juan@andina.cl")], INTERNAL, NOV4) is None
-    assert waiting_on_them([msg(1, "ramiro@bianca-ai.com")], INTERNAL, NOV4) is None
-    assert waiting_on_them([msg(10, "ramiro@bianca-ai.com", to=("nico@bianca-ai.com",))], INTERNAL, NOV4) is None
-    assert waiting_on_them([msg(200, "ramiro@bianca-ai.com")], INTERNAL, NOV4) is None
+def test_no_wait_when_they_answered_last_or_latest_email_is_internal_only():
+    ask = expect_reply(msg(10, "ramiro@bianca-ai.com"))
+    assert waiting_on_them([ask, msg(5, "juan@andina.cl")], INTERNAL, NOV4) is None
+    internal = expect_reply(msg(10, "ramiro@bianca-ai.com", to=("nico@bianca-ai.com",)))
+    assert waiting_on_them([internal], INTERNAL, NOV4) is None
+
+
+@pytest.mark.parametrize("days,eligible", [(6, False), (7, True), (60, True), (61, False)])
+def test_waiting_age_is_seven_through_sixty_days(days, eligible):
+    waiting = waiting_on_them([expect_reply(msg(days, "ramiro@bianca-ai.com"))], INTERNAL, NOV4)
+    assert (waiting is not None) is eligible
+
+
+@pytest.mark.parametrize("overrides", [
+    {"state": "closed"},
+    {"state": "unclear"},
+    {"latest_message_id": "old-outbound"},
+    {"latest_content_hash": "old-outbound-body"},
+    {"evidence_message_id": "missing-message"},
+    {"evidence_content_hash": "old-evidence-body"},
+])
+def test_waiting_requires_current_expected_reply_with_current_evidence(overrides):
+    outbound = expect_reply(msg(10, "ramiro@bianca-ai.com"), **overrides)
+    assert waiting_on_them([outbound], INTERNAL, NOV4) is None
+
+
+def test_waiting_omits_outbound_with_no_reply_expectation():
+    assert waiting_on_them([msg(10, "ramiro@bianca-ai.com")], INTERNAL, NOV4) is None
 
 
 def wait(deal, days, owner="RG", rank=2, **kw):
@@ -607,11 +666,11 @@ def wait(deal, days, owner="RG", rank=2, **kw):
 
 
 def test_waiting_list_is_per_founder_prospects_first_newest_silence_first():
-    ws = [wait("Customer Co", 60, rank=5), wait("Andina Chile", 9), wait("Arca Peru", 70), wait("Nico deal", 5, owner="NC")]
+    ws = [wait("Customer Co", 60, rank=5), wait("Andina Chile", 9), wait("Arca Peru", 50), wait("Nico deal", 7, owner="NC")]
     shown, more = pick_waiting(ws, "RG")
     assert [w.deal for w in shown] == ["Andina Chile", "Arca Peru", "Customer Co"] and more == 0
-    assert waiting_text(wait("Arca Peru", 70, nudges=3, auto=True)) == "To Juan Pérez · no reply to our 3 emails, out-of-office received"
-    assert waiting_text(wait("Farmater", 4, nudges=8, replied=True)) == "To Juan Pérez · 8 emails since their last reply"
+    assert waiting_text(wait("Arca Peru", 50, nudges=3, auto=True)) == "To Juan Pérez · no reply to our 3 emails, out-of-office received"
+    assert waiting_text(wait("Farmater", 7, nudges=8, replied=True)) == "To Juan Pérez · 8 emails since their last reply"
 
 
 def test_waiting_list_renders_with_a_done_button():

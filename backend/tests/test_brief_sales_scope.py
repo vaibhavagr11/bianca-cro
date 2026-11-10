@@ -24,9 +24,12 @@ def email(key: str, company: str, body: str, *, days: int = 2, outgoing: bool = 
     ours = {"address": "ramiro@bianca.example", "name": "Ramiro"}
     theirs = {"address": f"buyer@{company}.example", "name": "Buyer"}
     at = NOW - timedelta(days=days)
+    expectation = ({"state": "expected", "latest_message_id": key, "latest_content_hash": f"h-{key}",
+                    "evidence_message_id": key, "evidence_content_hash": f"h-{key}"} if outgoing else None)
     return {"id": key, "thread_id": thread or key, "company_id": company, "subject": key,
             "body": body, "source": "gmail", "occurred_at": at, "created_at": at, "meta": {},
-            "participants": {"from": [ours if outgoing else theirs], "to": [theirs if outgoing else ours]}}
+            "participants": {"from": [ours if outgoing else theirs], "to": [theirs if outgoing else ours]},
+            "external_id": key, "content_hash": f"h-{key}", "unclassified": False, "reply_expectation": expectation}
 
 
 def insight(key: str, company: str, text: str, scope: str | None, *, type_: str = "commitment",
@@ -38,7 +41,8 @@ def insight(key: str, company: str, text: str, scope: str | None, *, type_: str 
             "due_date": NOW.date() if dated else None, "status": "open", "action_scope": scope,
             "source": origin["source"] if origin else "notes", "unit_id": origin["thread_id"] if origin else key,
             "origin_record_id": origin["id"] if origin else key, "source_record_ids": [origin["id"] if origin else key],
-            "occurred_at": at, "created_at": at, "meta": {}}
+            "occurred_at": at, "created_at": at, "meta": {}, "last_extracted_at": at,
+            "origin_occurred_at": at if origin else None, "updated_at": at}
 
 
 class Result(list):
@@ -82,7 +86,9 @@ class BriefData:
                 for message in sorted(self.messages, key=lambda m: m["occurred_at"]):
                     latest[message["thread_id"]] = message
                 return Result(latest.values())
-            return Result(sorted(self.messages, key=lambda m: (m["thread_id"], m["occurred_at"])))
+            latest_first = "occurred_at desc" in query
+            return Result(sorted(self.messages, key=lambda m: (m["thread_id"], -m["occurred_at"].timestamp()
+                                                                 if latest_first else m["occurred_at"].timestamp())))
         if "from source_records" in query and "id = any" in query:
             return Result([m for m in self.messages if m["id"] in params[0]])
         raise AssertionError(f"Unexpected query: {query}")
@@ -95,8 +101,8 @@ def scoped_brief(monkeypatch):
     old = email("old-email", "repeat", old_quote, days=6, thread="repeat-thread")
     repeat = email("quoted-support-email", "repeat", f"Could you fix the export? Earlier: {old_quote}",
                    thread="repeat-thread")
-    outgoing = email("outbound-sales-ask", "sales-wait", "Can you approve the proposal?", days=4, outgoing=True)
-    support = email("outbound-support-ask", "support-wait", "Can you retry the report?", days=4, outgoing=True)
+    outgoing = email("outbound-sales-ask", "sales-wait", "Can you approve the proposal?", days=8, outgoing=True)
+    support = email("outbound-support-ask", "support-wait", "Can you retry the report?", days=8, outgoing=True)
     later_support = email("later-support-ask", "sales-wait", "Can you retry the export?", outgoing=True)
     stale = email("unscoped-support-email", "unscoped", "Could you add another dashboard?", days=2)
     messages = [inbound, old, repeat, outgoing, support, later_support, stale]
@@ -158,13 +164,14 @@ def test_brief_requires_sales_scope_for_stored_actions_and_exact_email_asks(scop
     assert "Share the pricing deck" in html
     assert "Send the pilot terms" in html
     assert SALES_ASK in html
-    assert "Confirm the renewal decision date" in html
+    # Customer-account suggestions only appear in v1: master removed v2's Customer accounts section.
+    assert ("Confirm the renewal decision date" in html) == (version == "v1")
     assert "Fix the sales dashboard" not in html
     assert "Refactor the analytics exporter" not in html
     assert "Repair the data connector" not in html
-    assert "Add another dashboard" not in html
+    assert "Add another dashboard" in html       # extracted before scopes existed: shown until re-extracted
     assert "quoted-support-email" not in html
-    assert "unscoped-support-email" not in html
+    # (the not-yet-scoped "Add another dashboard" row now shows, linking to its own email)
 
     if version == "v2":
         founder = result["payload"]["sections"][0]

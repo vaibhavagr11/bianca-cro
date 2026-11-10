@@ -40,6 +40,8 @@ class ExtractedInsight(BaseModel):
         description="YYYY-MM-DD when the quote gives a firm date. Null for an estimated date or timing window.")
     deadline_quote: str | None = Field(default=None, description="Verbatim timing phrase inside quote that supports due_date.")
     confidence: Literal["high", "medium", "low"]
+    source_ref: str | None = Field(default=None, description="The M-number labeling the exact message or record "
+                                                             "that contains the quote, if provided in the input.")
 
 
 class Extraction(BaseModel):
@@ -76,10 +78,11 @@ Extract only what the text actually says, as a list of insights:
   without a specific ask stays context. A scheduled meeting is a calendar event, and completed work is history.
 
 Rules:
-- quote: copy a passage verbatim from one source subject or body. When labeled, return its M-number as
-  source_ref. Use the original message, not the earlier text repeated in a reply. The English one-liner,
-  scope, action status, owner and timing must be supported by that passage and explicit context in the same
-  source, such as the sender of a first-person promise. A matching quote does not support additional facts.
+- quote: copy a passage verbatim from one source subject or body, never translated or paraphrased, and not a
+  header, timestamp or sender label. When labeled, return its M-number as source_ref. Use the original message,
+  not the earlier text repeated in a reply. The English one-liner, scope, action status, owner and timing must be
+  supported by that passage and explicit context in the same source, such as the sender of a first-person promise.
+  A matching quote does not support additional facts.
 - Commitments and next steps: say who must act (owner_side bianca/customer/unclear). Fill owner_name only when
   the text names or clearly identifies the person (an email's sender saying "I'll...", "NDL:", "Rama manda...").
   "We will", "nosotros", or an unattributed task -> owner_name null. Use owner_side=unclear when the responsible
@@ -152,15 +155,13 @@ def validate(extraction: Extraction, text: str, records: dict[str, dict] | None 
                 # A subject often persists unchanged across the whole thread. It cannot prove a new request.
                 return quote_in_record(i.quote, record, body_only=record.get("source") == "gmail" and i.type == "next_step")
 
-            if i.source_ref:
-                record = records.get(i.source_ref)
-                origin = record if record and supports(record) else None
-            else:
-                matches = [record for record in records.values() if supports(record)]
-                origin = matches[0] if len(matches) == 1 else None
-            if origin is None:
-                dropped += 1
-                continue
+            # The quote is verbatim in the input, so a wrong or missing M-number never drops it: use the labeled
+            # record if it holds the quote, else the only record that does, else keep it without an origin.
+            matches = {ref: rec for ref, rec in records.items() if supports(rec)}
+            if i.source_ref in matches:
+                origin = matches[i.source_ref]
+            elif len(matches) == 1:
+                origin = next(iter(matches.values()))
         actionable = i.type in ("commitment", "next_step")
         kept.append({
             "type": i.type,
@@ -173,6 +174,10 @@ def validate(extraction: Extraction, text: str, records: dict[str, dict] | None 
             "action_scope": i.action_scope,
             "origin_record_id": origin["id"] if origin else None,
         })
+        if records is not None:
+            reliable = origin is not None and not (origin.get("meta") or {}).get("date_inferred")
+            kept[-1].update(origin_record_id=origin["id"] if origin else None,
+                            origin_occurred_at=origin["occurred_at"] if reliable else None)
     return kept, dropped
 
 

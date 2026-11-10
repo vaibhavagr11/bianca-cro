@@ -1,4 +1,4 @@
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     brief_critical_ahead_days: int = 3
     # Preferred number of active In Talks deals among the four shown per founder (not a quota).
     brief_in_talks_target: int = 2
+    # Turn on after n8n is configured to provide receipts and check ready_to_send.
+    brief_verification_required: bool = False
+    brief_verification_feeds: list[str] = ["gmail:RG", "gmail:NC", "calendar:RG", "calendar:NC", "notes", "pipeline"]
+    brief_verification_sync_hours: int = Field(default=6, gt=0)
+    brief_verification_token_budget: int = Field(default=24000, ge=0)
     # Threads classified per /process/classify call.
     classify_batch_threads: int = 10
 
