@@ -26,7 +26,7 @@ test('Live page starts without sample company data, browser storage, or hardcode
   assert.equal(html.includes('sessionStorage'),false);
   assert.equal(html.includes('bianca-core'),false);
   assert.ok(html.includes('<h1>Sales Pipeline Updates</h1>'));
-  assert.ok(html.includes('<option value="NDL">Nico · NDL</option>'));
+  assert.ok(html.includes('<option value="NDL">Nicolás de León · NDL</option>'));
   assert.ok(html.includes('id="pending-count">0'));
   for(const match of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g))new Function(match[1]);
 });
@@ -207,21 +207,24 @@ test('The actual live UI starts empty and explains missing connector access',()=
   assert.equal(page.get('#sign-in-form').hidden,true);
 });
 
-test('Company cards display source types and dates without source quotes',async()=>{
+test('Company cards display escaped source labels in closed disclosures without exposing source quotes',async()=>{
   const s=snapshot();
   s.proposals[0].sources=[
-    {type:'Meeting notes',date:'2026-09-28',quote:'Hidden notes quotation.'},
-    {type:'Email',date:'2026-10-06',quote:'Hidden email quotation.'},
-    {type:'Calendar',date:'2026-10-07',quote:'Hidden calendar quotation.'},
-    {type:'Email',date:'',quote:'Hidden undated quotation.'},
-    {type:'<img src=x>',date:'<script>',quote:'Hidden malicious quotation.'}
+    {id:'email-scope',type:'Meeting notes',date:'2026-09-28',subject:'Pilot notes',quote:'Notes quotation.'},
+    {id:'email-review',type:'Email',date:'2026-10-06',subject:'Review request',quote:'Email quotation.'},
+    {id:'calendar-kickoff',type:'Calendar',date:'2026-10-07',subject:'<script>Calendar',quote:'<img src=x> Calendar quotation.'},
+    {id:'undated-email',type:'Email',date:'',subject:'Additional update',quote:'Fourth excerpt.'}
   ];
   const page=fakePage({callTool:async()=>({structuredContent:s})});
   await new Promise(resolve=>setImmediate(resolve));
   const card=page.get('#review-list').innerHTML;
-  for(const label of ['Notes · Sep 28','Email · Oct 6','Calendar · Oct 7','Email · Undated'])assert.ok(card.includes(label),label);
+  for(const [title,label] of [
+    ['Pilot notes','Source: Notes, Sep 28'],
+    ['Review request','Source: Email, Oct 6'],
+    ['&lt;script&gt;Calendar','Source: Calendar, Oct 7']
+  ])assert.ok(card.includes(`<details><summary><span>${title}</span><span class="src">${label}</span></summary><div class="ctx">${title}</div></details>`),label);
   for(const source of s.proposals[0].sources)assert.equal(card.includes(source.quote),false);
-  assert.equal(card.includes('View source context'),false);
+  assert.equal(card.includes('Fourth excerpt.'),false);
   assert.equal(card.includes('<img src=x>'),false);
   assert.equal(card.includes('<script>'),false);
 });
@@ -237,7 +240,8 @@ test('Current Next steps is a collapsed native dropdown using the latest matchin
   const details=card.match(/<details[^>]*class="current-next-steps"[^>]*>([\s\S]*?)<\/details>/);
   assert.ok(details,'Current Next steps uses a native details element.');
   assert.equal(/\sopen(?:[\s=>])/.test(details[0].slice(0,details[0].indexOf('>'))),false);
-  assert.ok(details[1].includes('<summary>Current Next steps</summary>'));
+  assert.ok(details[1].includes('<summary>Current Sheet cells</summary>'));
+  assert.ok(details[1].includes('<h4>Next step (now)</h4>'));
   assert.ok(details[1].includes('- Current action &amp; details.\n- &lt;img src=x&gt; Follow up.'));
   assert.equal(card.includes('Outdated proposal context'),false);
   assert.equal(card.includes('Another company context'),false);
@@ -324,7 +328,7 @@ test('An approval with a stale mirror shows a persistent full-sync notice until 
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(page.get('#mirror-sync-notice').hidden,false);
   assert.ok(page.get('#mirror-sync-notice').textContent.includes('pipeline snapshot needs a full sync'));
-  assert.ok(page.get('#toast-region').innerHTML.includes('Google Sheet updated. Pipeline snapshot needs a full sync.'));
+  assert.ok(page.get('#toast-region').innerHTML.includes('Written to the Sheet copy. Pipeline snapshot needs a full sync.'));
   assert.equal(page.get('#pending-count').textContent,0,'A confirmed decision removes its card even when the pipeline mirror needs a sync.');
   assert.ok(page.get('#activity-list').innerHTML.includes('Confirm the scope.'),'Confirmed approval remains visible in the decision history.');
   await page.get('#refresh-updates').onclick();
@@ -436,9 +440,11 @@ test('Cards show separate destination sections and read-only current Client Cont
   const page=fakePage({callTool:async()=>({structuredContent:s})});
   await new Promise(resolve=>setImmediate(resolve));
   const card=page.get('#review-list').innerHTML;
-  assert.ok(card.includes('Next Step · actions and blockers'));
-  assert.ok(card.includes('Client Context · needs, signals, and objections'));
-  assert.ok(card.includes('<summary>Current Client Context</summary>'));
+  assert.ok(card.includes('Suggested next steps'));
+  assert.ok(card.includes('data-destination="nextStep"'));
+  assert.ok(card.includes('data-destination="clientContext"'));
+  assert.ok(card.includes('<summary>Current Sheet cells</summary>'));
+  assert.ok(card.includes('<h4>Client context (now)</h4>'));
   assert.ok(card.includes('- Current context &amp; details.\n- &lt;img src=x&gt; Escaped.'));
   assert.equal(card.includes('Older proposal context'),false);
   assert.equal(card.includes('<img src=x>'),false);
@@ -533,10 +539,10 @@ test('Lineage validates exact text and known source identities rather than label
     value=>{value.sources.push({...value.sources[0],subject:'A conflicting identity'});}
   ]){const value=json(p);mutate(value);assert.equal(core.trace(value).available,false);}
   const duplicate=json(p);duplicate.sources.push({...duplicate.sources[0]});
-  assert.equal(core.trace(duplicate).sources.length,3,'One source version has one chip even when repeated in evidence.');
+  assert.equal(core.trace(duplicate).sources.length,3,'A repeated source version has one source identity.');
 });
 
-test('A source click highlights only its associated bullets across both destinations without a write',async()=>{
+test('The source-selection handler highlights only associated bullets without a write',async()=>{
   let writes=0;
   const page=fakePage({callTool:async name=>{if(name!==core.TOOLS.workspace)writes++;return {structuredContent:tracedWorkspace()};}});
   await new Promise(resolve=>setImmediate(resolve));
@@ -545,7 +551,6 @@ test('A source click highlights only its associated bullets across both destinat
   assert.equal(highlighted(card,'action-codes'),true);
   assert.equal(highlighted(card,'action-checklist'),false);
   assert.equal(highlighted(card,'context-pilot'),true);
-  assert.ok(card.includes('data-source-id="email-a" data-source-unavailable="false" aria-pressed="true"'));
   assert.ok(page.get('#announcer').textContent.includes('2 bullets highlighted from Email · Nov 2'));
   sourceClick(page,'p-1','notes-a');card=articleHtml(page);
   assert.equal(highlighted(card,'action-codes'),false);
@@ -558,12 +563,11 @@ test('A source click highlights only its associated bullets across both destinat
   assert.equal(writes,0);
 });
 
-test('Same-date source chips remain distinct native keyboard buttons with descriptive accessible names',async()=>{
+test('Same-date sources remain distinct native disclosures with descriptive summaries',async()=>{
   const page=fakePage({callTool:async()=>({structuredContent:tracedWorkspace()})});await new Promise(resolve=>setImmediate(resolve));
   const card=articleHtml(page);
-  assert.ok(card.includes('<button type="button" class="source-label" data-action="source" data-source-id="email-a"'));
-  assert.ok(card.includes('Highlight bullets from Email · Nov 2 — Revised store list (source 1)'));
-  assert.ok(card.includes('Highlight bullets from Email · Nov 2 — Launch confirmation (source 3)'));
+  assert.ok(card.includes('<details><summary><span>Revised store list</span><span class="src">Source: Email, Nov 2</span></summary>'));
+  assert.ok(card.includes('<details><summary><span>Launch confirmation</span><span class="src">Source: Email, Nov 2</span></summary>'));
   sourceClick(page,'p-1','email-b');
   const selected=articleHtml(page);
   assert.equal(highlighted(selected,'action-codes'),false);
@@ -590,7 +594,7 @@ test('Refresh preserves a still-present selected source by stable identity, not 
   const card=articleHtml(page);
   assert.equal(highlighted(card,'action-codes'),false);
   assert.equal(highlighted(card,'action-checklist'),true);
-  assert.ok(card.includes('data-source-id="email-b" data-source-unavailable="false" aria-pressed="true"'));
+  assert.equal(highlighted(card,'context-pilot'),true);
 });
 
 test('Refresh clears a selected source when the new revision no longer includes it',async()=>{
@@ -601,8 +605,10 @@ test('Refresh clears a selected source when the new revision no longer includes 
   p.sources=p.sources.filter(source=>source.id!=='email-a');
   p.bulletLineage.nextStep[0].sourceIds=['email-b'];p.bulletLineage.clientContext[0].sourceIds=['email-b'];
   await page.get('#refresh-updates').onclick();
-  assert.equal(articleHtml(page).includes('class="source-highlight"'),false);
-  assert.ok(articleHtml(page).includes('Select a source to highlight'));
+  const card=articleHtml(page);
+  assert.equal(card.includes('class="source-highlight"'),false);
+  assert.equal(card.includes('Revised store list'),false);
+  assert.ok(card.includes('Launch confirmation'));
 });
 
 test('Missing or invalid lineage never fabricates source highlights and blocks a new approval',async()=>{
@@ -646,7 +652,7 @@ test('Founder-edited bullets with explicit empty provenance do not claim support
   assert.deepEqual(json(data.lineage.nextStep[0].sourceIds),[]);
 });
 
-test('An entirely founder-edited saved approval explains why its source chips are unavailable',async()=>{
+test('An entirely founder-edited saved approval explains its missing attribution and remains retryable',async()=>{
   const s=snapshot('applying'),p=s.proposals[0];
   p.nextStepBullets=['A founder supplied action.'];
   p.bulletLineage.nextStep=[{bulletId:'founder-edit',text:p.nextStepBullets[0],sourceIds:[],origin:'founder_edit'}];
@@ -654,7 +660,7 @@ test('An entirely founder-edited saved approval explains why its source chips ar
   const page=fakePage({callTool:async()=>({structuredContent:s})});await new Promise(resolve=>setImmediate(resolve));
   const card=articleHtml(page);
   assert.ok(card.includes('These founder-edited bullets have no source attribution.'));
-  assert.ok(card.includes('data-source-unavailable="true"'));
+  assert.equal(card.includes('class="source-highlight"'),false);
   assert.ok(card.includes('data-action="retry"'));
 });
 
