@@ -23,7 +23,7 @@ def insight(**overrides):
     return {"id": "extract-1", "type": "next_step", "text": "Send the launch checklist.",
             "quote": "Send the launch checklist.", "source_record_ids": ["record-1"],
             "owner_side": "bianca", "owner_name": None, "due_date": None,
-            "occurred_at": NOW, "status": "open", **overrides}
+            "occurred_at": NOW, "status": "open", "action_scope": "deal_progression", **overrides}
 
 
 def stored(content, **overrides):
@@ -35,20 +35,34 @@ def stored(content, **overrides):
 def test_only_records_containing_the_supporting_passage_receive_bullet_edges():
     email = record()
     notes = record(2, source="notes", body="A different discussion.")
-    actions, context, sources, lineage = proposal_content([email, notes], [insight(source_record_ids=[email["id"], notes["id"]])])
+    actions, context, sources, lineage = proposal_content(
+        [email, notes], [insight(action_scope=None, source_record_ids=[email["id"], notes["id"]])])
     assert context == []
-    assert actions[0] == "We owe: Send the launch checklist."
+    assert actions == ["Next step: Send the launch checklist."]
     assert lineage["nextStep"][0]["sourceIds"] == [source_id(email)]
-    assert lineage["nextStep"][1]["sourceIds"] == [source_id(notes)]
-    assert len(sources) == 2
+    assert len(sources) == 1
     assert validate_lineage(actions, context, sources, lineage)
+
+
+def test_origin_selects_exact_record_and_ambiguous_legacy_quote_is_unattributed():
+    first, second = record(), record(2)
+    possible_ids = [first["id"], second["id"]]
+    old = insight(action_scope=None, source_record_ids=possible_ids)
+    assert proposal_content([first, second], [old]) == proposal_content([], [])
+
+    exact = insight(origin_record_id=second["id"], source_record_ids=possible_ids)
+    actions, context, sources, lineage = proposal_content([first, second], [exact])
+    assert lineage["nextStep"][0]["sourceIds"] == [source_id(second)]
+    assert validate_lineage(actions, context, sources, lineage)
+    assert proposal_content([first], [exact]) == proposal_content([], [])
+    assert proposal_content([first, {**second, "body": "An unrelated reply."}], [exact]) == proposal_content([], [])
 
 
 def test_same_bullet_from_multiple_records_is_deduplicated_and_unions_support():
     first, second = record(), record(2, source="notes")
     actions, context, sources, lineage = proposal_content([first, second], [
         insight(), insight(id="extract-2", source_record_ids=[second["id"]])])
-    assert actions == ["We owe: Send the launch checklist."]
+    assert actions == ["Next step: Send the launch checklist."]
     assert len(sources) == 2
     assert lineage["nextStep"][0]["sourceIds"] == sorted([source_id(first), source_id(second)])
     assert validate_lineage(actions, context, sources, lineage)
@@ -64,11 +78,14 @@ def test_two_insights_from_one_source_have_two_edges_but_one_source_button():
 
 
 def test_same_display_type_and_date_does_not_collapse_different_email_records():
-    actions, context, sources, lineage = proposal_content([record(), record(2)], [])
+    first, second = record(), record(2)
+    actions, context, sources, lineage = proposal_content([first, second], [
+        insight(origin_record_id=first["id"]), insight(origin_record_id=second["id"]),
+    ])
     assert len(sources) == 2
     assert sources[0]["type"] == sources[1]["type"] and sources[0]["date"] == sources[1]["date"]
     assert sources[0]["id"] != sources[1]["id"]
-    assert len(actions) == 1, "Identical fallback wording may share one bullet with both true source edges."
+    assert len(actions) == 1
     assert len(lineage["nextStep"][0]["sourceIds"]) == 2
     assert validate_lineage(actions, context, sources, lineage)
 
@@ -89,14 +106,43 @@ def test_source_receipt_version_is_compatible_with_the_pre_lineage_branch():
         "version": "efc8a284f7ebf201b2b2d58c0c3d3ef42e64e63b40436e01d864188ac09c420b"}
 
 
-def test_calendar_title_does_not_support_a_commercial_statement_but_fallback_has_lineage():
+def test_calendar_title_and_gmail_subject_do_not_create_next_steps():
     meeting = record(source="calendar", body="", subject="Purchase approved", meta={"status": "cancelled"})
-    actions, context, sources, lineage = proposal_content([meeting], [insight(
-        type="buying_signal", quote="Purchase approved", text="Customer approved purchase.")])
-    assert context == []
-    assert actions[0].startswith("Meeting cancelled")
-    assert lineage["nextStep"][0]["sourceIds"] == [source_id(meeting)]
-    assert validate_lineage(actions, context, sources, lineage)
+    email = record(2, subject="Can you send the proposal?", body="Thanks for your time.")
+    content = proposal_content([meeting, email], [
+        insight(type="buying_signal", quote=meeting["subject"], text="Customer approved purchase."),
+        insight(quote=email["subject"], text="Customer asked for the proposal.", origin_record_id=email["id"]),
+    ])
+    assert content == proposal_content([], [])
+    assert validate_lineage(*content)
+
+
+def test_mixed_source_keeps_sales_actions_and_context_without_delivery_fallback():
+    sales = record(body="We will share the proposal on Friday. Can you send pilot pricing by Friday? "
+                        "Budget approval depends on pilot cost. Fix the dashboard. Send dashboard usage metrics.")
+    support = record(2, body="Please rebuild the sales dashboard.")
+    content = proposal_content([sales, support], [
+        insight(type="commitment", text="We will share the proposal.", quote="We will share the proposal on Friday.",
+                origin_record_id=sales["id"], due_date="2026-11-06"),
+        insight(text="Customer requested pilot pricing.", quote="Can you send pilot pricing by Friday?",
+                origin_record_id=sales["id"], due_date="2026-11-06"),
+        insight(type="objection", text="Budget approval depends on pilot cost.",
+                quote="Budget approval depends on pilot cost.", origin_record_id=sales["id"]),
+        insight(type="commitment", text="Fix the dashboard.", quote="Fix the dashboard.",
+                origin_record_id=sales["id"], action_scope="delivery"),
+        insight(type="need", text="Send dashboard usage metrics.", quote="Send dashboard usage metrics.",
+                origin_record_id=sales["id"], action_scope="out_of_scope"),
+        insight(text="Please rebuild the sales dashboard.", quote="Please rebuild the sales dashboard.",
+                origin_record_id=support["id"], action_scope="delivery"),
+    ])
+    actions, context, sources, lineage = content
+    assert actions == [
+        "Next step: Customer requested pilot pricing. — requested by 2026-11-06",
+        "We owe: We will share the proposal. — due 2026-11-06",
+    ]
+    assert context == ["Objection: Budget approval depends on pilot cost."]
+    assert [s["recordId"] for s in sources] == [sales["id"]]
+    assert validate_lineage(*content)
 
 
 @pytest.mark.parametrize("type_,destination", [("next_step", "nextStep"), ("commitment", "nextStep"),
@@ -111,10 +157,10 @@ def test_type_routing_keeps_its_own_aligned_lineage(type_, destination):
 
 
 def test_unverifiable_or_completed_insight_never_gets_a_false_support_edge():
-    for change in [{"quote": "Invented passage"}, {"status": "done"}, {"status": "possibly_done"}]:
+    for change in [{"quote": "Invented passage"}, {"status": "done"}, {"status": "possibly_done"},
+                   {"origin_record_id": "record-2"}]:
         content = proposal_content([record()], [insight(**change)])
-        assert content[0][0].startswith("Commercial email recorded")
-        assert content[3]["nextStep"][0]["sourceIds"] == [source_id(record())]
+        assert content == proposal_content([], [])
         assert validate_lineage(*content)
 
 
@@ -130,7 +176,7 @@ def test_pending_merge_keeps_old_content_and_appends_new_days_with_exact_edges()
         text="Review the store codes.", quote="Review the store codes.")])
     before = copy.deepcopy(first)
     merged = merge_content(stored(first), fresh)
-    assert merged[0] == ["We owe: Send the launch checklist.", "We owe: Review the store codes."]
+    assert merged[0] == ["Next step: Send the launch checklist.", "Next step: Review the store codes."]
     assert merged[3]["nextStep"][0]["sourceIds"] == first[3]["nextStep"][0]["sourceIds"]
     assert merged[3]["nextStep"][1]["sourceIds"] == fresh[3]["nextStep"][0]["sourceIds"]
     assert first == before, "Merging must not mutate a previous stored snapshot."

@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import pytest
 
 from app import review_service as review
-from app.review_content import bullet_id, source_id
 from app.review_sheets import SheetConflict, SheetWriteUncertain
 
 
@@ -33,18 +32,23 @@ def insight(**overrides):
             "occurred_at": NOW, "status": "open", **overrides}
 
 
+def insight_for_record(material):
+    if material["body"] == record()["body"]:
+        return insight(source_record_ids=[material["id"]], occurred_at=material["occurred_at"])
+    return insight(id=f"insight-{material['id']}", source_record_ids=[material["id"]],
+                   origin_record_id=material["id"], action_scope="deal_progression", text=material["body"],
+                   quote=material["body"], occurred_at=material["occurred_at"], owner_name=None, due_date=None)
+
+
 def proposal(**overrides):
     version = review.source_version(record())
-    source = {"id": source_id(record()), "recordId": RECORD, "source": "gmail", "externalId": "message-1",
-              "version": version["version"], "type": "Email", "date": "2026-11-02", "quote": insight()["quote"],
-              "quotes": [insight()["quote"]]}
+    next_steps, context, sources, lineage = review.proposal_content([record()], [insight()])
     value = {"id": PROPOSAL, "workspace_id": WORKSPACE, "company_id": COMPANY, "opportunity_id": OPPORTUNITY,
              "company_name": "Pernod Ricard", "owner_code": "NDL", "stage": "4. Pilot", "country": "ARG",
-             "bullets": ["Send the pilot checklist."], "next_step_bullets": ["Send the pilot checklist."],
-             "client_context_bullets": [], "routing_version": 1, "snapshot_client_context": "", "sources": [source],
+             "bullets": next_steps + context, "next_step_bullets": next_steps,
+             "client_context_bullets": context, "routing_version": 1, "snapshot_client_context": "", "sources": sources,
              "source_versions": [version], "observed_source_versions": [version], "lineage_version": 1,
-             "bullet_lineage": {"nextStep": [{"bulletId": bullet_id("nextStep", "Send the pilot checklist."),
-                                               "text": "Send the pilot checklist.", "sourceIds": [source["id"]]}], "clientContext": []},
+             "bullet_lineage": lineage,
              "snapshot_last_progress": "Pilot terms agreed.", "snapshot_next_step": "Ask for the signed agreement.",
              "revision": 1, "status": "pending", "created_at": NOW, "updated_at": NOW, "removed_at": None}
     value.update(overrides)
@@ -71,23 +75,19 @@ def test_existing_insight_wording_owner_and_due_date_are_preserved_and_quoted():
 def test_old_thread_context_is_not_repeated_when_only_a_new_message_needs_review():
     new_message = record(body="Thanks, that works.")
     bullets, _, _, _ = review.proposal_content([new_message], [insight(source_record_ids=["older-record", RECORD])])
-    assert len(bullets) == 1
-    assert bullets[0].startswith("Commercial email recorded")
-    assert "We owe" not in bullets[0]
+    assert not bullets
 
 
 def test_calendar_title_only_cannot_become_a_buying_signal_or_completed_meeting():
     meeting = record(source="calendar", body="", subject="Pilot purchase approved", occurred_at="2026-11-05T12:00:00Z")
-    bullets, _, _, _ = review.proposal_content([meeting], [insight(type="buying_signal", quote="Pilot purchase approved",
-                                                           text="Customer approved the purchase.")])
-    assert bullets == ["Meeting scheduled (2026-11-05): Pilot purchase approved. Review the agenda and confirm any next actions."]
-    assert "Buying signal:" not in bullets[0]
+    bullets, context, _, _ = review.proposal_content([meeting], [insight(type="buying_signal", quote="Pilot purchase approved",
+                                                                    text="Customer approved the purchase.")])
+    assert not bullets and not context
 
 
-def test_cancelled_calendar_record_has_explicit_factual_fallback():
+def test_cancelled_calendar_record_does_not_create_a_sheet_update():
     bullets, _, sources, _ = review.proposal_content([record(source="calendar", meta={"status": "cancelled"})], [])
-    assert bullets[0].startswith("Meeting cancelled (2026-11-02)")
-    assert sources[0]["type"] == "Calendar"
+    assert not bullets and not sources
 
 
 def test_completed_or_unverifiable_insights_are_not_presented_as_open_actions():
@@ -130,6 +130,7 @@ class Store:
         self.locked = True
         self.fail_finalize = False
         self.source_record = record()
+        self.insights = [insight()]
 
     def connect(self):
         return DecisionConnection(self)
@@ -166,6 +167,8 @@ class DecisionConnection:
             return Result([copy.deepcopy(p)] if str(p["workspace_id"]) == str(params[0]) and str(p["id"]) == params[1] else [])
         if q.startswith("select * from source_records"):
             return Result([self.store.source_record])
+        if q.startswith("select * from insights"):
+            return Result([i for i in self.store.insights if set(i["source_record_ids"]) & set(params[-1])])
         if q.startswith("select * from review_decisions"):
             return Result([copy.deepcopy(i) for i in self.data["intents"] if i["idempotency_key"] == params[1]])
         if q.startswith("insert into review_decisions"):
@@ -269,7 +272,7 @@ def test_approval_replaces_last_progress_exactly_and_updates_only_after_confirme
     result = approve()
     assert sheets.last_progress == old_next
     assert sheets.last_progress != old_last
-    assert sheets.next_step == "- Send the pilot checklist."
+    assert sheets.next_step == "- " + proposal()["next_step_bullets"][0]
     assert store.data["proposal"]["status"] == "approved"
     assert result["activity"]["actor"] == "NDL"
     assert result["activity"]["before"] == {"lastProgress": old_last, "nextStep": old_next, "clientContext": ""}
@@ -333,6 +336,16 @@ def test_changed_source_material_blocks_a_stale_card_even_before_the_next_builde
     assert not store.data["intents"]
 
 
+@pytest.mark.parametrize("edited", [False, True])
+def test_delivery_reclassification_blocks_a_stale_card_before_a_sheet_read(service, edited):
+    store, sheets = service
+    store.insights[0]["action_scope"] = "delivery"
+    with pytest.raises(review.ReviewConflict, match="sales evidence changed"):
+        approve(["Edited next step."] if edited else None)
+    assert "sheet-read" not in store.events
+    assert not sheets.calls and not store.data["intents"] and not store.data["receipts"]
+
+
 def test_uncertain_write_retains_fixed_intent_and_same_key_retry_recovers_without_rotation(service):
     store, sheets = service
     old_next = sheets.next_step
@@ -343,6 +356,7 @@ def test_uncertain_write_retains_fixed_intent_and_same_key_retry_recovers_withou
     assert store.data["intents"][0]["status"] == "applying"
     assert not store.data["receipts"]
     assert sheets.last_progress == old_next
+    store.insights[0]["action_scope"] = "delivery"
     with pytest.raises(review.ReviewConflict):
         review.decide(WORKSPACE, PROPOSAL, "NC", "approve", 1, "different-key", next_step_bullets=["Edited next action."])
     result = approve(["Edited next action."])
@@ -471,7 +485,9 @@ class BuildConnection:
                         if len(params) == 2 else self.records.get(params[1], []) if self.records_enabled else [])
             return Result(copy.deepcopy([r for r in material if review._instant(r["created_at"]) <= params[-1]]))
         if q.startswith("select * from insights"):
-            return Result(copy.deepcopy(self.insights if self.insights is not None else [insight()]))
+            insights = (self.insights if self.insights is not None else
+                        [insight_for_record(r) for r in self.records[params[1]]])
+            return Result(copy.deepcopy([i for i in insights if set(i["source_record_ids"]) & set(params[-1])]))
         if q.startswith("insert into review_proposals"):
             keys = ["workspace_id", "company_id", "opportunity_id", "company_name", "owner_code", "stage", "country",
                     "bullets", "sources", "source_versions", "snapshot_last_progress", "snapshot_next_step",
@@ -485,6 +501,7 @@ class BuildConnection:
             if "status = 'superseded'" in q:
                 item = next(p for p in self.proposals.values() if p["id"] == params[0])
                 item["status"] = "superseded"
+                item["revision"] += 1
                 return Result([])
             keys = ["company_name", "owner_code", "stage", "country", "bullets", "sources", "source_versions",
                     "snapshot_last_progress", "snapshot_next_step", "snapshot_client_context",
@@ -539,14 +556,18 @@ def test_applying_card_is_never_rebuilt_while_external_result_is_unknown(monkeyp
     assert conn.proposals["company-0"]["revision"] == before["revision"]
 
 
-def test_reclassified_or_relinked_sources_retain_pending_historical_snapshot_until_a_decision(monkeypatch):
+@pytest.mark.parametrize("scope_changed", [False, True])
+def test_no_current_sales_evidence_withdraws_a_card_without_consuming_its_sources(monkeypatch, scope_changed):
     monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
     conn = BuildConnection(1)
     review.build_proposals(conn, WORKSPACE)
-    conn.records_enabled = False
-    review.build_proposals(conn, WORKSPACE, force=True)
-    assert conn.proposals["company-0"]["status"] == "pending"
-    assert conn.proposals["company-0"]["observed_source_versions"] == []
+    if scope_changed:
+        conn.insights = [insight(action_scope="out_of_scope")]
+    else:
+        conn.records_enabled = False
+    assert review.build_proposals(conn, WORKSPACE, force=True)["updated"] == 1
+    assert conn.proposals["company-0"]["status"] == "superseded"
+    assert conn.proposals["company-0"]["revision"] == 2
     assert not conn.receipts
 
 
@@ -608,8 +629,8 @@ def test_insight_categories_route_to_separate_columns_without_inference_from_tex
     assert "Customer need: We owe: reporting capability is needed." in context
     assert any(x.startswith("Buying signal:") for x in context)
     assert any(x.startswith("Objection:") for x in context)
-    assert "We owe: Send the checklist." in next_steps
-    assert "Customer next step: Share data." in next_steps
+    assert "Next step: Send the checklist." in next_steps
+    assert "Customer committed: Share data." in next_steps
     assert len(sources) == 1
     assert len(lineage["nextStep"]) == len(lineage["clientContext"]) == 3
 
@@ -935,13 +956,12 @@ def test_real_content_change_to_an_excluded_initial_record_is_new_information(mo
     assert current != {key: conn.exclusions[0][key] for key in ("source", "external_id", "version")}
 
 
-def test_pending_bullets_survive_more_than_14_days_and_grow_without_new_fallbacks_for_old_records(monkeypatch):
+def test_still_qualified_pending_bullets_survive_more_than_14_days_and_grow(monkeypatch):
     monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
     conn = BuildConnection(1)
     review.build_proposals(conn, WORKSPACE)
     old = copy.deepcopy(conn.proposals["company-0"])
     conn.now += timedelta(days=30)
-    conn.insights = []  # An old action's extraction status changing must not drop the reviewed snapshot.
     conn.records["company-0"].append(dated_record(9, conn.now, created=conn.now))
     assert review.build_proposals(conn, WORKSPACE)["updated"] == 1
     pending = conn.proposals["company-0"]
@@ -956,20 +976,18 @@ def test_force_rebuild_adds_newly_extracted_insights_without_resetting_initial_h
     conn = BuildConnection(1)
     conn.insights = []
     conn.records["company-0"].append(dated_record(1, NOW - timedelta(days=90)))
-    review.build_proposals(conn, WORKSPACE)
-    before = copy.deepcopy(conn.proposals["company-0"])
+    assert review.build_proposals(conn, WORKSPACE)["created"] == 0
     conn.insights = [insight()]
     conn.now += timedelta(hours=1)
-    assert review.build_proposals(conn, WORKSPACE, force=True)["updated"] == 1
+    assert review.build_proposals(conn, WORKSPACE, force=True)["created"] == 1
     current = conn.proposals["company-0"]
-    assert before["next_step_bullets"][0] in current["next_step_bullets"]
     assert any(text.startswith("We owe:") for text in current["next_step_bullets"])
     assert len(conn.exclusions) == 1
     assert all(source["externalId"] != "dated-1" for source in current["sources"])
     assert conn.queue_state["initialized_at"] == NOW
 
 
-def test_accumulated_changed_source_versions_keep_distinct_lineage_and_consume_all_versions_on_approval(monkeypatch):
+def test_changed_source_version_replaces_unsupported_lineage_and_approval_consumes_only_current_version(monkeypatch):
     monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
     conn = BuildConnection(1)
     review.build_proposals(conn, WORKSPACE)
@@ -978,14 +996,14 @@ def test_accumulated_changed_source_versions_keep_distinct_lineage_and_consume_a
     conn.records["company-0"][0].update(body="The pilot scope has been corrected.", content_hash="new-scope")
     review.build_proposals(conn, WORKSPACE)
     pending = conn.proposals["company-0"]
-    assert len(pending["sources"]) == len(pending["source_versions"]) == 2
+    assert len(pending["sources"]) == len(pending["source_versions"]) == 1
     assert len(pending["observed_source_versions"]) == 1
-    assert pending["sources"][0] == original
-    assert pending["sources"][0]["id"] != pending["sources"][1]["id"]
+    assert pending["sources"][0]["id"] != original["id"]
     item = {**copy.deepcopy(pending), "id": PROPOSAL, "workspace_id": WORKSPACE,
             "company_id": COMPANY, "opportunity_id": OPPORTUNITY, "removed_at": None}
     store = Store(item)
     store.source_record = conn.records["company-0"][0]
+    store.insights = [insight_for_record(store.source_record)]
     sheets = FakeSheets(store)
     monkeypatch.setattr(review, "settings", SimpleNamespace(
         review_spreadsheet_id="test-sheet", review_sheet_tab="Pipeline", review_sheet_id=1869050409,
@@ -995,24 +1013,29 @@ def test_accumulated_changed_source_versions_keep_distinct_lineage_and_consume_a
     monkeypatch.setattr(review, "_mirror_approval", lambda *args: True)
     result = review.decide(WORKSPACE, PROPOSAL, "RG", "approve", pending["revision"], "accumulated-key-1")
     assert result["status"] == "approved"
-    assert len(store.data["receipts"]) == 2
+    assert len(store.data["receipts"]) == 1
     assert result["activity"]["bulletLineage"]["nextStep"] == [
         {**node, "origin": "source"} for node in pending["bullet_lineage"]["nextStep"]]
 
 
-def test_unreviewed_card_is_retained_when_a_source_is_no_longer_current_but_history_is_not_reassigned(monkeypatch):
+def test_rebuild_prunes_delivery_on_unchanged_source_and_keeps_sales_and_unscoped(monkeypatch):
     monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
     conn = BuildConnection(1)
+    conn.insights = [insight(action_scope="deal_progression"),
+                     insight(text="Discuss expansion.", action_scope=None),
+                     insight(text="Fix the report.", action_scope=None)]
     review.build_proposals(conn, WORKSPACE)
     old = copy.deepcopy(conn.proposals["company-0"])
+    assert len(old["next_step_bullets"]) == 3
+    conn.insights[-1]["action_scope"] = "delivery"
     conn.now += timedelta(days=1)
-    conn.records_enabled = False
-    review.build_proposals(conn, WORKSPACE)
+    assert review.build_proposals(conn, WORKSPACE)["updated"] == 1
     pending = conn.proposals["company-0"]
-    assert pending["next_step_bullets"] == old["next_step_bullets"]
+    assert pending["next_step_bullets"] == [bullet for bullet in old["next_step_bullets"] if "Fix the report" not in bullet]
     assert pending["sources"] == old["sources"]
-    assert pending["observed_source_versions"] == []
-    assert pending["status"] == "pending"
+    assert pending["source_versions"] == old["source_versions"]
+    assert pending["revision"] == 2 and pending["status"] == "pending"
+    assert not conn.receipts
 
 
 def test_legacy_pending_lineage_is_rebuilt_or_withdrawn_by_initial_window(monkeypatch):
