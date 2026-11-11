@@ -1,7 +1,7 @@
 """Permission tests against a migrated, disposable local Postgres database."""
 
 import os
-from datetime import date
+from datetime import date, timedelta
 from secrets import token_hex
 
 import psycopg
@@ -317,3 +317,105 @@ def test_evidence_search_filters_and_pages_only_permitted_sales_records(sales_da
     assert search(insight_type="objection", viewer_mailbox="NC")["evidence"][0]["url"] is None
     assert search(query="50_", evidence_kind="source")["total_matches"] == 0
     assert search(query="50%", stages=[4])["total_matches"] == 0
+
+
+def test_history_and_outlook_tools_work_with_workspace_scoped_grants(sales_database):
+    from app import sales_account, sales_history, sales_mcp, sales_outlook
+
+    login, _, password, workspaces = sales_database
+    workspace = workspaces["bound"]
+    dsn = make_conninfo(TEST_DATABASE_URL, user=login, password=password)
+    with psycopg.connect(TEST_DATABASE_URL) as admin:
+        deal_ids = {}
+        for label, scoped_workspace in workspaces.items():
+            deal_ids[label], = admin.execute(
+                "update public.opportunities set stage_rank = 1, stage = '1. Opening', owner_code = 'RG'"
+                " where workspace_id = %s returning id", (scoped_workspace,),
+            ).fetchone()
+            for days in (65, 3):
+                run_id, = admin.execute(
+                    "insert into public.sync_runs (workspace_id, source, status, started_at, finished_at)"
+                    " values (%s, 'pipeline', 'succeeded', now() - make_interval(days => %s),"
+                    " now() - make_interval(days => %s)) returning id",
+                    (scoped_workspace, days, days),
+                ).fetchone()
+                if days == 3:
+                    admin.execute(
+                        "insert into public.opportunity_changes (workspace_id, opportunity_id, sync_run_id, field,"
+                        " old_value, new_value, detected_at) values"
+                        " (%s, %s, %s, 'stage', '0. Paused', '1. Opening', now() - interval '3 days'),"
+                        " (%s, %s, %s, 'client_context', 'excluded-old', 'excluded-new', now() - interval '3 days')",
+                        (scoped_workspace, deal_ids[label], run_id, scoped_workspace, deal_ids[label], run_id),
+                    )
+            admin.execute(
+                "insert into public.brief_actions (workspace_id, kind, ref, action) values"
+                " (%s, 'thread', 'sales', 'done'), (%s, 'thread', 'private', 'done'),"
+                " (%s, 'insight', 'sales', 'done')",
+                (scoped_workspace, scoped_workspace, scoped_workspace),
+            )
+        deal_id = deal_ids["bound"]
+        admin.execute("update public.workspaces set internal_domains = array['bianca.test'] where id = %s", (workspace,))
+        company_id, = admin.execute(
+            "select company_id from public.opportunities where id = %s", (deal_id,),
+        ).fetchone()
+        admin.execute("update public.contacts set name = 'Example Buyer' where company_id = %s", (company_id,))
+        record_id, = admin.execute(
+            "update public.source_records set occurred_at = now() - interval '45 days', subject = 'Budget',"
+            " body = 'We will send the approved budget.', participants = %s, meta = %s"
+            " where workspace_id = %s and external_id = 'sales' returning id",
+            (Jsonb({"from": [{"address": "sales@example.com", "name": "Example Buyer"}],
+                    "to": [{"address": "founder@bianca.test"}]}), Jsonb({"mailboxes": ["RG"]}), workspace),
+        ).fetchone()
+        admin.execute(
+            "insert into public.insights (workspace_id, opportunity_id, company_id, source, unit_id, source_record_ids,"
+            " type, text, quote, confidence, extractor_version, origin_record_id, owner_side, owner_name,"
+            " due_date, action_scope)"
+            " values (%s, %s, %s, 'gmail', 'budget', %s, 'commitment', 'Send the approved budget',"
+            " 'We will send the approved budget.', 'high', 'test', %s, 'customer', 'Example Buyer',"
+            " current_date + 2, 'deal_progression')",
+            (workspace, deal_id, company_id, [record_id], record_id),
+        )
+        pilot_company, = admin.execute(
+            "insert into public.companies (workspace_id, name, normalized_name)"
+            " values (%s, 'Example Pilot', 'example pilot') returning id", (workspace,),
+        ).fetchone()
+        pilot_id, = admin.execute(
+            "insert into public.opportunities (workspace_id, company_id, owner_code, stage_rank, stage, row_hash)"
+            " values (%s, %s, 'RG', 4, '4. Pilot', 'pilot-test') returning id", (workspace, pilot_company),
+        ).fetchone()
+
+    with psycopg.connect(dsn, autocommit=True) as reader:
+        assert reader.execute("select workspace_id, field from public.opportunity_changes").fetchall() == [
+            (workspace, "stage"),
+        ]
+        assert reader.execute("select workspace_id, kind, ref from public.brief_actions").fetchall() == [
+            (workspace, "thread", "sales"),
+        ]
+        for statement in (
+            "select actor from public.brief_actions",
+            "update public.opportunity_changes set new_value = 'changed'",
+            "delete from public.brief_actions",
+        ):
+            with pytest.raises(errors.InsufficientPrivilege):
+                reader.execute(statement)
+
+    def run(handler, **arguments):
+        return sales_mcp._read(dsn, [], 84, handler, **arguments)
+
+    digest = run(sales_history.get_deal_change_digest, opportunity_id=deal_id, months=2)
+    assert [change["field"] for change in digest["changes"]] == ["stage"]
+    assert "coverage" in digest
+
+    today = date.today()
+    for handler, arguments in (
+        (sales_account.get_stakeholder_map, {"opportunity_id": deal_id}),
+        (sales_account.list_commitments_and_followups, {"opportunity_id": deal_id}),
+        (sales_account.prepare_sales_meeting, {"opportunity_id": deal_id}),
+        (sales_history.find_stalled_deals, {}),
+        (sales_history.compare_pipeline_periods, {"start": today - timedelta(days=6), "end": today}),
+        (sales_outlook.get_qualification_gaps, {"opportunity_id": deal_id}),
+        (sales_outlook.assess_next_milestone, {"opportunity_id": deal_id}),
+        (sales_outlook.find_reengagement_candidates, {}),
+        (sales_outlook.assess_pilot_readiness, {"opportunity_id": pilot_id}),
+    ):
+        assert "coverage" in run(handler, **arguments)

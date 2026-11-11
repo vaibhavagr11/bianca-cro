@@ -100,6 +100,10 @@ def test_founder_sees_only_sales_reads_and_mcp_uses_viewer_identity(mock_sales_t
         assert {tool["name"] for tool in tools} == {
             "search_pipeline", "get_account_activity", "find_stakeholder_evidence", "rank_warm_prospects",
             "search_sales_evidence",
+            "get_stakeholder_map", "list_commitments_and_followups", "prepare_sales_meeting",
+            "get_deal_change_digest", "find_stalled_deals", "compare_pipeline_periods",
+            "get_qualification_gaps", "assess_next_milestone", "find_reengagement_candidates",
+            "assess_pilot_readiness",
         }
         assert all(tool["annotations"]["readOnlyHint"] for tool in tools)
         args = {"opportunity_id": str(uuid4())}
@@ -146,3 +150,35 @@ def test_evidence_search_accepts_combined_filters_and_validates_before_reading(m
         **filters, "since": date(2026, 10, 1), "until": date(2026, 12, 31),
         "opportunity_id": None, "evidence_kind": None, "viewer_mailbox": "RG",
     })]
+
+
+def test_history_tools_route_calendar_months_and_validate_periods(mock_sales_tokens, monkeypatch):
+    calls = []
+
+    def read(_dsn, _feeds, _stale, handler, **arguments):
+        calls.append((handler.__name__, arguments))
+        return {"status": "ok"}
+
+    monkeypatch.setattr(sales_mcp, "_read", read)
+    opportunity = uuid4()
+    with TestClient(create_app(sales_config()), base_url=BASE) as client:
+        cases = [
+            ("get_deal_change_digest", {"opportunity_id": str(opportunity), "months": 4}, False),
+            ("get_deal_change_digest", {"opportunity_id": str(opportunity), "months": 0}, True),
+            ("compare_pipeline_periods", {"start": "2026-10-01", "end": "2026-10-07"}, False),
+            ("compare_pipeline_periods", {"start": "2026-10-01", "end": "2026-10-07",
+                                          "prior_start": "2026-09-01", "prior_end": "2026-09-30"}, False),
+            ("compare_pipeline_periods", {"start": "2026-10-01", "end": "2026-10-07",
+                                          "prior_start": "2026-09-27", "prior_end": "2026-10-03"}, True),
+        ]
+        for tool, arguments, invalid in cases:
+            result = rpc(client, "tools/call", {"name": tool, "arguments": arguments}).json()["result"]
+            assert result.get("isError", False) is invalid
+    assert calls == [
+        ("get_deal_change_digest", {"opportunity_id": opportunity, "months": 4, "limit": 10, "offset": 0}),
+        ("compare_pipeline_periods", {"start": date(2026, 10, 1), "end": date(2026, 10, 7),
+                                      "prior_start": None, "prior_end": None, "viewer_mailbox": "RG"}),
+        ("compare_pipeline_periods", {"start": date(2026, 10, 1), "end": date(2026, 10, 7),
+                                      "prior_start": date(2026, 9, 1), "prior_end": date(2026, 9, 30),
+                                      "viewer_mailbox": "RG"}),
+    ]
