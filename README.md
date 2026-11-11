@@ -19,9 +19,13 @@ go to `Client Context`. Action approval replaces `Last progress` with the exact 
 approved action bullets into `Next step`. Context approval adds distinct reviewed bullets to the existing `Client Context`.
 An empty section leaves its cells unchanged. Ignore never writes to the Sheet. Owners RG, NC, and NDL are supported.
 
-The first review cycle imports only sources dated within the preceding **14 days**. Later daily cycles add new source versions
-to the same pending company card, preserving earlier bullets until Approve, Save & approve, or Ignore. The cutoff is persisted once;
-pending bullets do not expire after 14 days. Clicking a source label highlights only the bullets linked to that exact source version.
+The review queue uses the Daily Brief's action scope. Evidence-backed deal progression and legacy insights with blank
+scope can appear. Delivery and out-of-scope insights stay out of both writable sections. A requested deadline stays
+with the request. Only an agreed commitment is shown as owed.
+
+The first review cycle imports only sources dated within the preceding **14 days**. Later builds refresh each pending
+card from unreviewed evidence. The initial cutoff is persisted once. An earlier bullet remains eligible while its evidence
+still qualifies. Clicking a source label highlights the bullets linked to that exact source version.
 
 The configured default destination is the [Pipeline tab of the designated source-of-truth Sheet](https://docs.google.com/spreadsheets/d/14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw/edit?gid=1869050409#gid=1869050409).
 
@@ -29,8 +33,8 @@ The configured default destination is the [Pipeline tab of the designated source
 - [Deployment, Claude Enterprise connector, and n8n setup](docs/gsheet-updates.md)
 - [Daily n8n workflow and scheduling setup](n8n/README.md)
 
-This feature is disabled by default. It requires migrations through `014_review_daily_lineage.sql`, a configured Google service account,
-and separate founder review credentials. Committing this code does not connect or modify a production Sheet or Claude account.
+This feature is disabled by default. Enabling it requires the optional review migrations, a configured Google Sheets
+connection, and separate founder review credentials. Apply the review migrations with `uv run python -m scripts.migrate --sheet-review`.
 
 For changes to Daily Brief wording or delivery, see the [Daily Brief review handoff](DAILY_BRIEF_REVIEW.md).
 
@@ -57,11 +61,11 @@ uv run python -m scripts.migrate --seed     # apply pending migrations, (re)run 
 
 ### Rolling out sales scope for the Daily Brief
 
-After applying `012_action_scope`, run the authenticated `POST /process/extract` with the active
+After applying `017_action_scope`, run the authenticated `POST /process/extract` with the active
 `opportunity_ids` and `"backfill_scope": true` until `remaining_units` reaches zero. Collect
 `touched_opportunity_ids` across batches and pass them to `POST /process/profile` in batches.
 Check both brief versions with `POST /brief/build?version=v1&dry_run=true` and `version=v2` before
-resuming scheduled sends. Actions with unresolved scope stay out of the sales brief until classified.
+resuming scheduled sends. Legacy actions with blank scope remain eligible while they await re-extraction.
 
 ## Ingest endpoints (called by n8n)
 
