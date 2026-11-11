@@ -50,8 +50,8 @@ def test_v1_collector_skips_rows_the_renderers_will_not_show():
 
 def test_legacy_planner_fallback_keeps_original_detail_for_text_preparation():
     candidate = brief.Candidate("C1", "FEMSA", "Pilot", "RG", "recommended", "Prepare data", LONG_ACTION, 60)
-    fallback = brief.fallback_plan([candidate], [])
-    assert fallback.actions[0].do_today == LONG_ACTION
+    fallback = brief.fallback_plan([candidate])
     rows = brief.priority_rows(brief.resolve_plan(fallback, [candidate]))
+    assert rows[0].what == LONG_ACTION   # the planner only ranks; the wording is the source's
     html = brief.rows_table(rows, TODAY)   # Claude unavailable for both calls: the row is cut, never blocks the brief
     assert LONG_ACTION not in html and "Bianca will send the complete data plan to the customer on Friday." in html

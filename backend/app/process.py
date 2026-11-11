@@ -9,7 +9,7 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel
 from psycopg.types.json import Jsonb
 
-from app import brief_v2, classifier, db, extractor, opportunities, profiler, reconciler, resolution, timeline
+from app import brief_v2, classifier, db, extractor, gmail, opportunities, profiler, reconciler, resolution, timeline
 from app.config import settings
 from app.ingest import _fail, _workspace_id, require_token
 from app.pipeline import normalize_name
@@ -297,6 +297,23 @@ def resolve_entities(x_ingest_token: str | None = Header(default=None)) -> dict:
 
 class ExtractRequest(BaseModel):
     opportunity_ids: list[str]
+    backfill_scope: bool = False
+
+
+_PENDING_EXTRACTION = """
+    select r.source, r.thread_id, r.company_id, max(r.occurred_at) as latest
+    from source_records r
+    where r.workspace_id = %(workspace_id)s and r.company_id::text = any(%(company_ids)s)
+      and r.status = 'classified' and r.body is not null and r.thread_id is not null
+      and (r.classification->>'is_commercial')::bool
+    group by r.workspace_id, r.source, r.thread_id, r.company_id
+    having bool_or(r.extracted_version is null or not r.extracted_version = any(%(kept_versions)s))
+       or (%(backfill_scope)s and bool_or(r.extracted_version is distinct from %(current_version)s) and (
+           (r.source = 'gmail' and max(r.occurred_at) >= now() - interval '90 days')
+           or exists (select 1 from insights i where i.workspace_id = r.workspace_id
+                      and i.source = r.source and i.unit_id = r.thread_id and i.company_id = r.company_id
+                      and i.status = 'open' and i.type in ('commitment', 'next_step'))))
+"""
 
 
 def _write_extracted_insights(conn, workspace_id, unit: dict, deal: dict, records: list[dict],
@@ -350,21 +367,22 @@ def _write_extracted_insights(conn, workspace_id, unit: dict, deal: dict, record
                 " text = %s, quote = %s, owner_side = %s, owner_name = %s, due_date = %s, confidence = %s,"
                 " occurred_at = case when origin_occurred_at is not null then occurred_at else %s end,"
                 " origin_occurred_at = coalesce(origin_occurred_at, %s),"
-                " origin_record_id = coalesce(origin_record_id, %s),"
+                " origin_record_id = coalesce(origin_record_id, %s), action_scope = %s,"
                 " extractor_version = %s, last_extracted_at = now() where id = %s",
                 (unit["company_id"], deal["id"], record_ids, i["text"], i["quote"], i["owner_side"],
                  i["owner_name"], i["due_date"], i["confidence"], when, i["origin_occurred_at"],
-                 i["origin_record_id"], extractor.EXTRACTOR_VERSION, old["id"]),
+                 i["origin_record_id"], i.get("action_scope"), extractor.EXTRACTOR_VERSION, old["id"]),
             )
         else:
             conn.execute(
                 "insert into insights (workspace_id, company_id, opportunity_id, source, unit_id, source_record_ids,"
                 " type, text, quote, owner_side, owner_name, due_date, occurred_at, confidence, extractor_version,"
-                " origin_record_id, origin_occurred_at) values"
-                " (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                " origin_record_id, origin_occurred_at, action_scope) values"
+                " (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (workspace_id, unit["company_id"], deal["id"], unit["source"], unit["thread_id"], record_ids,
                  i["type"], i["text"], i["quote"], i["owner_side"], i["owner_name"], i["due_date"], when,
-                 i["confidence"], extractor.EXTRACTOR_VERSION, i["origin_record_id"], i["origin_occurred_at"]),
+                 i["confidence"], extractor.EXTRACTOR_VERSION, i["origin_record_id"], i["origin_occurred_at"],
+                 i.get("action_scope")),
             )
 
     for old in existing:
@@ -389,7 +407,7 @@ def _write_extracted_insights(conn, workspace_id, unit: dict, deal: dict, record
 
 @router.post("/extract")
 def extract_insights(payload: ExtractRequest, x_ingest_token: str | None = Header(default=None)) -> dict:
-    """Extract insights for up to classify_batch_threads not-yet-extracted units of the given deals."""
+    """Extract one batch. With backfill_scope, also review older open actions and recent Gmail threads."""
     require_token(x_ingest_token)
     client = _claude()
     with db.connect() as conn:
@@ -402,28 +420,31 @@ def extract_insights(payload: ExtractRequest, x_ingest_token: str | None = Heade
         team = conn.execute("select owner_code, full_name, email from team_members where workspace_id = %s"
                             " order by owner_code", (workspace_id,)).fetchall()
         system_prompt = extractor.build_system_prompt(team)
+        params = {"workspace_id": workspace_id, "company_ids": list(deals), "kept_versions": list(extractor.KEPT_VERSIONS),
+                  "current_version": extractor.EXTRACTOR_VERSION, "backfill_scope": payload.backfill_scope,
+                  "limit": settings.classify_batch_threads}
         units = conn.execute(
-            "select source, thread_id, company_id from source_records where workspace_id = %s"
-            " and company_id::text = any(%s) and status = 'classified' and body is not null and thread_id is not null"
-            " and (classification->>'is_commercial')::bool"
-            " group by source, thread_id, company_id"
-            " having bool_or(extracted_version is null or not extracted_version = any(%s))"
-            " order by max(occurred_at) desc nulls last limit %s",
-            (workspace_id, list(deals), list(extractor.KEPT_VERSIONS), settings.classify_batch_threads),
+            _PENDING_EXTRACTION + " order by latest desc nulls last limit %(limit)s", params,
         ).fetchall()
 
         counts = {"units": len(units), "insights": 0, "dropped_quotes": 0, "failed": 0}
+        touched = set()
         for unit in units:
             deal = deals[str(unit["company_id"])]
             key = (workspace_id, unit["source"], unit["thread_id"])
             records = conn.execute(
-                "select id, occurred_at, updated_at, subject, participants, body, meta from source_records"
-                " where workspace_id = %s and source = %s and thread_id is not distinct from %s"
+                "select id, source, occurred_at, updated_at, extracted_version, subject, participants, body, meta"
+                " from source_records where workspace_id = %s and source = %s and thread_id = %s"
                 " order by occurred_at nulls first, id", key,
             ).fetchall()
             conn.commit()
-            if not records:
+            if not records or all(r["extracted_version"] == extractor.EXTRACTOR_VERSION for r in records):
                 continue
+            if unit["source"] == "gmail":
+                for r in records:
+                    # Stored Gmail normally has quotes stripped already. Ignore legacy quoted lines as well.
+                    r["body"] = "\n".join(line for line in gmail.strip_quoted(r["body"] or "").splitlines()
+                                          if not line.lstrip().startswith(">"))
             refs = {f"M{n}": r for n, r in enumerate(records, start=1)}
             if unit["source"] == "gmail":
                 text = classifier.render_thread([
@@ -442,8 +463,8 @@ def extract_insights(payload: ExtractRequest, x_ingest_token: str | None = Heade
             kept, dropped = extractor.validate(result, text, refs)
             with conn.transaction():
                 current = {r["id"]: r["updated_at"] for r in conn.execute(
-                    "select id, updated_at from source_records where workspace_id = %s"
-                    " and source = %s and thread_id is not distinct from %s order by id for update", key,
+                    "select id, updated_at from source_records where workspace_id = %s and source = %s"
+                    " and thread_id = %s order by id for update", key,
                 )}
                 if current != {r["id"]: r["updated_at"] for r in records}:
                     continue
@@ -452,16 +473,13 @@ def extract_insights(payload: ExtractRequest, x_ingest_token: str | None = Heade
                              (extractor.EXTRACTOR_VERSION, list(current)))
             counts["insights"] += len(kept)
             counts["dropped_quotes"] += dropped
+            touched.add(str(deal["id"]))
 
         remaining = conn.execute(
-            "select count(*) as n from (select 1 from source_records where workspace_id = %s"
-            " and company_id::text = any(%s) and status = 'classified' and body is not null and thread_id is not null"
-            " and (classification->>'is_commercial')::bool group by source, thread_id"
-            " having bool_or(extracted_version is null or not extracted_version = any(%s))) u",
-            (workspace_id, list(deals), list(extractor.KEPT_VERSIONS)),
+            "select count(*) as n from (" + _PENDING_EXTRACTION + ") u", params,
         ).fetchone()["n"]
     log.info("extract run: %s remaining_units=%s", counts, remaining)
-    return {**counts, "remaining_units": remaining}
+    return {**counts, "remaining_units": remaining, "touched_opportunity_ids": sorted(touched)}
 
 
 def _claude() -> anthropic.Anthropic:

@@ -33,6 +33,36 @@ def test_owner_and_due_date_only_kept_for_actionable_types():
     assert kept[1]["owner_side"] == "bianca" and kept[1]["due_date"] == date(2026, 10, 8)
 
 
+def test_validation_keeps_distinct_actions_from_one_message_and_preserves_timing_certainty():
+    quote = "Mañana envío el precio y el contrato. ¿Pueden arreglar el tablero la semana que viene?"
+    records = {
+        "M1": {"id": "first", "body": quote, "occurred_at": date(2026, 10, 6)},
+        "M2": {"id": "second", "body": "Gracias", "occurred_at": date(2026, 10, 7)},
+    }
+    sales = {"quote": quote, "source_ref": "M1", "action_scope": "deal_progression",
+             "due_date": "2026-10-07", "deadline_quote": "Mañana"}
+    candidates = Extraction(insights=[
+        ins(text="Send the pricing tomorrow.", **sales),
+        ins(text="Send the contract tomorrow.", **sales),
+        ins(type="next_step", text="Customer asked for a dashboard fix next week.", quote=quote, source_ref="M1",
+            action_scope="delivery", due_date="2026-10-16", deadline_quote="la semana que viene"),
+        ins(text="Send the pricing tomorrow.", **{**sales, "source_ref": "M2"}),
+    ])
+
+    kept, dropped = validate(candidates, f"{quote}\nGracias", records)
+
+    assert dropped == 0   # the mislabeled copy (M2) is kept with its real origin; the writer merges duplicates
+    assert [item["origin_record_id"] for item in kept] == ["first"] * 4
+    assert [item["text"] for item in kept[:2]] == ["Send the pricing tomorrow.", "Send the contract tomorrow."]
+    assert [item["action_scope"] for item in kept[:3]] == ["deal_progression", "deal_progression", "delivery"]
+    assert [item["due_date"] for item in kept[:3]] == [date(2026, 10, 7), date(2026, 10, 7), None]
+    assert kept[2]["type"] == "next_step" and "next week" in kept[2]["text"]
+
+    records["M1"]["meta"] = {"date_inferred": True}
+    estimated, _ = validate(candidates, f"{quote}\nGracias", records)
+    assert all(item["due_date"] is None for item in estimated)
+
+
 def test_parse_due_rejects_vague_or_bad_dates():
     assert parse_due("2026-10-08") == date(2026, 10, 8)
     assert parse_due("next Thursday") is None
@@ -112,7 +142,7 @@ def test_reextraction_updates_existing_action_without_resetting_identity_or_revi
     assert sql.startswith("update insights")
     assert "created_at" not in sql and "status" not in sql and "completion" not in sql
     assert params[-1] == "stable"
-    assert params[-4] == "2026-10-06"
+    assert params[-5] == "2026-10-06"   # origin_occurred_at (then origin, scope, version, id)
 
     # The updated thread's extractor may omit the action because the later reply fulfills it.
     old["status"] = "open"
@@ -159,7 +189,7 @@ def test_legacy_action_without_origin_is_updated_not_duplicated():
     writes = _rewrite([legacy], [ins(source_ref="M1", quote="Les mando la propuesta el jueves",
                                      text="Send the proposal on Thursday.")], THREAD)
     assert [(verb, params[-1]) for verb, params in writes] == [("update", "legacy")]
-    assert writes[0][1][-3] == "first"   # the legacy row is now tied to its message
+    assert writes[0][1][-4] == "first"   # the legacy row is now tied to its message
 
 
 def test_reworded_quote_on_the_same_message_is_one_action():

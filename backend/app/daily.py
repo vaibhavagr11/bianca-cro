@@ -106,12 +106,15 @@ def _daily_step(workspace_id, x_ingest_token: str | None, sync_batch_id: UUID | 
     elif stage == "extract":
         res = process.extract_insights(process.ExtractRequest(opportunity_ids=opportunity_ids),
                                        x_ingest_token=x_ingest_token)
-        entry = {"stage": stage, **res}
+        touched = set(touched) | set(res.get("touched_opportunity_ids") or [])
+        entry = {"stage": stage, **{k: v for k, v in res.items() if k != "touched_opportunity_ids"}}
         if res["remaining_units"] == 0:
             with db.connect() as conn:
-                touched = [r[0] for r in conn.execute(
+                touched.update(r[0] for r in conn.execute(
                     "select distinct opportunity_id::text from insights where workspace_id = %s"
-                    " and opportunity_id is not null and last_extracted_at >= %s", (workspace_id, run["started_at"]))]
+                    " and opportunity_id is not null and last_extracted_at >= %s", (workspace_id, run["started_at"])))
+        touched = sorted(touched)
+        if res["remaining_units"] == 0:
             stage, queue = ("profile" if sync_batch_id is not None else "reconcile"), touched
     elif stage == "reconcile":
         batch, queue = take(queue, stage)

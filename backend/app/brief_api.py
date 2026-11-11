@@ -14,7 +14,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
-from app import actions, brief, brief_review, brief_v2, db, timeline
+from app import actions, brief, brief_review, brief_v2, db, extractor, timeline
 from app.brief_delivery import DeliveryGate, VerificationPending, create_gate
 from app.brief_review import ActionSource
 from app.brief_text import prepare_table_text
@@ -33,6 +33,77 @@ router = APIRouter(prefix="/brief")
 FOUNDER_ORDER = ["RG", "NC"]  # sections in this order; NDL gets the small shared table
 # Two founders are named Nicolás, so the brief uses these names, not first names.
 DISPLAY = {"RG": ("Ramiro", "Ramiro Godfrid"), "NC": ("Nico", "Nico Casaux"), "NDL": ("Nico DL", "Nico de León")}
+
+
+def _insight_rows(conn, workspace_id) -> list[dict]:
+    return conn.execute(
+        "select i.id, i.opportunity_id, i.type, i.text, i.quote, i.owner_side, i.owner_name, i.due_date, i.status,"
+        " i.source, i.unit_id, i.occurred_at, i.created_at, i.company_id, i.source_record_ids, m.meta,"
+        " i.action_scope, i.origin_record_id, i.origin_occurred_at, i.last_extracted_at, i.updated_at"
+        " from insights i left join source_records m"
+        " on m.id = coalesce(i.origin_record_id, i.source_record_ids[1]) where i.workspace_id = %s"
+        " order by i.occurred_at desc nulls last, i.id",
+        (workspace_id,),
+    ).fetchall()
+
+
+SALES_SCOPES = ("deal_progression", None)  # None: extracted before scopes existed, shown until re-extracted
+
+
+def _scoped_rows(rows: list[dict], deals: dict[str, dict]) -> list[dict]:
+    """Sales items, plus not-yet-scoped ones; only delivery and out-of-scope work is hidden."""
+    return [r for r in rows if r["action_scope"] in SALES_SCOPES
+            and (deal := deals.get(str(r["company_id"]))) is not None
+            and str(deal["id"]) == str(r["opportunity_id"])]
+
+
+def _email_asks(rows: list[dict]) -> dict[tuple[str, str, str], list[dict]]:
+    asks: dict[tuple[str, str, str], list[dict]] = {}
+    for r in rows:
+        if (r["source"] == "gmail" and r["origin_record_id"] and r["status"] == "open"
+                and r["type"] == "next_step" and r["owner_side"] in ("bianca", "customer")):
+            key = (str(r["origin_record_id"]), str(r["company_id"]), r["owner_side"])
+            asks.setdefault(key, []).append(r)
+    return asks
+
+
+def _message_asks(asks: dict[tuple[str, str, str], list[dict]], message: dict, side: str) -> list[dict]:
+    key = str(message["id"]), str(message["company_id"]), side
+    # The subject can be inherited from an earlier email. The actual ask must be in the message body.
+    return [r for r in asks.get(key, []) if extractor.quote_in_record(r["quote"], message, body_only=True)]
+
+
+def _profile_sales_entry(entry: dict, profile: dict, sales_by_id: dict[str, dict], deal: dict) -> bool:
+    """Every cited insight is a current sales (or not-yet-scoped) item. Profiles from before scopes still count."""
+    refs = profile["profile"].get("refs") or {}
+    evidence = [sales_by_id.get(str(refs.get(ref))) for ref in entry.get("evidence") or []]
+    return bool(evidence) and all(r and str(r["opportunity_id"]) == str(deal["id"])
+                                  and (r.get("updated_at") or r["created_at"]) <= profile["generated_at"]
+                                  and (r["type"] not in ("commitment", "next_step") or r["status"] == "open")
+                                  for r in evidence)
+
+
+def _upcoming_meetings(conn, workspace_id, today, tz, deals, email_to_code, sales) -> list[brief.Meeting]:
+    # Preserve prep only when a qualifying action is supported by this particular meeting.
+    prep: dict[str, str] = {}
+    for r in sales:
+        if (r["source"] == "calendar" and r["status"] == "open" and r["owner_side"] == "bianca"
+                and r["type"] in ("commitment", "next_step")):
+            prep.setdefault(str(r["origin_record_id"]), r["text"])
+    start = datetime.combine(today, time.min, tz)
+    meetings = []
+    for m in conn.execute(
+            "select id, subject, occurred_at, participants, company_id from source_records"
+            " where workspace_id = %s and source = 'calendar' and occurred_at >= %s and occurred_at < %s"
+            " and coalesce(meta->>'status', 'confirmed') <> 'cancelled' and (classification->>'is_commercial')::bool"
+            " order by occurred_at", (workspace_id, start, start + timedelta(days=2))):
+        deal = deals.get(str(m["company_id"]))
+        codes = sorted({email_to_code[a["address"]] for a in (m["participants"] or {}).get("attendees") or []
+                        if a.get("address") in email_to_code})
+        meetings.append(brief.Meeting(m["occurred_at"].astimezone(tz), m["subject"] or "(no title)",
+                                      deal["name"] if deal else None, deal["stage"] if deal else None, codes,
+                                      context=prep.get(str(m["id"]), "")))
+    return meetings
 
 
 class BuildSyncReceipts(BaseModel):
@@ -108,9 +179,13 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
             "select o.id, o.company_id, c.name, o.stage, o.stage_rank, o.owner_code from opportunities o"
             " join companies c on c.id = o.company_id where o.workspace_id = %s and o.removed_at is null order by o.id",
             (workspace_id,))}
-        profiles = {str(r["opportunity_id"]): r["profile"] for r in conn.execute(
-            "select distinct on (opportunity_id) opportunity_id, profile from opportunity_profiles"
+        profiles = {str(r["opportunity_id"]): r for r in conn.execute(
+            "select distinct on (opportunity_id) opportunity_id, profile, generated_at, profiler_version"
+            " from opportunity_profiles"
             " where workspace_id = %s order by opportunity_id, generated_at desc", (workspace_id,))}
+        sales = _scoped_rows(_insight_rows(conn, workspace_id), deals)
+        sales_by_id = {str(r["id"]): r for r in sales}
+        email_asks = _email_asks(sales)
         insight_origins = {str(r["id"]): r for r in conn.execute(
             "select id, origin_record_id, origin_occurred_at from insights where workspace_id = %s",
             (workspace_id,))} if gate else {}
@@ -122,26 +197,23 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
         def cid() -> str:
             return f"C{next(seq)}"
 
-        # Dated follow-ups Bianca owes (commitments and next steps), overdue up to 30 days or due within 7.
+        # Only agreed commitments with a firm deadline belong in the dated obligations.
         dated: list[brief.Row] = []
-        for i in conn.execute(
-                "select i.id, company_id, text, due_date, owner_name, source, unit_id, occurred_at,"
-                " origin_record_id, origin_occurred_at, meta from insights i"
-                " left join lateral (select meta from source_records r"
-                " where r.id = coalesce(i.origin_record_id, i.source_record_ids[1])) m on true"
-                " where i.workspace_id = %s and i.type in ('commitment', 'next_step') and i.owner_side = 'bianca'"
-                " and i.status = any(%s) and i.due_date between %s and %s order by i.id",
-                (workspace_id, ["open", "possibly_done"] if gate else ["open"],
-                 today - timedelta(days=brief.OVERDUE_WINDOW_DAYS), today + timedelta(days=brief.WEEK_DAYS))):
-            d = deals.get(str(i["company_id"]))
-            if not d:
+        hidden: dict[str, int] = {}
+        first_due = today - timedelta(days=brief.OVERDUE_WINDOW_DAYS)
+        last_due = today + timedelta(days=brief.WEEK_DAYS)
+        for i in sales:
+            if (i["type"] != "commitment" or i["owner_side"] != "bianca" or not i["due_date"]
+                    or not first_due <= i["due_date"] <= last_due):
                 continue
-            timestamp = i["origin_occurred_at"] or i["occurred_at"]
-            when = timestamp.astimezone(tz) if timestamp else None
-            label = {"gmail": "Email", "notes": "Notes", "calendar": "Meeting"}.get(i["source"], i["source"])
-            link = (timeline.GMAIL_THREAD_URL.format(i["unit_id"]) if i["source"] == "gmail"
-                    else timeline.DOC_URL.format((i["meta"] or {}).get("doc_id")) if i["source"] == "notes"
-                    and (i["meta"] or {}).get("doc_id") else None)
+            d = deals[str(i["company_id"])]
+            if i["status"] == "possibly_done" and not gate:   # verified builds re-check these instead
+                hidden[d["owner_code"]] = hidden.get(d["owner_code"], 0) + 1
+            if i["status"] not in (("open", "possibly_done") if gate else ("open",)):
+                continue
+            when = _event_day(i, tz) if i["occurred_at"] else None
+            label = SOURCE_LABEL.get(i["source"], i["source"])
+            link = _link_for(i["source"], i["unit_id"], i["meta"])
             ref = f"insight:{i['id']}" if gate else None
             if ref:
                 sources[ref] = ActionSource.insight("commitment", i)
@@ -149,21 +221,16 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
                                    f"{label} · {when:%b} {when.day}" if when else label, link,
                                    owner_code=d["owner_code"], verification_ref=ref))
 
-        # Dated items hidden because the completion check found evidence they were done.
-        hidden: dict[str, int] = {}
-        for h in conn.execute(
-                "select o.owner_code, count(*) as n from insights i join opportunities o on o.company_id = i.company_id"
-                " where i.workspace_id = %s and i.type in ('commitment', 'next_step') and i.owner_side = 'bianca'"
-                " and i.status = 'possibly_done' and i.due_date between %s and %s group by o.owner_code",
-                (workspace_id, today - timedelta(days=brief.OVERDUE_WINDOW_DAYS), today + timedelta(days=brief.WEEK_DAYS))):
-            hidden[h["owner_code"]] = h["n"]
-
-        # Profile recommendations and blockers.
+        # Profile recommendations and blockers need current, sales-scoped evidence.
+        open_sales_by_deal: dict[str, int] = {}
         for company_id, d in deals.items():
-            prof = profiles.get(str(d["id"]))
-            if not prof:
+            prow = profiles.get(str(d["id"]))
+            if not prow:
                 continue
+            prof = prow["profile"]
             for a in prof.get("recommended_actions") or []:
+                if a.get("action_scope") not in SALES_SCOPES or not _profile_sales_entry(a, prow, sales_by_id, d):
+                    continue
                 score = {"high": 70, "medium": 50, "low": 30}.get(a.get("urgency"), 30)
                 rec_id = _recommendation_ref(d["id"], a["action"])
                 if closed.get(("rec", rec_id), ("",))[0] == "done":
@@ -171,11 +238,15 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
                 ref = f"rec:{rec_id}" if gate else None
                 if ref:
                     sources[ref] = brief_review.profile_source(prof, a, insight_origins)
-                detail = a["action"] if gate else f"{a['action']} (why: {a['why']})"
+                detail = a["action"]
                 cands.append(brief.Candidate(cid(), d["name"], d["stage"], d["owner_code"], "recommended",
-                                              "Recommended next move", detail, score, verification_ref=ref))
+                                              "AI recommendation", detail, score, verification_ref=ref))
+            open_sales_by_deal[company_id] = sum(_profile_sales_entry(e, prow, sales_by_id, d)
+                                                for e in (prof.get("open_commitments") or []) + (prof.get("blockers") or []))
             if (d["stage_rank"] or 0) >= 1:
                 for b in (prof.get("blockers") or [])[:2]:
+                    if not _profile_sales_entry(b, prow, sales_by_id, d):
+                        continue
                     cands.append(brief.Candidate(cid(), d["name"], d["stage"], d["owner_code"], "blocker",
                                                  "Blocker",
                                                  f"Blocker: {b['text']}", 60))
@@ -183,7 +254,7 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
         # Unanswered customer emails: thread's latest message is from outside Bianca.
         seen_threads = set()
         for t in conn.execute(
-                "select id, thread_id, company_id, subject, occurred_at, participants"
+                "select id, thread_id, company_id, subject, body, occurred_at, participants"
                 " from source_records where workspace_id = %s and source = 'gmail' and company_id is not null"
                 " and (classification->>'is_commercial')::bool and occurred_at >= %s"
                 " and occurred_at <= %s order by thread_id, occurred_at desc, id",
@@ -191,53 +262,49 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
             d = deals.get(str(t["company_id"]))
             senders = [p["address"] for p in (t["participants"] or {}).get("from") or []]
             thread = t["thread_id"]
-            if thread in seen_threads or (gate and brief_v2.is_automated(senders, t["subject"])):
-                continue
+            if thread in seen_threads or brief_v2.is_automated(senders, t["subject"]):
+                continue  # an out-of-office or bot: the thread's latest real message decides it
             seen_threads.add(thread)
             handled = closed.get(("thread", thread))
             if handled and handled[0] == "done" and handled[1] >= t["occurred_at"]:
                 continue
-            if d and senders and all(domain(s) not in internal for s in senders):
+            asks = _message_asks(email_asks, t, "bianca")
+            if d and asks and senders and all(domain(s) not in internal for s in senders):
                 c = brief.unanswered_candidate(cid(), d["name"], d["stage"], d["owner_code"], t["subject"],
                                                t["occurred_at"], now, timeline.GMAIL_THREAD_URL.format(t["thread_id"]))
                 if c:
+                    c.detail = "Customer asked: " + " · ".join(a["text"] for a in asks)
                     if gate:
                         c.verification_ref = f"thread:{thread}"
-                        c.detail = _reply_to(t["subject"])
                         sources[c.verification_ref] = ActionSource("reply", str(t["id"]), t["occurred_at"])
                     cands.append(c)
+
+        for i in sales:
+            if (i["status"] != "open" or i["owner_side"] != "bianca" or i["type"] != "next_step"
+                    or i["source"] == "gmail" or not i["occurred_at"]):
+                continue
+            recorded = _event_day(i, tz)
+            if (today - recorded).days > brief_v2.UNDATED_WINDOW_DAYS:
+                continue
+            d = deals[str(i["company_id"])]
+            label = SOURCE_LABEL.get(i["source"], i["source"])
+            cands.append(brief.Candidate(cid(), d["name"], d["stage"], d["owner_code"], "next_step", "Next step",
+                                         i["text"], 60, link=_link_for(i["source"], i["unit_id"], i["meta"]),
+                                         source=f"{label} · {recorded:%b} {recorded.day}"))
 
         # Quiet active deals that still have open items.
         last_activity = {str(r["company_id"]): r["last"] for r in conn.execute(
             "select company_id, max(occurred_at) as last from source_records where workspace_id = %s"
             " and company_id is not null and occurred_at <= now() group by company_id", (workspace_id,))}
         for company_id, d in deals.items():
-            prof = profiles.get(str(d["id"])) or {}
-            open_items = len(prof.get("open_commitments") or []) + len(prof.get("blockers") or [])
             la = last_activity.get(company_id)
             c = brief.quiet_candidate(cid(), d["name"], d["stage"], d["stage_rank"], d["owner_code"],
-                                      la.astimezone(tz).date() if la else None, open_items, today)
+                                      la.astimezone(tz).date() if la else None, open_sales_by_deal.get(company_id, 0), today)
             if c:
                 cands.append(c)
 
         # Meetings today and tomorrow (local time), not cancelled.
-        start = datetime.combine(today, time.min, tz)
-        meetings: list[brief.Meeting] = []
-        for m in conn.execute(
-                "select subject, occurred_at, participants, company_id, meta from source_records"
-                " where workspace_id = %s and source = 'calendar' and occurred_at >= %s and occurred_at < %s"
-                " and coalesce(meta->>'status', 'confirmed') <> 'cancelled' and (classification->>'is_commercial')::bool"
-                " order by occurred_at", (workspace_id, start, start + timedelta(days=2))):
-            d = deals.get(str(m["company_id"])) if m["company_id"] else None
-            prof = profiles.get(str(d["id"])) if d else None
-            context = ""
-            if prof:
-                opens = "; ".join(c["text"] for c in (prof.get("open_commitments") or [])[:2])
-                context = f"{prof['summary']['text']} Open: {opens or 'none'}"
-            codes = sorted({email_to_code[a["address"]] for a in (m["participants"] or {}).get("attendees") or []
-                            if a.get("address") in email_to_code})
-            meetings.append(brief.Meeting(m["occurred_at"].astimezone(tz), m["subject"] or "(no title)",
-                                          d["name"] if d else None, d["stage"] if d else None, codes, context))
+        meetings = _upcoming_meetings(conn, workspace_id, today, tz, deals, email_to_code, sales)
 
         # Changes since the last brief.
         changes: list[brief.Change] = []
@@ -280,23 +347,22 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
 
     # Per-founder sections.
     names = {t["owner_code"]: t["full_name"] for t in team}
-    client = None if gate else _claude()
+    client = None if gate else (_claude() if any(c.owner_code in FOUNDER_ORDER for c in cands) else None)
     sections, payload = [], {"sections": [], "ndl": [], "changes": []}
     for code in FOUNDER_ORDER:
         mine = [c for c in cands if c.owner_code == code]
         my_meetings = [m for m in meetings if code in m.attendees]
-        if gate:
-            plan = brief.fallback_plan(mine, my_meetings, source_wording=True)
+        if gate or not mine:
+            plan = brief.fallback_plan(mine)   # source wording, ranked by score
         else:
             try:
-                plan = brief.plan_for(client, settings.anthropic_model, names.get(code, code), mine, my_meetings, today)
+                plan = brief.plan_for(client, settings.anthropic_model, names.get(code, code), mine, today)
             except (anthropic.APIStatusError, anthropic.APIConnectionError, ValueError) as exc:
                 log.warning("brief plan failed for %s: %s", code, type(exc).__name__)
-                plan = brief.fallback_plan(mine, my_meetings)
+                plan = brief.fallback_plan(mine)
         todo, week = brief.split_dated([r for r in dated if r.owner_code == code], today)
         todo += brief.priority_rows(brief.resolve_plan(plan, mine))
-        preps = {p.meeting_index: p.prep for p in plan.preps}
-        meet_rows = [(m, preps.get(n, "")) for n, m in enumerate(my_meetings)]
+        meet_rows = [(m, m.context) for m in my_meetings]
         short, full = DISPLAY.get(code, (code, names.get(code, code)))
         sections.append({"owner": code, "name": full, "short": short, "today": todo, "week": week,
                          "meetings": meet_rows, "hidden": 0 if gate else hidden.get(code, 0)})
@@ -361,7 +427,7 @@ def _event_day(rec: dict, tz) -> "date":
 
 def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                    gate: DeliveryGate | None = None) -> dict:
-    """Same data, safeguards and model calls as v1; compact deal-level selection (see brief_v2).
+    """Build the sales brief with compact deal-level selection (see brief_v2).
 
     `since` overrides the change window for side-by-side replays only.
     """
@@ -388,15 +454,20 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             " join companies c on c.id = o.company_id where o.workspace_id = %s and o.removed_at is null order by o.id",
             (workspace_id,))}
         profiles = {str(r["opportunity_id"]): r for r in conn.execute(
-            "select distinct on (opportunity_id) opportunity_id, profile, generated_at from opportunity_profiles"
+            "select distinct on (opportunity_id) opportunity_id, profile, generated_at, profiler_version"
+            " from opportunity_profiles"
             " where workspace_id = %s order by opportunity_id, generated_at desc", (workspace_id,))}
-        ins_rows = conn.execute(
-            "select i.id, i.opportunity_id, i.type, i.text, i.quote, i.owner_side, i.owner_name, i.due_date, i.status,"
-            " i.source, i.unit_id, i.occurred_at, i.last_extracted_at, i.origin_record_id, i.origin_occurred_at,"
-            " i.company_id, i.source_record_ids, m.meta from insights i"
-            " left join lateral (select meta from source_records r"
-            " where r.id = coalesce(i.origin_record_id, i.source_record_ids[1])) m on true"
-            " where i.workspace_id = %s order by i.id", (workspace_id,)).fetchall()
+        ins_rows = _insight_rows(conn, workspace_id)
+        sales = _scoped_rows(ins_rows, deals)
+        sales_by_id = {str(r["id"]): r for r in sales}
+        email_asks = _email_asks(sales)
+        # An email whose extracted items are all delivery or out-of-scope work does not move the sales conversation:
+        # it neither answers our sales ask nor counts as our follow-up. An email with nothing extracted still does.
+        email_scopes: dict[str, set] = {}
+        for r in ins_rows:
+            if r["source"] == "gmail" and r["origin_record_id"]:
+                email_scopes.setdefault(str(r["origin_record_id"]), set()).add(r["action_scope"])
+        not_sales = {mid for mid, scopes in email_scopes.items() if not scopes & set(SALES_SCOPES)}
         newest_insight: dict[str, datetime] = {}
         for r in ins_rows:
             k = str(r["opportunity_id"])
@@ -405,8 +476,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         ins_by_id = {str(r["id"]): r for r in ins_rows}
         closed = actions.latest(conn, workspace_id)  # founders' "Mark as complete" clicks: (kind, ref) -> (action, at)
         eligible_statuses = ("open", "possibly_done") if gate else ("open",)
-        open_items = [r for r in ins_rows if r["type"] in ("commitment", "next_step") and r["owner_side"] == "bianca"
-                      and r["status"] in eligible_statuses and str(r["company_id"]) in deals]
+        bianca_actions = [r for r in sales if r["type"] in ("commitment", "next_step") and r["owner_side"] == "bianca"]
+        open_items = [r for r in bianca_actions if r["status"] in eligible_statuses]
         # Who wrote the passage each open item quotes: Bianca, the customer, or the notes doc.
         recs = {str(r["id"]): r for r in conn.execute(
             "select id, subject, body, participants from source_records where id = any(%s)",
@@ -414,14 +485,14 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         last_contact = {str(r["company_id"]): r["last"].astimezone(tz).date() for r in conn.execute(
             "select company_id, max(occurred_at) as last from source_records where workspace_id = %s"
             " and company_id is not null and occurred_at <= now() group by company_id", (workspace_id,))}
-        hidden = {h["owner_code"]: h["n"] for h in conn.execute(
-            "select o.owner_code, count(*) as n from insights i join opportunities o on o.company_id = i.company_id"
-            " where i.workspace_id = %s and i.type in ('commitment', 'next_step') and i.owner_side = 'bianca'"
-            " and i.status = 'possibly_done' group by o.owner_code", (workspace_id,))}
+        hidden: dict[str, int] = {}
+        for r in bianca_actions:
+            if r["status"] == "possibly_done":
+                code = deals[str(r["company_id"])]["owner_code"]
+                hidden[code] = hidden.get(code, 0) + 1
 
         # An inbound last message may be unanswered; an outbound last message needs a verified reply expectation.
         unanswered: dict[str, brief_v2.Unanswered] = {}
-        unanswered_src: dict[str, tuple[str, str]] = {}  # deal -> (thread id, latest customer message body)
         threads: dict[str, list[dict]] = {}
         unclassified_latest: dict[str, datetime] = {}
         for t in conn.execute(
@@ -436,6 +507,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             if t["unclassified"]:
                 if not automated:
                     unclassified_latest[t["thread_id"]] = t["occurred_at"]
+                continue
+            if str(t["id"]) in not_sales:
                 continue
             threads.setdefault(t["thread_id"], []).append(
                 {"at": t["occurred_at"], "from": frm, "to": p.get("to") or [], "cc": p.get("cc") or [],
@@ -475,6 +548,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                 unclassified_at = unclassified_latest.get(thread_id)
                 if unclassified_at is not None and unclassified_at >= t["occurred_at"]:
                     continue  # newer real mail can resolve or change the request before it is classified
+                asks = _message_asks(email_asks, t, "customer")   # what we asked for, when extraction found it
                 w = brief_v2.waiting_on_them(msgs, internal, now)
                 if not w or (not gate and (last_reply.get(d["name"], t["occurred_at"]) > t["occurred_at"]
                                            or last_ours.get(d["name"], t["occurred_at"]) > t["occurred_at"])):
@@ -488,9 +562,14 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                         d["name"], d["stage"], w["to"], sent.date(), w["days"], max(nudges, w["nudges"]), replied is not None,
                         w["auto_reply"] or last_auto.get(d["name"], t["occurred_at"]) > t["occurred_at"],
                         timeline.GMAIL_THREAD_URL.format(thread_id), f"Email · {sent:%b} {sent.day}",
-                        thread_id, sender if sender in FOUNDER_ORDER else d["owner_code"], d["stage_rank"])
+                        thread_id, sender if sender in FOUNDER_ORDER else d["owner_code"], d["stage_rank"],
+                        action=asks[0]["text"] if asks else None)
                     if gate:
                         sources[f"wait:{thread_id}"] = ActionSource("waiting", str(t["id"]), t["occurred_at"])
+                continue
+            asks = [r for r in _message_asks(email_asks, t, "bianca")
+                    if (not r["owner_name"] or team_by_name.get(brief_v2.norm(r["owner_name"])) == d["owner_code"])]
+            if not asks:
                 continue
             c = brief.unanswered_candidate("x", d["name"], d["stage"], d["owner_code"], t["subject"],
                                            t["occurred_at"], now, timeline.GMAIL_THREAD_URL.format(thread_id))
@@ -499,31 +578,12 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                 if d["name"] not in unanswered or days < unanswered[d["name"]].days:
                     sent = t["occurred_at"].astimezone(tz)
                     unanswered[d["name"]] = brief_v2.Unanswered(
-                        t["subject"] or "", days, c.link, brief_v2.has_request(f"{t['subject'] or ''} {t['body'] or ''}"),
-                        source=f"Email · {sent:%b} {sent.day}", thread_id=thread_id)
+                        t["subject"] or "", days, c.link, True, action=asks[0]["text"],
+                        source=f"Email · {sent:%b} {sent.day}", thread_id=thread_id, item_id=str(asks[0]["id"]))
                     if gate:
-                        unanswered[d["name"]].action = _reply_to(t["subject"])
                         sources[f"thread:{thread_id}"] = ActionSource("reply", str(t["id"]), t["occurred_at"])
-                    else:
-                        unanswered_src[d["name"]] = (thread_id, t["body"] or "")
 
-        start = datetime.combine(today, time.min, tz)
-        meetings: list[brief.Meeting] = []
-        for m in conn.execute(
-                "select subject, occurred_at, participants, company_id from source_records"
-                " where workspace_id = %s and source = 'calendar' and occurred_at >= %s and occurred_at < %s"
-                " and coalesce(meta->>'status', 'confirmed') <> 'cancelled' and (classification->>'is_commercial')::bool"
-                " order by occurred_at", (workspace_id, start, start + timedelta(days=2))):
-            d = deals.get(str(m["company_id"])) if m["company_id"] else None
-            prof = (profiles.get(str(d["id"])) or {}).get("profile") if d else None
-            context = ""
-            if prof:
-                opens = "; ".join(c["text"] for c in (prof.get("open_commitments") or [])[:2])
-                context = f"{prof['summary']['text']} Open: {opens or 'none'}"
-            codes = sorted({email_to_code[a["address"]] for a in (m["participants"] or {}).get("attendees") or []
-                            if a.get("address") in email_to_code})
-            meetings.append(brief.Meeting(m["occurred_at"].astimezone(tz), m["subject"] or "(no title)",
-                                          d["name"] if d else None, d["stage"] if d else None, codes, context))
+        meetings = _upcoming_meetings(conn, workspace_id, today, tz, deals, email_to_code, sales)
 
         # What changed: only records stored since the last brief can hold a development; each is then dated by
         # its source event time (email sent, meeting date), never by when we stored it.
@@ -566,14 +626,17 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
     for company_id, d in deals.items():
         prow = profiles.get(str(d["id"]))
         prof = prow["profile"] if prow else {}
-        blockers, recs_ = prof.get("blockers") or [], prof.get("recommended_actions") or []
-        recs_ = [a for a in recs_ if (n := note(d, a, prow, True)) is None
-                 or closed.get(("rec", n.ref), ("",))[0] != "done"]  # suggestions a founder dismissed
+        blockers = [n for b in prof.get("blockers") or [] if _profile_sales_entry(b, prow, sales_by_id, d)
+                    and (n := note(d, b, prow, False)) and n.verified]
+        recs_ = [n for a in prof.get("recommended_actions") or [] if a.get("action_scope") in SALES_SCOPES
+                 and _profile_sales_entry(a, prow, sales_by_id, d)
+                 and (n := note(d, a, prow, True)) and n.verified
+                 and closed.get(("rec", n.ref), ("",))[0] != "done"]
         views[d["name"]] = brief_v2.DealView(
             d["name"], d["stage"], d["stage_rank"], d["owner_code"], last_contact.get(company_id),
-            blocker=note(d, blockers[0], prow, False) if blockers else None,
-            recommendation=note(d, recs_[0], prow, True) if recs_ else None,
-            recommendations=[n for n in (note(d, a, prow, True) for a in recs_) if n],
+            blocker=blockers[0] if blockers else None,
+            recommendation=recs_[0] if recs_ else None,
+            recommendations=recs_,
             summary=note(d, prof.get("summary"), prow, False), unanswered=unanswered.get(d["name"]))
 
     bianca_names = {brief_v2.norm(t["full_name"]) for t in team} | {"bianca"}
@@ -634,28 +697,14 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             _link_for(r["source"], r["unit_id"], r["meta"]),
             brief_v2.bucket(r["due_date"], recorded, today, t1, t2), kind))
 
-    # ---- what each unanswered customer email asks of us (only from items extracted from that very message)
-    kinds = {i.id: i for i in items}
-    for deal, (thread_id, body) in unanswered_src.items():
-        asks = [kinds[str(r["id"])] for r in open_items if r["source"] == "gmail" and r["unit_id"] == thread_id
-                and str(r["id"]) in kinds and kinds[str(r["id"])].kind in ("owed", "customer_request")
-                and kinds[str(r["id"])].basis != "delegated"  # someone else's task (e.g. engineering) is not the ask
-                and brief_v2.is_new_insight(r["quote"], body)]
-        if asks:
-            unanswered[deal].action = asks[0].text
-
     # ---- classify every newly extracted insight by the event time of the record its quote comes from
     lookback = settings.brief_late_lookback_days
-    by_unit: dict[tuple[str, str], list[dict]] = {}
-    for rec in new_records:
-        by_unit.setdefault((rec["source"], rec["thread_id"]), []).append(rec)
+    records_by_id = {str(rec["id"]): rec for rec in new_records}
     events: list[tuple[dict, dict, str]] = []          # (insight, record, new|late|backfill|undated|scheduled)
-    for r in ins_rows:
-        if not (r["last_extracted_at"] > since and r["type"] in brief_v2.CHANGE_TYPES
-                and str(r["company_id"]) in deals):
+    for r in sales:
+        if not (r["last_extracted_at"] > since and r["type"] in brief_v2.CHANGE_TYPES):
             continue
-        rec = next((x for x in by_unit.get((r["source"], r["unit_id"]), [])
-                    if brief_v2.is_new_insight(r["quote"], f"{x['subject'] or ''} {x['body'] or ''}")), None)
+        rec = records_by_id.get(str(r["origin_record_id"]))
         if rec is None:
             continue                                   # quote is in a record we already had: not a change
         reliable = not (rec["meta"] or {}).get("date_inferred")
@@ -671,37 +720,16 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
     for code in FOUNDER_ORDER:
         short, full = DISPLAY.get(code, (code, names.get(code, code)))
         sections.append(brief_v2.build_section(
-            code, full, short, views, items, [(m, "") for m in meetings if code in m.attendees], today, display,
+            code, full, short, views, items, [(m, m.context) for m in meetings if code in m.attendees], today, display,
             0 if gate else hidden.get(code, 0), settings.brief_critical_ahead_days, settings.brief_in_talks_target))
         sections[-1].waiting, sections[-1].more_waiting = brief_v2.pick_waiting(list(waiting.values()), code)
-
-    # The legacy planner can reword existing recommendations and write prep. Verified builds use stable
-    # source-backed wording across polls and leave meetings as calendar context.
-    client = None if gate else _claude()
-    for s in sections if not gate else ():
-        moves = [(v, m) for v, m, _ in s.highlights]
-        picked = [(v, m) for v, m in moves if m.tag == "AI recommendation" and not m.text.endswith("(profile not verified)")]
-        ai = {f"C{n}": m for n, (_, m) in enumerate(picked, start=1)}
-        cands = [brief.Candidate(f"C{n}", v.deal, v.stage or "", s.code, "recommended", "Recommended next move", m.text, 50)
-                 for n, (v, m) in enumerate(picked, start=1)]
-        my_meetings = [m for m, _ in s.meetings]
-        try:
-            plan = brief.plan_for(client, settings.anthropic_model, names.get(s.code, s.code), cands, my_meetings, today)
-        except (anthropic.APIStatusError, anthropic.APIConnectionError, ValueError) as exc:
-            log.warning("brief v2 plan failed for %s: %s", s.code, type(exc).__name__)
-            plan = brief.fallback_plan(cands, my_meetings)
-        for a in plan.actions:
-            if a.candidate_id in ai and a.do_today.strip():
-                ai[a.candidate_id].text = a.do_today.strip()
-        preps = {p.meeting_index: p.prep for p in plan.preps}
-        s.meetings = [(m, preps.get(n, "")) for n, m in enumerate(my_meetings)]
 
     ndl = [brief_v2.TodayRow(i.deal, views[i.deal].stage, "Due now", i.text, f"due {i.due:%b} {i.due.day}", "Nico DL",
                              i.link, i.id, i.source, f"insight:{i.id}")
            for i in items if i.route == "NDL" and i.kind == "owed" and i.bucket in ("today", "overdue")]
     ndl += [brief_v2.TodayRow(v.deal, v.stage, "Reply needed", brief_v2.reply_text(v.unanswered),
-                              f"received {v.unanswered.days}d ago", "Nico DL", v.unanswered.link, None,
-                              v.unanswered.source, f"thread:{v.unanswered.thread_id}")
+                              f"received {v.unanswered.days}d ago", "Nico DL", v.unanswered.link, v.unanswered.item_id,
+                              v.unanswered.source, v.unanswered.completion_ref)
             for v in views.values() if v.owner == "NDL" and v.unanswered and brief_v2.reply_label(v.unanswered) == "reply_needed"]
     ndl = ndl[:brief.MAX_NDL]
     ndl_review = brief_review.verify_v2(sections, ndl, {d["name"]: key for key, d in deals.items()}, sources, gate) \
@@ -781,6 +809,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                 "and calendar, WhatsApp, so missing activity is not proof nothing happened.")
     labels = brief_v2.completable(sections, ndl)  # ref -> (deal, text) for each row's "Mark as complete" link
     action_url = (lambda ref: actions.link(ref, *labels[ref])) if settings.brief_action_secret else None
+    client = None if gate else _claude()   # verified builds keep wording stable: deterministic cut only
     display = prepare_table_text(brief_v2.table_text_fields(sections, ndl, changes), client, settings.anthropic_model)
     html_body = brief_v2.render(sections, ndl, changes, today, len(deals), coverage, not NICO_INBOX_CONNECTED,
                                 backfill, action_url, ndl_review, display=display)
