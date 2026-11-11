@@ -1,10 +1,10 @@
 # Bianca Sales in Claude
 
-The existing Bianca backend serves the connector at `/sales/mcp` over Streamable HTTP. Claude can search active pipeline deals, read recent account activity, find attributed stakeholder evidence, rank warm prospects, and search sales evidence across deals. The connector reads Bianca's Supabase data through a separate Postgres login.
+The existing Bianca backend serves 15 read-only tools at `/sales/mcp` over Streamable HTTP. They cover pipeline and evidence search, account briefings, recorded changes, and conditional next milestones. The connector reads Bianca's Supabase data through a separate Postgres login.
 
 ## Staging database
 
-Use a staging backend and a disposable or approved staging dataset. From `backend/`, run `uv sync --locked` and `uv run python -m scripts.migrate` with the staging migration credentials. Migration 018 creates the grant role, workspace binding, and read policies. It is independent of the optional Sheets-review migrations.
+Use a staging backend and a disposable or approved staging dataset. From `backend/`, run `uv sync --locked` and `uv run python -m scripts.migrate` with the staging migration credentials before deploying the connector. Migration 018 creates the grant role, workspace binding, and read policies. Migration 019 adds scoped reads for pipeline change history, commitment details, and Gmail follow-up status. Both migrations are independent of the optional Sheets-review migrations.
 
 Connect as the migration admin in `psql`. Replace the example login name and workspace as needed. Use a different login and password for each environment.
 
@@ -55,12 +55,31 @@ An unauthenticated request to the endpoint should return HTTP 401 with the prote
 
 [Claude custom connectors](https://claude.com/docs/connectors/custom/add-unlisted) · [Claude Projects](https://support.claude.com/en/articles/9519177-how-can-i-create-and-manage-projects)
 
+## Account, history, and outlook tools
+
+| Tool | Example question |
+| --- | --- |
+| `get_stakeholder_map` | Who have we actually engaged, and who is identified as the buyer? |
+| `list_commitments_and_followups` | What do we owe this week, and what are we waiting on the customer to do? |
+| `prepare_sales_meeting` | What should I know before my next call, and what should I ask? |
+| `get_deal_change_digest` | What changed on this deal in the last three months? |
+| `find_stalled_deals` | Which prospects need review because recorded buyer activity is quiet or a blocker is open? |
+| `compare_pipeline_periods` | Did more prospects advance or engage during this period than the preceding one? |
+| `get_qualification_gaps` | What should we confirm before sending a proposal? |
+| `assess_next_milestone` | What could happen next with this deal, and what would change that outlook? |
+| `find_reengagement_candidates` | Which quiet prospects gave us a reason to reach back out? |
+| `assess_pilot_readiness` | Which pilots are approaching a decision, and what still needs confirmation? |
+
+The deal digest accepts 1–60 calendar months and reports the dates available in the change history. A change timestamp records when Bianca observed it. Period comparisons accept non-overlapping date windows and default to the immediately preceding window of the same length. They report recorded stage events separately from distinct accounts with observed engagement. The prospect engagement counts use historical stage observations and report unknown stages separately. Forward-looking answers should cite the evidence and distinguish explicit commitments, scheduled events, missing information, and conditional suggestions.
+
 ## Pilot checks
 
-- Each founder can authenticate separately. An uninvited account is denied. The connector lists exactly five read tools, and the database login can only read its assigned workspace.
+- Each founder can authenticate separately. An uninvited account is denied. The connector lists exactly 15 read tools, and the database login can only read its assigned workspace.
 - Ask about last customer contact for a known deal. Check the email date and meeting date against sources. Past Calendar entries show scheduling and unverified attendance. When a Gmail alias is available for the signed-in founder, check that they can open the citation in the right mailbox.
 - Ask what a known stakeholder emphasized. Check named excerpts in the meeting notes. An inferred date is labeled, and a name in an attendee list does not establish authorship.
 - Ask which objections recur across prospects this quarter. Use `insight_type="objection"`, `stages=[1,2,3]`, and the quarter's dates. Review the cited excerpts and result counts. A record can contain more than one finding. Use the distinct source record and opportunity counts when reporting how many records or deals support a conclusion.
+- Ask what changed on one deal in the last three months. Verify the returned start date, the old and new values against the stored changes, and the history-coverage label for periods that predate the first recorded sync.
+- Ask about a prospect's next milestone and a pilot's decision readiness. Check that each reported commitment or criterion has a source and that suggestions and unknowns are labeled.
 - Ask for three warm prospects. By default the eligible stages are Opening, In Talks, and Proposal, with 60 days of evidence. The ranking favors distinct recent records with buyer signals or confirmed buyer actions, then fewer recent open blockers, later stage, and more recent buyer evidence. It can return fewer than three when buyer evidence is sparse.
 - Compare source and feed freshness with the ingest logs. Source-level success is available for legacy runs. Per-feed coverage stays unverified until n8n sends a successful, complete receipt using the existing ingestion contract. The currently configured Gmail and Calendar feeds are RG and NC. Activity for other pipeline owners may appear in those feeds or in notes.
 
