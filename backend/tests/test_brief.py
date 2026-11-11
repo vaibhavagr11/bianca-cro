@@ -3,7 +3,7 @@ from datetime import date, datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 
 from app.brief import (
-    Candidate, Change, ChosenAction, FounderPlan, Meeting, PrepLine, commitment_candidate, fallback_plan,
+    Candidate, Change, ChosenAction, FounderPlan, Meeting, commitment_candidate, fallback_plan,
     pick_attention, quiet_candidate, render, resolve_plan, subject, unanswered_candidate,
 )
 from app.main import app
@@ -49,14 +49,13 @@ def test_attention_one_row_per_deal_skips_action_deals_and_recommendations():
 
 def test_resolve_plan_ignores_unknown_and_duplicate_ids():
     cands = [cand("C1", "Acme"), cand("C2", "Globex")]
-    plan = FounderPlan(actions=[ChosenAction(candidate_id="C9", do_today="x", why="y"),
-                                ChosenAction(candidate_id="C2", do_today="Call", why="Late"),
-                                ChosenAction(candidate_id="C2", do_today="Again", why="dup")], preps=[])
-    assert [(c.id, a.do_today) for c, a in resolve_plan(plan, cands)] == [("C2", "Call")]
+    plan = FounderPlan(actions=[ChosenAction(candidate_id="C9"), ChosenAction(candidate_id="C2"),
+                                ChosenAction(candidate_id="C2")])
+    assert resolve_plan(plan, cands) == [cands[1]]
 
 
 def test_fallback_plan_uses_top_scores():
-    plan = fallback_plan([cand("C1", "A", score=50), cand("C2", "B", score=90)], [])
+    plan = fallback_plan([cand("C1", "A", score=50), cand("C2", "B", score=90)])
     assert plan.actions[0].candidate_id == "C2"
 
 
@@ -82,8 +81,8 @@ def test_due_cell_shows_days_late():
 
 def test_render_layout_a_tables_escaped_with_priorities():
     from app.brief import Row, priority_rows, render
-    chosen = [(Candidate("C1", "Pernod <Ricard>", "3. Proposal", "RG", "blocker", "l", "d", 60, link="https://x",
-                         source="Deal profile"), ChosenAction(candidate_id="C1", do_today="Sign NDA", why="Blocks data"))]
+    chosen = [Candidate("C1", "Pernod <Ricard>", "3. Proposal", "RG", "blocker", "Blocks data", "Sign NDA", 60,
+                        link="https://x", source="Deal profile")]
     m = Meeting(datetime(2026, 10, 22, 12, 0), "Gus <> Ramiro", "Campari", "4. Pilot", ["RG"])
     sections = [{"name": "Ramiro Godfrid", "short": "Ramiro",
                  "today": [Row("FEMSA Arg", "Send next-steps email", TODAY - timedelta(days=2), "NC", "5. Working client",

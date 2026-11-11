@@ -55,6 +55,14 @@ uv run python -m scripts.migrate --status   # what's applied / pending
 uv run python -m scripts.migrate --seed     # apply pending migrations, (re)run seeds
 ```
 
+### Rolling out sales scope for the Daily Brief
+
+After applying `012_action_scope`, run the authenticated `POST /process/extract` with the active
+`opportunity_ids` and `"backfill_scope": true` until `remaining_units` reaches zero. Collect
+`touched_opportunity_ids` across batches and pass them to `POST /process/profile` in batches.
+Check both brief versions with `POST /brief/build?version=v1&dry_run=true` and `version=v2` before
+resuming scheduled sends. Actions with unresolved scope stay out of the sales brief until classified.
+
 ## Ingest endpoints (called by n8n)
 
 `POST /ingest/pipeline` with header `X-Ingest-Token` and body `{"rows": [ {sheet row}, ... ]}` — the
