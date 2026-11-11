@@ -18,11 +18,13 @@ COLUMN_MAP = {
     "nombre contacto (rol)": "contacts_text",
     "last progress": "last_progress",
     "next step": "next_step",
+    "client context": "client_context",
 }
 REQUIRED_COLUMN = "empresa"
 
 # Fields compared between syncs; a change in any of them is logged to opportunity_changes.
-TRACKED_FIELDS = ("owner_code", "stage", "country", "primary_buyer", "contacts_text", "last_progress", "next_step")
+BASE_TRACKED_FIELDS = ("owner_code", "stage", "country", "primary_buyer", "contacts_text", "last_progress", "next_step")
+TRACKED_FIELDS = (*BASE_TRACKED_FIELDS, "client_context")
 
 # Refuse a sync that would remove more than this share of active deals (wrong tab, empty file...).
 MAX_REMOVAL_SHARE = 0.5
@@ -58,7 +60,8 @@ class PipelineRow:
 
     @property
     def row_hash(self) -> str:
-        payload = json.dumps([self.company, [self.fields[f] for f in TRACKED_FIELDS]], ensure_ascii=False)
+        tracked = TRACKED_FIELDS if "client_context" in self.fields else BASE_TRACKED_FIELDS
+        payload = json.dumps([self.company, [self.fields[f] for f in tracked]], ensure_ascii=False)
         return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -69,7 +72,7 @@ def _clean(value) -> str | None:
     return text or None
 
 
-def parse_rows(raw_rows: list[dict]) -> list[PipelineRow]:
+def parse_rows(raw_rows: list[dict], *, include_client_context: bool = True) -> list[PipelineRow]:
     """Map sheet rows to PipelineRows. Skips rows with a blank company; rejects missing columns and duplicates."""
     if not raw_rows:
         raise PipelineValidationError("payload has no rows")
@@ -78,6 +81,7 @@ def parse_rows(raw_rows: list[dict]) -> list[PipelineRow]:
     if REQUIRED_COLUMN not in headers:
         raise PipelineValidationError("required column 'Empresa' not found")
 
+    tracked = TRACKED_FIELDS if include_client_context else BASE_TRACKED_FIELDS
     rows: list[PipelineRow] = []
     seen: dict[str, int] = {}
     for raw in raw_rows:
@@ -87,7 +91,7 @@ def parse_rows(raw_rows: list[dict]) -> list[PipelineRow]:
             continue
         key = normalize_name(company)
         seen[key] = seen.get(key, 0) + 1
-        rows.append(PipelineRow(company, key, {f: mapped.get(f) for f in TRACKED_FIELDS}))
+        rows.append(PipelineRow(company, key, {f: mapped.get(f) for f in tracked}))
 
     duplicates = sorted(k for k, n in seen.items() if n > 1)
     if duplicates:
@@ -129,7 +133,7 @@ def plan_sync(existing: list[ExistingDeal], incoming: list[PipelineRow], guard: 
         elif deal.row_hash == row.row_hash and not deal.removed:
             plan.unchanged.append(deal.opportunity_id)
         else:
-            changes = [(f, deal.fields.get(f), row.fields[f]) for f in TRACKED_FIELDS if deal.fields.get(f) != row.fields[f]]
+            changes = [(f, deal.fields.get(f), value) for f, value in row.fields.items() if deal.fields.get(f) != value]
             plan.updates.append((deal.opportunity_id, row, changes, deal.removed))
 
     incoming_keys = {row.normalized_name for row in incoming}
@@ -141,15 +145,19 @@ def plan_sync(existing: list[ExistingDeal], incoming: list[PipelineRow], guard: 
     return plan
 
 
-def describe_plan(plan: SyncPlan, existing: list[ExistingDeal], raw_rows: list[dict]) -> dict:
+def describe_plan(plan: SyncPlan, existing: list[ExistingDeal], raw_rows: list[dict], *,
+                  include_client_context: bool = True) -> dict:
     """What a sync would do, for a dry run: columns read, deals created / removed, and every changed field."""
     headers = sorted({h.strip() for row in raw_rows for h in row})
     read = {h.strip().lower() for h in headers}
     active = sum(1 for d in existing if not d.removed)
+    columns = set(COLUMN_MAP)
+    if not include_client_context:
+        columns.remove("client context")
     return {
-        "columns_read": [h for h in headers if h.lower() in COLUMN_MAP],
-        "columns_ignored": [h for h in headers if h.lower() not in COLUMN_MAP],
-        "columns_missing": [h for h in COLUMN_MAP if h not in read],
+        "columns_read": [h for h in headers if h.lower() in columns],
+        "columns_ignored": [h for h in headers if h.lower() not in columns],
+        "columns_missing": [h for h in COLUMN_MAP if h in columns and h not in read],
         "created": [r.company for r in plan.creates],
         "removed": [d.normalized_name for d in plan.removals],
         "restored": [r.company for _, r, _, restored in plan.updates if restored],

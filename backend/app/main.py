@@ -2,7 +2,7 @@ import logging
 
 from fastapi import FastAPI, HTTPException
 
-from app import actions, brief_api, daily, db, ingest, opportunities, process
+from app import actions, brief_api, daily, db, ingest, opportunities, process, review_api
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("bianca_cro")
@@ -14,6 +14,8 @@ app.include_router(daily.router)
 app.include_router(opportunities.router)
 app.include_router(brief_api.router)
 app.include_router(actions.router)
+app.include_router(review_api.router)
+app.include_router(review_api.publish_router)
 
 
 @app.get("/health")

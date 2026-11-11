@@ -48,7 +48,7 @@ from app.pipeline import (  # noqa: E402
 
 def sheet_row(company, stage="1. Opening", owner="NC", next_step=None, **extra):
     row = {"Empresa": company, "Owner": owner, "Status": stage, "Country": "ARG", "Primary buyer": None,
-           "Nombre contacto (Rol)": None, "Last progress": None, "Next step": next_step}
+           "Nombre contacto (Rol)": None, "Last progress": None, "Next step": next_step, "Client Context": None}
     row.update(extra)
     return row
 
@@ -60,6 +60,16 @@ def test_parse_rows_maps_columns_and_ignores_unknown():
     assert row.fields["stage"] == "2. In Talks"
     assert row.fields["next_step"] == "Send proposal"
     assert row.fields["owner_code"] == "NC"
+
+
+def test_client_context_is_parsed_tracked_and_updates_without_losing_next_step():
+    old = parse_rows([sheet_row("Acme", next_step="Send proposal", **{"Client Context": "Old need"})])[0]
+    new = parse_rows([sheet_row("Acme", next_step="Send proposal", **{" CLIENT CONTEXT ": "  Revised need\nNew objection  "})])[0]
+    assert new.fields["client_context"] == "Revised need\nNew objection"
+    assert old.row_hash != new.row_hash
+    plan = plan_sync([existing_from(old, "o1")], [new])
+    assert plan.updates[0][2] == [("client_context", "Old need", "Revised need\nNew objection")]
+    assert new.fields["next_step"] == "Send proposal"
 
 
 def test_parse_rows_trims_and_blanks_become_none():

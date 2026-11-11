@@ -9,6 +9,7 @@ dependencies = [
     "pydantic-settings>=2.4",
     "psycopg[binary]>=3.2",
     "anthropic>=2.1.0",
+    "google-auth>=2.38",
 ]
 
 [dependency-groups]

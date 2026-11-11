@@ -47,12 +47,9 @@ def _insight_rows(conn, workspace_id) -> list[dict]:
     ).fetchall()
 
 
-SALES_SCOPES = ("deal_progression", None)  # None: extracted before scopes existed, shown until re-extracted
-
-
 def _scoped_rows(rows: list[dict], deals: dict[str, dict]) -> list[dict]:
     """Sales items, plus not-yet-scoped ones; only delivery and out-of-scope work is hidden."""
-    return [r for r in rows if r["action_scope"] in SALES_SCOPES
+    return [r for r in rows if r["action_scope"] in extractor.SALES_SCOPES
             and (deal := deals.get(str(r["company_id"]))) is not None
             and str(deal["id"]) == str(r["opportunity_id"])]
 
@@ -229,7 +226,7 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
                 continue
             prof = prow["profile"]
             for a in prof.get("recommended_actions") or []:
-                if a.get("action_scope") not in SALES_SCOPES or not _profile_sales_entry(a, prow, sales_by_id, d):
+                if a.get("action_scope") not in extractor.SALES_SCOPES or not _profile_sales_entry(a, prow, sales_by_id, d):
                     continue
                 score = {"high": 70, "medium": 50, "low": 30}.get(a.get("urgency"), 30)
                 rec_id = _recommendation_ref(d["id"], a["action"])
@@ -467,7 +464,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         for r in ins_rows:
             if r["source"] == "gmail" and r["origin_record_id"]:
                 email_scopes.setdefault(str(r["origin_record_id"]), set()).add(r["action_scope"])
-        not_sales = {mid for mid, scopes in email_scopes.items() if not scopes & set(SALES_SCOPES)}
+        not_sales = {mid for mid, scopes in email_scopes.items() if not scopes & set(extractor.SALES_SCOPES)}
         newest_insight: dict[str, datetime] = {}
         for r in ins_rows:
             k = str(r["opportunity_id"])
@@ -628,7 +625,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         prof = prow["profile"] if prow else {}
         blockers = [n for b in prof.get("blockers") or [] if _profile_sales_entry(b, prow, sales_by_id, d)
                     and (n := note(d, b, prow, False)) and n.verified]
-        recs_ = [n for a in prof.get("recommended_actions") or [] if a.get("action_scope") in SALES_SCOPES
+        recs_ = [n for a in prof.get("recommended_actions") or [] if a.get("action_scope") in extractor.SALES_SCOPES
                  and _profile_sales_entry(a, prow, sales_by_id, d)
                  and (n := note(d, a, prow, True)) and n.verified
                  and closed.get(("rec", n.ref), ("",))[0] != "done"]

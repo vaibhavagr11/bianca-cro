@@ -1,0 +1,92 @@
+{
+  "name": "Bianca - Daily Sales Pipeline Updates",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {"rule": {"interval": [{"field": "cronExpression", "expression": "0 0 9 * * *"}]}},
+      "id": "5ef90222-f9bc-4ccb-93e5-f4d8916e4761",
+      "name": "Every day at 09:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {},
+      "id": "d3baf1be-cf27-4a01-9779-ff4b9fab8e4c",
+      "name": "Run once manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [0, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://bianca-cro-api.onrender.com/review/daily",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {"timeout": 120000}
+      },
+      "id": "67fedca9-57cd-42c8-90d3-067d7eaa9a26",
+      "name": "Build the next review batch",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [260, 0],
+      "notesInFlow": true,
+      "notes": "Set the deployed backend URL and select Header Auth: name X-Ingest-Token, value your existing ingest credential. Run after all source ingestion and /process/daily finish successfully."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+          "conditions": [{"id": "b8e8348b-3fe7-49ad-87a7-a362453297af", "leftValue": "={{ $json.done }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4d598db4-22df-4b04-9d12-4a6060fe293d",
+      "name": "All companies checked?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [520, 0]
+    },
+    {
+      "parameters": {"amount": 2, "unit": "seconds"},
+      "id": "b10a3bb5-7335-42af-8f12-8ec7c0316f16",
+      "name": "Wait before next batch",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [520, 220],
+      "webhookId": "1828ec5a-4555-4fa9-abd7-904d3eebadf6"
+    },
+    {
+      "parameters": {},
+      "id": "809c21d6-49c4-449a-b238-25824c539e86",
+      "name": "Daily review complete",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [780, -40]
+    },
+    {
+      "parameters": {
+        "content": "## Configure before activation\n1. Deploy migrations 012-014 and the matching backend/UI.\n2. Select Header Auth on the HTTP node: X-Ingest-Token / existing ingest secret.\n3. Confirm the backend URL and workflow timezone. Default: 09:00 America/Argentina/Buenos_Aires.\n4. Schedule AFTER the existing Google ingestion + /process/daily workflow.\n5. Publish/activate after testing.\n\nThe first queue cycle considers the prior 14 days only. Later cycles add new versions once per workspace day. Retries and batch continuation do not duplicate cards. This workflow never approves cards, changes Sheets, or builds/sends another brief.\n\nIf the existing daily brief workflow already calls /process/publish, it can drive the same daily review cycle; use one normal scheduling path. A duplicate trigger is safely skipped after the day's review is complete.",
+        "height": 440,
+        "width": 500
+      },
+      "id": "43879b6b-53ec-41fa-9de8-7f729428770b",
+      "name": "Setup notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [900, 40]
+    }
+  ],
+  "connections": {
+    "Every day at 09:00": {"main": [[{"node": "Build the next review batch", "type": "main", "index": 0}]]},
+    "Run once manually": {"main": [[{"node": "Build the next review batch", "type": "main", "index": 0}]]},
+    "Build the next review batch": {"main": [[{"node": "All companies checked?", "type": "main", "index": 0}]]},
+    "All companies checked?": {"main": [[{"node": "Daily review complete", "type": "main", "index": 0}], [{"node": "Wait before next batch", "type": "main", "index": 0}]]},
+    "Wait before next batch": {"main": [[{"node": "Build the next review batch", "type": "main", "index": 0}]]}
+  },
+  "settings": {"executionOrder": "v1", "timezone": "America/Argentina/Buenos_Aires", "executionTimeout": 1800, "saveDataSuccessExecution": "none", "saveDataErrorExecution": "all"},
+  "pinData": {},
+  "tags": []
+}
