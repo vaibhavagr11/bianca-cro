@@ -1,5 +1,6 @@
 """Exercise the connector's actual FastAPI mount and MCP protocol."""
 
+from datetime import date
 from uuid import uuid4
 
 import pytest
@@ -98,6 +99,7 @@ def test_founder_sees_only_sales_reads_and_mcp_uses_viewer_identity(mock_sales_t
         tools = rpc(client, "tools/list").json()["result"]["tools"]
         assert {tool["name"] for tool in tools} == {
             "search_pipeline", "get_account_activity", "find_stakeholder_evidence", "rank_warm_prospects",
+            "search_sales_evidence",
         }
         assert all(tool["annotations"]["readOnlyHint"] for tool in tools)
         args = {"opportunity_id": str(uuid4())}
@@ -114,3 +116,33 @@ def test_founder_sees_only_sales_reads_and_mcp_uses_viewer_identity(mock_sales_t
 
     assert [name for name, _ in seen] == ["get_account_activity", "get_account_activity"]
     assert [args["viewer_mailbox"] for _, args in seen] == ["RG", "NC"]
+
+
+def test_evidence_search_accepts_combined_filters_and_validates_before_reading(mock_sales_tokens, monkeypatch):
+    calls = []
+
+    def read(_dsn, _feeds, _stale, handler, **arguments):
+        calls.append((handler.__name__, arguments))
+        return {"total_matches": 0, "evidence": [], "next_offset": None}
+
+    monkeypatch.setattr(sales_mcp, "_read", read)
+    filters = {
+        "query": "precio", "owner_code": "NC", "stages": [1, 2, 3], "source": "notes",
+        "insight_type": "objection", "since": "2026-10-01", "until": "2026-12-31", "limit": 8, "offset": 8,
+    }
+    tool = "search_sales_evidence"
+    with TestClient(create_app(sales_config()), base_url=BASE) as client:
+        response = rpc(client, "tools/call", {"name": tool, "arguments": filters})
+        assert response.json()["result"]["structuredContent"]["total_matches"] == 0
+        for invalid in (
+            {"stages": [9]}, {"source": "other"}, {"offset": -1},
+            {"since": "2026-12-31", "until": "2026-10-01"},
+            {"evidence_kind": "source", "insight_type": "objection"},
+        ):
+            result = rpc(client, "tools/call", {"name": tool, "arguments": invalid}).json()["result"]
+            assert result["isError"]
+
+    assert calls == [(tool, {
+        **filters, "since": date(2026, 10, 1), "until": date(2026, 12, 31),
+        "opportunity_id": None, "evidence_kind": None, "viewer_mailbox": "RG",
+    })]

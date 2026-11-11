@@ -1,6 +1,7 @@
 """Permission tests against a migrated, disposable local Postgres database."""
 
 import os
+from datetime import date
 from secrets import token_hex
 
 import psycopg
@@ -234,3 +235,85 @@ def test_connector_queries_run_with_the_restricted_login(sales_database):
 
     with pytest.raises(ToolError, match="database access is unavailable"):
         sales_mcp._read(TEST_DATABASE_URL, feeds, 84, sales_queries.search_pipeline)
+
+
+def test_evidence_search_filters_and_pages_only_permitted_sales_records(sales_database):
+    from app import sales_mcp, sales_queries
+
+    login, _, password, workspaces = sales_database
+    dsn = make_conninfo(TEST_DATABASE_URL, user=login, password=password)
+    workspace_id = workspaces["bound"]
+    quote = "A 50% price increase is too high."
+    when = "2001-01-15T12:00:00+00:00"
+    with psycopg.connect(TEST_DATABASE_URL) as admin:
+        admin.execute("update public.opportunities set stage_rank = 2, owner_code = 'RG' where workspace_id = any(%s)",
+                      (list(workspaces.values()),))
+        admin.execute(
+            "update public.source_records set occurred_at = %s, body = %s, meta = %s"
+            " where workspace_id = any(%s)",
+            (when, "Prefix. " * 80 + quote + " Suffix." * 80, Jsonb({"mailboxes": ["RG"]}),
+             list(workspaces.values())),
+        )
+        opportunity_id, company_id = admin.execute(
+            "select id, company_id from public.opportunities where workspace_id = %s", (workspace_id,),
+        ).fetchone()
+        email_id = admin.execute(
+            "select id from public.source_records where workspace_id = %s and external_id = 'sales'", (workspace_id,),
+        ).fetchone()[0]
+        notes_company, = admin.execute(
+            "insert into public.companies (workspace_id, name, normalized_name)"
+            " values (%s, 'Other Prospect', 'other prospect') returning id", (workspace_id,),
+        ).fetchone()
+        admin.execute(
+            "insert into public.opportunities (workspace_id, company_id, stage_rank, owner_code, row_hash)"
+            " values (%s, %s, 1, 'NC', 'test')", (workspace_id, notes_company),
+        )
+        note_id, = admin.execute(
+            "insert into public.source_records (workspace_id, company_id, source, external_id, occurred_at, subject,"
+            " content_hash, body, status, classification, meta) values"
+            " (%s, %s, 'notes', 'meeting', %s, 'Price review', 'notes-hash',"
+            " %s, 'classified', %s, %s) returning id",
+            (workspace_id, notes_company, when, quote, Jsonb({"category": "prospect", "is_commercial": True}),
+             Jsonb({"doc_id": "price-review", "date_inferred": False})),
+        ).fetchone()
+        for key, excerpt in (("valid", quote), ("unsupported", "The product was entirely free.")):
+            admin.execute(
+                "insert into public.insights (workspace_id, opportunity_id, company_id, source, unit_id,"
+                " source_record_ids, type, text, quote, confidence, extractor_version, origin_record_id, action_scope)"
+                " values (%s, %s, %s, 'gmail', %s, %s, 'objection', 'Price concern',"
+                " %s, 'high', 'test', %s, 'deal_progression')",
+                (workspace_id, opportunity_id, company_id, key, [email_id], excerpt, email_id),
+            )
+
+    def search(**kwargs):
+        return sales_mcp._read(dsn, [], 84, sales_queries.search_sales_evidence, **kwargs)
+
+    filters = {"query": "50% PRICE", "stages": [1, 2, 3], "evidence_kind": "source",
+               "since": date(2001, 1, 15), "until": date(2001, 1, 15), "limit": 1, "viewer_mailbox": "RG"}
+    first = search(**filters)
+    assert first["total_matches"] == 2
+    assert first["distinct_source_records"] == 2
+    assert first["distinct_opportunities"] == 2
+    assert first["next_offset"] == 1
+    second = search(**filters, offset=first["next_offset"])
+    assert second["next_offset"] is None
+    assert {page["evidence"][0]["record_id"] for page in (first, second)} == {str(email_id), str(note_id)}
+    assert all(quote in page["evidence"][0]["excerpt"] for page in (first, second))
+
+    mixed = search(query="price")
+    assert mixed["total_matches"] == 3
+    assert mixed["distinct_source_records"] == 2
+    assert mixed["counts_by_kind"] == {"source": 2, "insight": 1}
+
+    notes = search(source="notes", evidence_kind="source")
+    assert notes["evidence"][0]["excerpt"] == quote
+
+    objections = search(insight_type="objection", owner_code="RG", source="gmail",
+                        opportunity_id=opportunity_id, viewer_mailbox="RG")
+    assert objections["total_matches"] == 1
+    assert objections["counts_by_insight_type"] == {"objection": 1}
+    assert objections["evidence"][0]["record_id"] == str(email_id)
+    assert objections["evidence"][0]["url"].endswith("#all/alias-sales")
+    assert search(insight_type="objection", viewer_mailbox="NC")["evidence"][0]["url"] is None
+    assert search(query="50_", evidence_kind="source")["total_matches"] == 0
+    assert search(query="50%", stages=[4])["total_matches"] == 0
