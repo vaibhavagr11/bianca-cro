@@ -164,6 +164,138 @@ def _aliases(conn, workspace_id, viewer_mailbox: str | None, rows: list[dict]) -
     )}
 
 
+def search_sales_evidence(conn, workspace_id, query: str | None = None, opportunity_id: UUID | None = None,
+                          owner_code: str | None = None, stages: list[int] | None = None, source: str | None = None,
+                          insight_type: str | None = None, evidence_kind: str | None = None,
+                          since: date | None = None, until: date | None = None, limit: int = 10,
+                          offset: int = 0, viewer_mailbox: str | None = None) -> dict:
+    """Search commercial records and grounded insights with a stable evidence-level order."""
+    _limit(limit)
+    if not 0 <= offset <= 2_147_483_647:
+        raise ValueError("offset must be between 0 and 2147483647")
+    if since and until and since > until:
+        raise ValueError("since must not be after until")
+    if stages is not None and (not stages or any(stage not in range(6) for stage in stages)):
+        raise ValueError("stages must contain pipeline stage ranks between 0 and 5")
+    if source not in (None, "gmail", "notes", "calendar"):
+        raise ValueError("invalid source")
+    if evidence_kind not in (None, "source", "insight") or evidence_kind == "source" and insight_type:
+        raise ValueError("an insight type can only filter insight evidence")
+    _, timezone = _workspace(conn, workspace_id)
+    now = timeline.utcnow()
+    params = {"workspace": workspace_id, "opportunity": opportunity_id, "stages": stages,
+              "owner": owner_code.strip().upper() if owner_code else None, "source": source, "insight_type": insight_type,
+              "kind": evidence_kind, "query": (query or "").strip() or None, "now": now, "timezone": timezone.key,
+              "since": since, "until": until, "limit": limit, "offset": offset, "excerpt_length": MAX_EXCERPT}
+    rows = conn.execute(
+        f"""with accounts as (
+                select o.id as opportunity_id, o.company_id, c.name as company, o.stage, o.owner_code
+                from {DEAL_TABLES}
+                where o.workspace_id = %(workspace)s and o.removed_at is null
+                  and (%(opportunity)s::uuid is null or o.id = %(opportunity)s)
+                  and (%(owner)s::text is null or o.owner_code = %(owner)s)
+                  and (%(stages)s::smallint[] is null or o.stage_rank = any(%(stages)s))
+            ), candidates as (
+                select a.opportunity_id, a.company, a.stage, a.owner_code, 'source'::text as kind,
+                       r.id, r.source, r.thread_id, r.occurred_at, r.subject, r.meta,
+                       null::uuid as insight_id, null::text as insight_type, null::text as insight_summary,
+                       null::text as confidence,
+                       case when %(query)s::text is null then left(r.body, %(excerpt_length)s)
+                            when match.body_position > 0 then substring(r.body from greatest(1, match.body_position - 80)
+                                                                        for %(excerpt_length)s) end as excerpt
+                from accounts a join public.source_records r on r.company_id = a.company_id
+                cross join lateral (select strpos(lower(r.body), lower(%(query)s::text)) as body_position) match
+                where r.workspace_id = %(workspace)s and r.status = 'classified'
+                  and r.classification->'is_commercial' = 'true'::jsonb
+                  and %(insight_type)s::text is null and %(kind)s::text is distinct from 'insight'
+                  and (%(source)s::text is null or r.source = %(source)s)
+                  and (%(query)s::text is null or match.body_position > 0
+                       or strpos(lower(r.subject), lower(%(query)s)) > 0)
+                union all
+                select a.opportunity_id, a.company, a.stage, a.owner_code, 'insight'::text as kind,
+                       r.id, r.source, r.thread_id, r.occurred_at, r.subject, r.meta,
+                       i.id, i.type, left(i.text, %(excerpt_length)s), i.confidence, left(i.quote, %(excerpt_length)s)
+                from accounts a join public.insights i on i.opportunity_id = a.opportunity_id
+                     and i.company_id = a.company_id
+                join lateral (
+                    select record.id, record.source, record.thread_id, record.occurred_at, record.subject, record.meta,
+                           count(*) over () as supporting_records
+                    from public.source_records record
+                    where record.workspace_id = i.workspace_id and record.company_id = i.company_id
+                      and record.source = i.source and record.id = any(i.source_record_ids)
+                      and (i.origin_record_id is null or record.id = i.origin_record_id)
+                      and record.status = 'classified' and record.classification->'is_commercial' = 'true'::jsonb
+                      and strpos(regexp_replace(lower(record.body), '[[:space:]]+', ' ', 'g'),
+                                 nullif(btrim(regexp_replace(lower(i.quote), '[[:space:]]+', ' ', 'g')), '')) > 0
+                    order by record.id limit 1
+                ) r on r.supporting_records = 1
+                where i.workspace_id = %(workspace)s and i.status <> 'dismissed'
+                  and (i.action_scope = 'deal_progression' or i.action_scope is null)
+                  and %(kind)s::text is distinct from 'source'
+                  and (%(insight_type)s::text is null or i.type = %(insight_type)s)
+                  and (%(source)s::text is null or i.source = %(source)s)
+                  and (%(query)s::text is null or strpos(lower(i.text), lower(%(query)s)) > 0
+                       or strpos(lower(i.quote), lower(%(query)s)) > 0)
+            ), dated as (
+                select *, case when source = 'notes' then occurred_at::date
+                               else (occurred_at at time zone %(timezone)s)::date end as event_date
+                from candidates
+            ), matches as (
+                select * from dated
+                where (%(since)s::date is null or event_date >= %(since)s)
+                  and (%(until)s::date is null or event_date <= %(until)s)
+                  and (occurred_at is null or occurred_at <= %(now)s
+                       or (source = 'calendar' and kind = 'source' and %(until)s::date is not null))
+            ), totals as (
+                select count(*) as total_matches, count(distinct id) as distinct_source_records,
+                       count(distinct opportunity_id) as distinct_opportunities,
+                       count(*) filter (where kind = 'insight') as insight_matches,
+                       count(*) filter (where kind = 'source') as source_matches
+                from matches
+            ), by_type as (
+                select coalesce(jsonb_object_agg(insight_type, hits), '{{}}'::jsonb) as counts_by_insight_type
+                from (select insight_type, count(*) as hits from matches where kind = 'insight' group by insight_type) grouped
+            )
+            select page.*, totals.*, by_type.counts_by_insight_type
+            from totals cross join by_type left join lateral (
+                select * from matches
+                order by occurred_at desc nulls last, kind, id, insight_id nulls last
+                limit %(limit)s offset %(offset)s
+            ) page on true
+            order by page.occurred_at desc nulls last, page.kind, page.id, page.insight_id nulls last""",
+        params,
+    ).fetchall()
+
+    totals = rows[0]
+    page = [row for row in rows if row["id"] is not None]
+    aliases = _aliases(conn, workspace_id, viewer_mailbox, page)
+    evidence = []
+    for row in page:
+        item = {**_source(row, timezone, aliases, viewer_mailbox), "kind": row["kind"],
+                "opportunity_id": str(row["opportunity_id"]), "company": row["company"],
+                "stage": row["stage"], "owner_code": row["owner_code"]}
+        if row["kind"] == "insight":
+            item.update(insight_id=str(row["insight_id"]), insight_type=row["insight_type"],
+                        summary=row["insight_summary"], confidence=row["confidence"], quote=row["excerpt"])
+        else:
+            item["match_basis"] = ("filters" if params["query"] is None else "body" if row["excerpt"] else "title")
+            if row["excerpt"]:
+                item["excerpt"] = row["excerpt"]
+        if row["source"] == "calendar":
+            item["calendar_status"] = (row["meta"] or {}).get("status", "unknown")
+            item["attendance"] = "unverified"
+            item["future"] = bool(row["occurred_at"] and row["occurred_at"] > now)
+        evidence.append(item)
+    next_offset = offset + len(evidence)
+    return {"status": "ok", "evidence": evidence, "total_matches": totals["total_matches"],
+            "distinct_source_records": totals["distinct_source_records"],
+            "distinct_opportunities": totals["distinct_opportunities"],
+            "counts_by_kind": {"source": totals["source_matches"], "insight": totals["insight_matches"]},
+            "counts_by_insight_type": totals["counts_by_insight_type"],
+            "next_offset": next_offset if next_offset < totals["total_matches"] else None,
+            "as_of": now.astimezone(timezone).isoformat()}
+
+
 def _activity_rows(conn, workspace_id, company_id, source: str, as_of: datetime, limit: int,
                    *, before: tuple | None = None, explicit_date: bool = False) -> list[dict]:
     cutoff, cutoff_id = before or (None, None)

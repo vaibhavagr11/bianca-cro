@@ -21,6 +21,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app import sales_queries
 from app.config import Settings
+from app.extractor import InsightType
 from app.sales_auth import SalesTokenVerifier
 
 log = logging.getLogger(__name__)
@@ -193,6 +194,41 @@ def create_sales_transport(settings: Settings):
         return await run(
             sales_queries.find_stakeholder_evidence,
             opportunity_id=opportunity_id, stakeholder=stakeholder, since=since, until=until, limit=limit,
+        )
+
+    @server.tool(annotations=READ_ONLY)
+    async def search_sales_evidence(
+        query: Annotated[
+            str, Field(min_length=1, max_length=160, description="Case-insensitive literal phrase."),
+        ] | None = None,
+        opportunity_id: UUID | None = None,
+        owner_code: OwnerCode | None = None,
+        stages: Annotated[list[Annotated[int, Field(ge=0, le=5)]], Field(
+            min_length=1, max_length=6,
+            description="Current pipeline stage ranks. Opening=1, In Talks=2, Proposal=3, Pilot=4.",
+        )] | None = None,
+        source: Literal["gmail", "calendar", "notes"] | None = None,
+        evidence_kind: Literal["source", "insight"] | None = None,
+        insight_type: InsightType | None = None,
+        since: date | None = None,
+        until: date | None = None,
+        limit: ResultLimit = 10,
+        offset: Annotated[int, Field(ge=0, le=2_147_483_647)] = 0,
+    ) -> dict[str, Any]:
+        """Search recorded evidence across active deals. Combine filters and cite the returned excerpts.
+
+        Use insight_type for supported extracted findings and next_offset to review more matches.
+        The totals cover all matches and distinguish results, source records, and opportunities.
+        """
+        if since and until and since > until:
+            raise ToolError("The start date must be on or before the end date.")
+        if evidence_kind == "source" and insight_type is not None:
+            raise ToolError("An insight type requires insight evidence.")
+        return await run(
+            sales_queries.search_sales_evidence, mailbox_aware=True, query=query,
+            opportunity_id=opportunity_id, owner_code=owner_code, stages=stages, source=source,
+            evidence_kind=evidence_kind, insight_type=insight_type, since=since, until=until,
+            limit=limit, offset=offset,
         )
 
     @server.tool(annotations=READ_ONLY)
