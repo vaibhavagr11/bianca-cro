@@ -45,6 +45,10 @@ def test_serves_a_restricted_same_origin_consent_page():
     assert "frame-ancestors 'none'" in policy and "form-action 'none'" in policy
     assert f'integrity="sha256-{script_hash}"' in page.text
     assert 'data-authorization-id="auth-id_123"' in page.text
+    assert '<form id="sign-in" hidden>' in page.text
+    assert '<input id="password" type="password" autocomplete="off" required>' in page.text
+    assert '<button type="submit">Sign in</button>' in page.text
+    assert "Email me a code" not in page.text
     assert PILOT_SUBJECT not in page.text
     assert hashlib.sha256(PILOT_SUBJECT.encode()).hexdigest() in page.text
     assert "test-ingest-token" not in page.text
