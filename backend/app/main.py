@@ -51,6 +51,10 @@ def create_app(config: Settings = settings) -> FastAPI:
     app.add_api_route("/health", health, methods=["GET"])
     app.add_api_route("/health/db", health_db, methods=["GET"])
     if transport is not None:
+        if config.sales_mcp_supabase_client_id is not None:
+            from app.sales_consent import create_sales_consent_router
+
+            app.include_router(create_sales_consent_router(config))
         # The SDK owns both /sales/mcp and its root-level OAuth discovery route.
         app.mount("/", transport)
     return app

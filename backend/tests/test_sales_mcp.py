@@ -64,6 +64,31 @@ def test_disabled_connector_and_incomplete_config():
         create_app(sales_config(sales_mcp_founders={}))
 
 
+def test_supabase_requires_the_registered_client_publishable_key_and_paired_issuer():
+    issuer = "https://aaaaaaaaaaaaaaaaaaaa.supabase.co/auth/v1"
+    jwks_url = f"{issuer}/.well-known/jwks.json"
+    settings = {
+        "sales_mcp_issuer": issuer,
+        "sales_mcp_jwks_url": jwks_url,
+        "sales_mcp_supabase_client_id": uuid4(),
+        "sales_mcp_supabase_publishable_key": "sb_publishable_test",
+    }
+    with TestClient(create_app(sales_config(**settings)), base_url=BASE) as client:
+        metadata = client.get("/.well-known/oauth-protected-resource/sales/mcp")
+        assert metadata.json()["authorization_servers"] == [issuer]
+        assert metadata.json()["scopes_supported"] == ["openid"]
+
+    for field, value, error in (
+        ("sales_mcp_supabase_client_id", None, "registered OAuth client ID"),
+        ("sales_mcp_supabase_publishable_key", None, "publishable key"),
+        ("sales_mcp_supabase_publishable_key", "sb_secret_test", "publishable key"),
+        ("sales_mcp_jwks_url", jwks_url.replace("aaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbb"), "one project"),
+        ("sales_mcp_issuer", ISSUER, "one project"),
+    ):
+        with pytest.raises(ValueError, match=error):
+            create_app(sales_config(**{**settings, field: value}))
+
+
 def test_oauth_discovery_at_exact_public_url(mock_sales_tokens):
     with TestClient(create_app(sales_config()), base_url=BASE) as client:
         unauthenticated = rpc(client, "tools/list", headers={})

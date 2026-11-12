@@ -3,10 +3,11 @@
 import asyncio
 from threading import get_ident
 from time import time
+from uuid import uuid4
 
 import jwt
 import pytest
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from jwt.exceptions import PyJWKClientConnectionError
 
 from app.sales_auth import SalesTokenVerifier
@@ -122,3 +123,38 @@ def test_fails_closed_on_jwks_timeout(verifier, private_key, monkeypatch):
 
     monkeypatch.setattr(verifier._jwks, "fetch_data", unavailable)
     assert asyncio.run(verifier.verify_token(signed_token(token_claims(), private_key))) is None
+
+
+@pytest.mark.parametrize("algorithm", ["RS256", "ES256"])
+def test_supabase_accepts_only_the_registered_client_and_resource(algorithm, monkeypatch, private_key):
+    client_id = uuid4()
+    issuer = "https://aaaaaaaaaaaaaaaaaaaa.supabase.co/auth/v1"
+    verifier = SalesTokenVerifier(
+        issuer=issuer,
+        audience=RESOURCE,
+        jwks_url=f"{issuer}/.well-known/jwks.json",
+        allowed_subjects={FOUNDER},
+        supabase_client_id=client_id,
+    )
+    if algorithm == "ES256":
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_jwk = jwt.algorithms.ECAlgorithm.to_jwk(private_key.public_key(), as_dict=True)
+    else:
+        public_jwk = jwt.algorithms.RSAAlgorithm.to_jwk(private_key.public_key(), as_dict=True)
+    public_jwk.update(kid="current-key", alg=algorithm)
+    monkeypatch.setattr(verifier._jwks, "fetch_data", lambda: {"keys": [public_jwk]})
+    claims = {**token_claims(), "iss": issuer, "client_id": str(client_id)}
+
+    def verify(overrides):
+        token = jwt.encode({**claims, **overrides}, private_key, algorithm=algorithm, headers={"kid": "current-key"})
+        return asyncio.run(verifier.verify_token(token))
+
+    result = verify({})
+    assert result is not None
+    assert result.client_id == str(client_id)
+    assert result.scopes == ["openid", "email"]
+    assert verify({"aud": [RESOURCE]}) is not None
+    assert verify({"aud": [RESOURCE, "authenticated"]}) is None
+    assert verify({"aud": "authenticated"}) is None
+    assert verify({"client_id": str(uuid4())}) is None
+    assert verify({"sub": "uninvited-user"}) is None
