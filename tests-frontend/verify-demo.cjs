@@ -17,6 +17,8 @@ const core = context.BiancaCore;
 const json = value => JSON.parse(JSON.stringify(value));
 const rowFor = (state, id) => state.rows.find(row => row.id === id);
 const proposalFor = (state, id) => state.proposals.find(proposal => proposal.id === id);
+const demoStorageKey = 'bianca.pipeline-review.demo.v4-nov3';
+const demoCompanyCount = 12;
 const at = '2026-11-02T20:30:00.000Z';
 const approve=(state,id,nextStepBullets,at)=>core.approve(state,id,{nextStepBullets,clientContextBullets:[]},at);
 let passed = 0;
@@ -26,10 +28,10 @@ function test(name, run) {
   catch (error) { failed++; process.stdout.write(`FAIL ${name}\n  ${error.message}\n`); }
 }
 
-test('Fresh workspace has six pending proposals, matching company rows, and valid state', () => {
+test('Fresh workspace has twelve pending proposals, matching company rows, and valid state', () => {
   const state = core.initial();
-  assert.equal(state.proposals.length, 6);
-  assert.equal(state.rows.length, 6);
+  assert.equal(state.proposals.length, demoCompanyCount);
+  assert.equal(state.rows.length, demoCompanyCount);
   assert.ok(state.proposals.every(proposal => proposal.status === 'pending'));
   assert.deepEqual(state.proposals.map(p => p.id).sort(), state.rows.map(r => r.id).sort());
   assert.equal(core.valid(state), true);
@@ -96,9 +98,11 @@ test('Repeated approval is idempotent and cannot rotate the sheet twice', () => 
 
 test('An empty previous Next step replaces Last progress with an empty cell', () => {
   const initial = core.initial();
-  rowFor(initial, 'koala-eco').nextStep = '';
-  const after = approve(initial, 'koala-eco', ['Send the onboarding checklist.'], at);
-  assert.equal(rowFor(after, 'koala-eco').lastProgress, '');
+  const id = 'pernod-ricard';
+  assert.notEqual(rowFor(initial, id).lastProgress, '');
+  rowFor(initial, id).nextStep = '';
+  const after = approve(initial, id, ['Send the onboarding checklist.'], at);
+  assert.equal(rowFor(after, id).lastProgress, '');
   assert.equal(after.activity[0].after.lastProgress, '');
 });
 
@@ -116,7 +120,7 @@ test('Ignore removes a pending card without changing any sheet cell', () => {
   const after = core.ignore(before, 'farmater', at);
   assert.deepEqual(json(after.rows), json(before.rows));
   assert.equal(proposalFor(after, 'farmater').status, 'ignored');
-  assert.equal(after.proposals.filter(p => p.status === 'pending').length, 5);
+  assert.equal(after.proposals.filter(p => p.status === 'pending').length, before.proposals.length - 1);
   assert.equal(after.activity[0].kind, 'ignored');
   assert.equal(proposalFor(before, 'farmater').status, 'pending');
 });
@@ -188,7 +192,7 @@ function fakePage(savedState){
     querySelectorAll(){return [];}querySelector(){return new Element();}
   }
   const elements=new Map(),events={},storage=new Map();
-  if(savedState)storage.set('bianca.pipeline-review.demo.v3',JSON.stringify(savedState));
+  if(savedState)storage.set(demoStorageKey,JSON.stringify(savedState));
   const get=selector=>{if(!elements.has(selector))elements.set(selector,new Element());return elements.get(selector);};
   get('#owner-filter').value='all';
   const page=vm.createContext({
@@ -198,42 +202,46 @@ function fakePage(savedState){
     setTimeout:()=>0,clearTimeout:()=>{}
   });
   for(const script of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g))vm.runInContext(script[1],page);
-  return {get,events};
+  return {get,events,storage};
 }
 
 test('Demo navigation and actions contain no Sheet preview or bottom rotation hint',()=>{
   for(const text of ['sheet-tab','sheet-panel','sheet-rows','Current Next step → Last progress','Approved bullets → Next step'])assert.equal(html.includes(text),false,text);
   assert.equal(/Sheet preview/i.test(html),false);
   const page=fakePage();
-  assert.equal(page.get('#pending-count').textContent,6);
+  assert.equal(page.get('#pending-count').textContent,demoCompanyCount);
   assert.ok(page.get('#review-list').innerHTML.includes('data-action="approve"'));
   assert.ok(page.get('#review-list').innerHTML.includes('data-action="edit"'));
   assert.ok(page.get('#review-list').innerHTML.includes('data-action="ignore"'));
 });
 
-test('Demo sources show every type and date without rendering sample quotes',()=>{
+test('Demo sources show types and dates and keep escaped excerpts in closed disclosures',()=>{
   const state=core.initial();
   state.proposals[0].sources=[
-    {id:'date-notes',type:'Meeting notes',date:'2026-09-28',quote:'Hidden notes quotation.'},
-    {id:'date-email',type:'Email',date:'2026-10-06',quote:'Hidden email quotation.'},
-    {id:'date-calendar',type:'Calendar',date:'2026-10-07',quote:'Hidden calendar quotation.'}
+    {id:'date-notes',type:'Meeting notes',date:'2026-09-28',subject:'Notes title',quote:'Notes quotation.'},
+    {id:'date-email',type:'Email',date:'2026-10-06',subject:'Email title',quote:'Email quotation.'},
+    {id:'date-calendar',type:'Calendar',date:'2026-10-07',subject:'Calendar title',quote:'<img src=x> Calendar quotation.'}
   ];
   for(const edges of Object.values(state.proposals[0].bulletLineage))for(const edge of edges)edge.sourceIds=['date-notes'];
-  const page=fakePage(state),card=page.get('#review-list').innerHTML;
-  for(const label of ['Notes · Sep 28','Email · Oct 6','Calendar · Oct 7'])assert.ok(card.includes(label),label);
-  for(const source of state.proposals[0].sources)assert.equal(card.includes(source.quote),false);
-  assert.equal(card.includes('View source context'),false);
+  const card=demoArticle(fakePage(state),state.proposals[0].id);
+  for(const [title,label,excerpt] of [
+    ['Notes title','Source: Notes, Sep 28','Notes quotation.'],
+    ['Email title','Source: Email, Oct 6','Email quotation.'],
+    ['Calendar title','Source: Calendar, Oct 7','&lt;img src=x&gt; Calendar quotation.']
+  ])assert.ok(card.includes(`<details><summary><span>${title}</span><span class="src">${label}</span></summary><div class="ctx">${excerpt}</div></details>`),label);
+  assert.equal(card.includes('<img src=x>'),false);
 });
 
 test('Demo Current Next steps reads the current row with escaped multiline text',()=>{
   const state=core.initial(),id='pernod-ricard';
   proposalFor(state,id).nextStep='Outdated proposal context';
   rowFor(state,id).nextStep='- Current action & details.\n- <img src=x> Follow up.';
-  const card=fakePage(state).get('#review-list').innerHTML;
+  const card=demoArticle(fakePage(state),id);
   const details=card.match(/<details[^>]*class="current-next-steps"[^>]*>([\s\S]*?)<\/details>/);
   assert.ok(details,'Current Next steps uses native details.');
   assert.equal(/\sopen(?:[\s=>])/.test(details[0].slice(0,details[0].indexOf('>'))),false);
-  assert.ok(details[1].includes('<summary>Current Next steps</summary>'));
+  assert.ok(details[1].includes('<summary>Current Sheet cells</summary>'));
+  assert.ok(details[1].includes('<h4>Next step (now)</h4>'));
   assert.ok(details[1].includes('- Current action &amp; details.\n- &lt;img src=x&gt; Follow up.'));
   assert.equal(card.includes('Outdated proposal context'),false);
   assert.equal(card.includes('<img src=x>'),false);
@@ -252,7 +260,7 @@ test('Demo retains the expanded context through filters and closes it when the w
 test('Demo current row with no Next steps shows a clear empty state',()=>{
   const state=core.initial(),id='pernod-ricard';
   proposalFor(state,id).nextStep='Older context must not return';rowFor(state,id).nextStep='';
-  const card=fakePage(state).get('#review-list').innerHTML;
+  const card=demoArticle(fakePage(state),id);
   assert.ok(card.includes('No Next steps are currently noted.'));
   assert.equal(card.includes('Older context must not return'),false);
 });
@@ -262,11 +270,12 @@ test('New schema rejects saved flat legacy proposals instead of guessing column 
   const legacy=core.initial();legacy.schema=1;
   assert.equal(core.valid(legacy),false);
   assert.throws(()=>core.approve(core.initial(),'campari',['A flat legacy bullet.'],at),/at least one bullet/);
-  assert.equal(html.includes('bianca.pipeline-review.demo.v3'),true);
+  assert.equal(html.includes(demoStorageKey),true);
 });
 
 test('Approval routes groups to separate cells and preserves the old Client Context exactly',()=>{
   const before=core.initial(),id='pernod-ricard',old=rowFor(before,id);
+  old.clientContext='  Existing retail context.';
   const after=core.approve(before,id,{nextStepBullets:['Blocker: Store codes are missing.'],clientContextBullets:['Buying signal: Pilot approved.']},at);
   assert.equal(rowFor(after,id).nextStep,'- Blocker: Store codes are missing.');
   assert.equal(rowFor(after,id).lastProgress,old.nextStep);
@@ -276,6 +285,7 @@ test('Approval routes groups to separate cells and preserves the old Client Cont
 
 test('Context-only approval changes no action or progress cell',()=>{
   const before=core.initial(),old=rowFor(before,'campari');
+  old.clientContext='Existing account context.';
   const after=core.approve(before,'campari',{nextStepBullets:[],clientContextBullets:['Objection: Timing depends on budget.']},at);
   assert.equal(rowFor(after,'campari').lastProgress,old.lastProgress);
   assert.equal(rowFor(after,'campari').nextStep,old.nextStep);
@@ -305,10 +315,13 @@ test('Both groups empty or malformed cannot be approved',()=>{
 
 test('Cards and editor expose separate destination groups and existing Client Context',()=>{
   const before=core.initial(),p=proposalFor(before,'pernod-ricard');
+  rowFor(before,p.id).clientContext='Current retail context.';
   const page=fakePage(before),cards=page.get('#review-list').innerHTML;
-  assert.ok(cards.includes('Next Step · actions and blockers'));
-  assert.ok(cards.includes('Client Context · needs, signals, and objections'));
-  assert.ok(cards.includes('<summary>Current Client Context</summary>'));
+  assert.ok(cards.includes('Suggested next steps'));
+  assert.ok(cards.includes('data-destination="nextStep"'));
+  assert.ok(cards.includes('data-destination="clientContext"'));
+  assert.ok(cards.includes('<summary>Current Sheet cells</summary>'));
+  assert.ok(cards.includes('<h4>Client context (now)</h4>'));
   assert.ok(html.includes('id="edit-client-context"'));
   const article={dataset:{id:p.id}},button={dataset:{action:'edit'},closest:()=>article};
   page.events.click({target:{closest:()=>button}});
@@ -326,32 +339,37 @@ test('Empty current Client Context is explicit and does not revive the proposal 
 
 
 function clickSource(page,companyId,sourceId){const article={dataset:{id:companyId}},button={dataset:{action:'source',sourceId},closest:selector=>selector==='[data-id]'?article:null};page.events.click({target:{closest:()=>button}});}
-const demoArticle=(page,id)=>page.get('#review-list').innerHTML.match(new RegExp('<article[^>]*data-id="'+id+'"[\\s\\S]*?<\\/article>'))?.[0]||'';
+function demoArticle(page,id){
+  return page.get('#review-list').innerHTML.match(new RegExp('<article[^>]*data-id="'+id+'"[\\s\\S]*?<\\/article>'))?.[0]||'';
+}
 const demoHighlighted=(card,bulletId)=>new RegExp('<li(?=[^>]*data-bullet-id="'+bulletId+'")(?=[^>]*class="source-highlight")[^>]*>').test(card);
 
-test('Fictional Pernod source edges explicitly link Email to its first two actions and Notes to its last action',()=>{
-  const p=core.initial().proposals[0],data=core.trace(p);
+test('Campari has distinct source edges for each action and its matching context',()=>{
+  const p=proposalFor(core.initial(),'campari'),data=core.trace(p);
   assert.equal(data.available,true);assert.equal(p.lineageVersion,1);
-  assert.deepEqual(json(data.lineage.nextStep.map(edge=>edge.sourceIds)),[[p.sources[0].id],[p.sources[0].id],[p.sources[1].id]]);
+  const expected=[[p.sources[0].id],[p.sources[1].id]];
+  assert.deepEqual(json(data.lineage.nextStep.map(edge=>edge.sourceIds)),expected);
+  assert.deepEqual(json(data.lineage.clientContext.map(edge=>edge.sourceIds)),expected);
   const page=fakePage();clickSource(page,p.id,p.sources[0].id);let card=demoArticle(page,p.id);
   assert.equal(demoHighlighted(card,p.bulletLineage.nextStep[0].bulletId),true);
-  assert.equal(demoHighlighted(card,p.bulletLineage.nextStep[1].bulletId),true);
-  assert.equal(demoHighlighted(card,p.bulletLineage.nextStep[2].bulletId),false);
-  assert.ok(page.get('#announcer').textContent.includes('2 bullets highlighted from Email · Nov 2'));
+  assert.equal(demoHighlighted(card,p.bulletLineage.nextStep[1].bulletId),false);
+  assert.equal(demoHighlighted(card,p.bulletLineage.clientContext[0].bulletId),true);
   clickSource(page,p.id,p.sources[1].id);card=demoArticle(page,p.id);
   assert.equal(demoHighlighted(card,p.bulletLineage.nextStep[0].bulletId),false);
-  assert.equal(demoHighlighted(card,p.bulletLineage.nextStep[2].bulletId),true);
-  assert.equal(demoHighlighted(card,p.bulletLineage.clientContext[0].bulletId),true);
+  assert.equal(demoHighlighted(card,p.bulletLineage.nextStep[1].bulletId),true);
+  assert.equal(demoHighlighted(card,p.bulletLineage.clientContext[1].bulletId),true);
+  assert.ok(page.get('#announcer').textContent.includes('2 bullets highlighted'));
 });
 
 test('Source selection toggles independently without storing a decision or changing any demo cell',()=>{
   const state=core.initial(),p=state.proposals[0],page=fakePage(state);
   clickSource(page,p.id,p.sources[0].id);
-  assert.equal(page.get('#pending-count').textContent,6);assert.equal(page.get('#activity-count').textContent,0);
-  assert.equal(demoArticle(page,'campari').includes('class="source-highlight"'),false);
+  assert.equal(page.get('#pending-count').textContent,demoCompanyCount);assert.equal(page.get('#activity-count').textContent,0);
+  assert.equal(demoArticle(page,'pernod-ricard').includes('class="source-highlight"'),false);
   clickSource(page,p.id,p.sources[0].id);
   assert.equal(demoArticle(page,p.id).includes('class="source-highlight"'),false);
   assert.ok(page.get('#announcer').textContent.includes('highlighting cleared'));
+  assert.equal(page.storage.get(demoStorageKey),JSON.stringify(state));
 });
 
 test('Demo graph validation refuses old or fabricated attribution',()=>{

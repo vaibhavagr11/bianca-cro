@@ -21,7 +21,7 @@ from app import db
 from app.config import settings
 from app.pipeline import PipelineRow, TRACKED_FIELDS, normalize_name
 from app.review_sheets import SheetsClient, SheetConflict, SheetError, SheetWriteUncertain
-from app.review_content import (source_version, proposal_content, merge_content, approved_lineage, validate_lineage)
+from app.review_content import Content, approved_lineage, proposal_content, source_version, validate_lineage
 
 
 class ReviewConflict(ValueError):
@@ -178,6 +178,20 @@ def _proposal_data(row: dict) -> dict:
             "revision": row["revision"], "status": row["status"]}
 
 
+def _current_content(conn, workspace_id, deal: dict, records: list[dict]) -> Content:
+    insights = conn.execute(
+        "select * from insights where workspace_id = %s and company_id = %s and opportunity_id = %s"
+        " and source_record_ids && %s::uuid[] order by id",
+        (workspace_id, deal["company_id"], deal["opportunity_id"], [r["id"] for r in records]),
+    ).fetchall() if records else []
+    return proposal_content(records, insights)
+
+
+def _content_versions(sources: list[dict]) -> list[dict]:
+    return sorted(({"source": s["source"], "external_id": s["externalId"], "version": s["version"]}
+                   for s in sources), key=_source_key)
+
+
 def build_proposals(conn, workspace_id, *, force: bool = False) -> dict:
     """Resume today's bounded build; only the initial import has a 14-day window."""
     conn.row_factory = dict_row
@@ -211,37 +225,29 @@ def build_proposals(conn, workspace_id, *, force: bool = False) -> dict:
                    if _source_key(source_version(r)) not in exclusions
                    and _source_key(source_version(r)) + (str(deal["company_id"]),) not in receipts
                    and (state["bootstrap_completed"] or _in_bootstrap_window(r, state))]
-        retain = (existing and existing.get("lineage_version") == 1 and existing.get("routing_version") == ROUTING_VERSION
-                  and validate_lineage(existing["next_step_bullets"], existing["client_context_bullets"],
-                                       existing["sources"], existing["bullet_lineage"]))
-        if not records and not retain:
-            if existing:
-                conn.execute("update review_proposals set status = 'superseded' where id = %s and status = 'pending'",
-                             (existing["id"],))
+        # Re-extraction can change an insight's scope without changing its source version.
+        next_steps, context, sources, lineage = _current_content(conn, workspace_id, deal, records)
+        if not existing and not (next_steps or context):
             counts["unchanged"] += 1
             continue
-        observed = sorted((source_version(r) for r in records), key=_source_key)
-        previous_versions = {_source_key(v) for v in (existing.get("source_versions", []) if retain else [])}
-        new_records = [r for r in records if force or _source_key(source_version(r)) not in previous_versions]
-        insights = conn.execute(
-            "select * from insights where workspace_id = %s and company_id = %s and source_record_ids && %s::uuid[]",
-            (workspace_id, deal["company_id"], [r["id"] for r in new_records])).fetchall() if new_records else []
-        next_steps, context, sources, lineage = merge_content(existing if retain else None, proposal_content(new_records, insights))
-        versions = {_source_key(v): v for v in (existing.get("source_versions", []) if retain else [])}
-        versions.update({_source_key(v): v for v in observed})
-        versions = [versions[key] for key in sorted(versions)]
+        versions = _content_versions(sources)
         baseline = _cells(deal["last_progress"], deal["next_step"], deal.get("client_context"))
         data = {"company_name": deal["company_name"], "owner_code": deal["owner_code"], "stage": deal["stage"],
                 "country": deal["country"], "bullets": next_steps + context, "sources": sources, "source_versions": versions,
                 "next_step_bullets": next_steps, "client_context_bullets": context, "routing_version": ROUTING_VERSION,
                 "snapshot_last_progress": baseline["lastProgress"], "snapshot_next_step": baseline["nextStep"],
-                "snapshot_client_context": baseline["clientContext"], "observed_source_versions": observed,
+                "snapshot_client_context": baseline["clientContext"], "observed_source_versions": versions,
                 "bullet_lineage": lineage, "lineage_version": 1}
-        if existing and all(existing.get(k) == value for k, value in data.items()):
+        if existing and (next_steps or context) and all(existing.get(k) == value for k, value in data.items()):
             counts["unchanged"] += 1
             continue
         if counts["created"] + counts["updated"] >= limit:
             counts["remaining"] += 1
+            continue
+        if not (next_steps or context):
+            conn.execute("update review_proposals set status = 'superseded', revision = revision + 1"
+                         " where id = %s and status = 'pending'", (existing["id"],))
+            counts["updated"] += 1
             continue
         if existing:
             conn.execute(
@@ -252,7 +258,7 @@ def build_proposals(conn, workspace_id, *, force: bool = False) -> dict:
                 " bullet_lineage = %s, lineage_version = %s, revision = revision + 1 where id = %s",
                 (data["company_name"], data["owner_code"], data["stage"], data["country"], Jsonb(next_steps + context), Jsonb(sources),
                  Jsonb(versions), baseline["lastProgress"], baseline["nextStep"], baseline["clientContext"],
-                 Jsonb(next_steps), Jsonb(context), ROUTING_VERSION, Jsonb(observed), Jsonb(lineage), 1, existing["id"]))
+                 Jsonb(next_steps), Jsonb(context), ROUTING_VERSION, Jsonb(versions), Jsonb(lineage), 1, existing["id"]))
             counts["updated"] += 1
         else:
             conn.execute(
@@ -264,7 +270,7 @@ def build_proposals(conn, workspace_id, *, force: bool = False) -> dict:
                 (workspace_id, deal["company_id"], deal["opportunity_id"], data["company_name"], data["owner_code"],
                  data["stage"], data["country"], Jsonb(next_steps + context), Jsonb(sources), Jsonb(versions),
                  baseline["lastProgress"], baseline["nextStep"], baseline["clientContext"],
-                 Jsonb(next_steps), Jsonb(context), ROUTING_VERSION, Jsonb(observed), Jsonb(lineage), 1))
+                 Jsonb(next_steps), Jsonb(context), ROUTING_VERSION, Jsonb(versions), Jsonb(lineage), 1))
             counts["created"] += 1
     done = counts["remaining"] == 0
     if done:
@@ -417,6 +423,23 @@ def _result(intent: dict, proposal: dict, mirror_refreshed: bool | None = None) 
     return data
 
 
+def _require_current_content(conn, workspace_id, proposal: dict) -> None:
+    # Extraction locks source rows before changing their insights. Keep the displayed evidence stable until
+    # the new decision is durable. Revalidate the original card even when the founder supplies edited text.
+    by_version = {_source_key(source_version(r)): r for r in conn.execute(
+        "select * from source_records where workspace_id = %s and company_id = %s and status = 'classified'"
+        " and classification->>'is_commercial' = 'true' order by id for share", (workspace_id, proposal["company_id"]))}
+    expected = [_source_key(v) for v in proposal.get("observed_source_versions", [])]
+    if any(key not in by_version for key in expected):
+        raise ReviewConflict("The source material changed since this card was generated. Refresh the review queue before deciding.")
+    next_steps, context, sources, lineage = _current_content(conn, workspace_id, proposal,
+                                                            [by_version[key] for key in expected])
+    if (not (next_steps or context) or next_steps != proposal["next_step_bullets"]
+            or context != proposal["client_context_bullets"] or lineage != proposal["bullet_lineage"]
+            or _content_versions(sources) != proposal["source_versions"]):
+        raise ReviewConflict("The sales evidence changed since this card was generated. Refresh the review queue before deciding.")
+
+
 def _prepare(conn, workspace_id, proposal_id: str, actor: str, action: str, revision: int,
              idempotency_key: str, next_step_bullets: list[str] | None,
              client_context_bullets: list[str] | None, sheets: SheetsClient) -> tuple[dict, dict, bool]:
@@ -463,6 +486,7 @@ def _prepare(conn, workspace_id, proposal_id: str, actor: str, action: str, revi
     if not validate_lineage(proposal["next_step_bullets"], proposal["client_context_bullets"],
                             proposal["sources"], proposal["bullet_lineage"]):
         raise ReviewConflict("This proposal has invalid source lineage. Rebuild the review queue before deciding.")
+    _require_current_content(conn, workspace_id, proposal)
     before = _cells(proposal["snapshot_last_progress"], proposal["snapshot_next_step"], proposal.get("snapshot_client_context"))
     after = dict(before)
     target = None
@@ -470,11 +494,6 @@ def _prepare(conn, workspace_id, proposal_id: str, actor: str, action: str, revi
         target = _sheet_target()
         if not _target_is_pinned(target):
             raise ReviewUnavailable("Pin REVIEW_SPREADSHEET_ID, REVIEW_SHEET_TAB, and a numeric REVIEW_SHEET_ID before approving.")
-        current_sources = {_source_key(source_version(r)) for r in conn.execute(
-            "select * from source_records where workspace_id = %s and company_id = %s and status = 'classified'"
-            " and classification->>'is_commercial' = 'true'", (workspace_id, proposal["company_id"]))}
-        if any(_source_key(version) not in current_sources for version in proposal.get("observed_source_versions", [])):
-            raise ReviewConflict("The source material changed since this card was generated. Refresh the review queue before approving.")
         live = sheets.read_company(proposal["company_name"])
         exact_live = _cells(live.last_progress, live.next_step, live.client_context)
         if not _same_cells(before, exact_live):

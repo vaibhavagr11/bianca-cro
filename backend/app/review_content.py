@@ -13,6 +13,8 @@ from datetime import date, datetime
 from typing import Any
 from urllib.parse import quote
 
+from app import extractor
+
 
 SOURCE_NAMES = {"gmail": "Email", "notes": "Meeting notes", "calendar": "Calendar"}
 CONTEXT_NAMES = {"need": "Customer need", "buying_signal": "Buying signal", "objection": "Objection",
@@ -81,13 +83,29 @@ def _merge_source(previous: dict, incoming: dict) -> dict:
     return result
 
 
+def _supporting_record(insight: dict, passage: str, records: dict[str, dict]) -> dict | None:
+    def supports(record: dict) -> bool:
+        source = record["source"]
+        # A calendar title or a Gmail subject carried through a thread cannot establish a new request.
+        body_only = source == "calendar" or (source == "gmail" and insight["type"] == "next_step")
+        return extractor.quote_in_record(passage, record, body_only=body_only)
+
+    if (origin_id := insight.get("origin_record_id")) is not None:
+        origin = records.get(str(origin_id))
+        return origin if origin is not None and supports(origin) else None
+
+    # Older insights identify a group of possible sources. Attribute the bullet only when one holds the quote.
+    candidate_ids = {str(record_id) for record_id in insight.get("source_record_ids") or ()}
+    matches = [records[record_id] for record_id in candidate_ids if record_id in records and supports(records[record_id])]
+    return matches[0] if len(matches) == 1 else None
+
+
 def proposal_content(records: list[dict], insights: list[dict]) -> Content:
-    """Use only source-supported insights; every resulting bullet has exact record edges."""
+    """Build sales review bullets and attribute each one to the source of its quote."""
     groups: dict[str, list[str]] = {destination: [] for destination in DESTINATIONS}
     lineage: dict[str, list[dict]] = {destination: [] for destination in DESTINATIONS}
     positions: dict[tuple[str, str], int] = {}
     sources: dict[str, dict] = {}
-    covered: set[str] = set()
     by_id = {str(record["id"]): record for record in records}
 
     def evidence(record: dict, passage: str) -> str:
@@ -102,70 +120,46 @@ def proposal_content(records: list[dict], insights: list[dict]) -> Content:
         sources[identifier] = _merge_source(sources[identifier], entry) if identifier in sources else entry
         return identifier
 
-    def add(text: str, destination: str, identifiers: list[str]) -> None:
+    def add(text: str, destination: str, identifier: str) -> None:
         key = (destination, _squash(text))
-        if not key[1] or not identifiers:
+        if not key[1]:
             return
         if key in positions:
             node = lineage[destination][positions[key]]
-            node["sourceIds"] = _union(node["sourceIds"], identifiers)
+            node["sourceIds"] = _union(node["sourceIds"], [identifier])
             return
         positions[key] = len(groups[destination])
         groups[destination].append(text)
-        lineage[destination].append({"bulletId": bullet_id(destination, text), "text": text,
-                                     "sourceIds": sorted(set(identifiers))})
+        lineage[destination].append({"bulletId": bullet_id(destination, text), "text": text, "sourceIds": [identifier]})
 
     ordered = sorted(insights, key=lambda item: (item["type"] in ("commitment", "next_step"),
                                                _stamp(item.get("occurred_at")), item["text"]))
     for insight in ordered:
-        if insight.get("type") not in ACTION_TYPES | CONTEXT_TYPES:
+        kind = insight["type"]
+        text = insight["text"].strip()
+        if kind not in ACTION_TYPES | CONTEXT_TYPES or insight.get("action_scope") not in extractor.SALES_SCOPES:
             continue
-        if insight.get("status") in ("done", "dismissed", "possibly_done"):
+        if not text or insight.get("status") in ("done", "dismissed", "possibly_done"):
             continue
         passage = insight.get("quote") or ""
-        if not passage.strip():
+        if not (record := _supporting_record(insight, passage, by_id)):
             continue
-        matched = [record for record_id in insight.get("source_record_ids") or []
-                   if (record := by_id.get(str(record_id)))
-                   and _squash(passage) in _squash(f"{record.get('subject') or ''} {record.get('body') or ''}")]
-        # A calendar title alone proves scheduling, not a commercial promise or signal.
-        substantive = [record for record in matched if record["source"] != "calendar"
-                       or _squash(passage) in _squash(record.get("body") or "")]
-        if not substantive:
-            continue
-        prefix = CONTEXT_NAMES.get(insight["type"])
-        if insight["type"] in ("commitment", "next_step"):
-            prefix = "We owe" if insight.get("owner_side") == "bianca" else (
-                "Customer next step" if insight.get("owner_side") == "customer" else "Next step (owner to confirm)")
-        text = f"{prefix}: {insight['text']}" if prefix else insight["text"]
+        prefix = CONTEXT_NAMES.get(kind)
+        owner_side = insight.get("owner_side")
+        if kind == "commitment":
+            prefix = {"bianca": "We owe", "customer": "Customer committed"}.get(
+                owner_side, "Commitment (owner to confirm)")
+        elif kind == "next_step":
+            prefix = {"bianca": "Next step", "customer": "Customer next step"}.get(
+                owner_side, "Next step (owner to confirm)")
+        text = f"{prefix}: {text}" if prefix else text
         if insight.get("owner_name"):
             text += f" (owner: {insight['owner_name']})"
-        if insight.get("due_date"):
-            text += f" — due {_stamp(insight['due_date'])[:10]}"
-        identifiers = []
-        for record in substantive:
-            covered.add(str(record["id"]))
-            identifiers.append(evidence(record, passage))
-        destination = "nextStep" if insight["type"] in ACTION_TYPES else "clientContext"
-        add(text, destination, identifiers)
-
-    for record in records:
-        if str(record["id"]) in covered:
-            continue
-        subject = (record.get("subject") or "Untitled item").strip()
-        day = _stamp(record.get("occurred_at"))[:10]
-        when = f" ({day})" if day else " (date unconfirmed)"
-        if record["source"] == "calendar":
-            verb = "Meeting cancelled" if (record.get("meta") or {}).get("status") == "cancelled" else "Meeting scheduled"
-            text = f"{verb}{when}: {subject}. Review the agenda and confirm any next actions."
-        elif record["source"] == "notes":
-            text = f"Commercial meeting notes recorded{when}: {subject}. Review the notes for context and next actions."
-        else:
-            text = f"Commercial email recorded{when}: {subject}. Review the message for context and any reply needed."
-        passage = ((record.get("classification") or {}).get("evidence_quote") or "").strip()
-        body = f"{record.get('subject') or ''} {record.get('body') or ''}"
-        passage = passage if passage and _squash(passage) in _squash(body) else subject
-        add(text, "nextStep", [evidence(record, passage)])
+        if kind in ("commitment", "next_step") and insight.get("due_date"):
+            label = "requested by" if kind == "next_step" else "due"
+            text += f" — {label} {_stamp(insight['due_date'])[:10]}"
+        destination = "nextStep" if kind in ACTION_TYPES else "clientContext"
+        add(text, destination, evidence(record, passage))
 
     return groups["nextStep"], groups["clientContext"], list(sources.values()), lineage
 

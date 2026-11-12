@@ -11,7 +11,7 @@ import re, sys, os, base64, json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from seed_data import to_js
 
-SHEET_URL = "https://docs.google.com/spreadsheets/d/14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw/edit?gid=1869050409#gid=1869050409"
+SHEET_URL = "https://docs.google.com/spreadsheets/d/11HXJsfGHIqnr_mekiV6l277v61C2qz_ELNxA0RyaNcA/edit?gid=1869050409#gid=1869050409"
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOGO_BLUE = base64.b64encode(open(os.path.join(HERE, "bianca-blue-360.png"), "rb").read()).decode()
 LOGO_WHITE = base64.b64encode(open(os.path.join(HERE, "bianca-white-360.png"), "rb").read()).decode()
@@ -92,6 +92,19 @@ dialog{border:1px solid #D8E0EF;border-radius:14px;box-shadow:0 22px 90px #182D5
 .dialog-body{padding:16px 24px 20px}.dialog-body label{font-size:12.5px;font-weight:650;display:block;margin:12px 0 6px}.dialog-body label:first-child{margin-top:0}
 .editor{display:block;width:100%;min-height:110px;padding:10px 12px;border:1px solid #BDCCEF;border-radius:8px;font-size:13.5px;line-height:1.7;color:#344766;background:#FCFDFF;resize:vertical}.field-help{font-size:11.5px;line-height:1.6;color:#8B97AD;margin-top:6px}
 .mode{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-top:12px}.mode button{border:0;background:#fff;padding:7px 12px;font-size:12px;font-weight:600;color:#55617C;border-right:1px solid var(--line)}.mode button:last-child{border-right:0}.mode button.on{background:var(--soft);color:var(--blue)}
+.mode-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px}.mode-row .mode{margin-top:0}.mode-hint{font-size:11.5px;color:#6B7690}
+.ns-rows{display:flex;flex-direction:column;gap:8px;margin-top:6px}
+.ns-row{display:grid;grid-template-columns:minmax(0,1fr) 158px 32px;gap:8px;align-items:start}
+.ns-row textarea{min-height:52px;border:1px solid #BDCCEF;border-radius:8px;padding:7px 10px;font:inherit;font-size:13.5px;line-height:1.45;color:#344766;background:#FCFDFF;resize:vertical;min-width:0}
+.ns-row textarea:focus{outline:2px solid var(--blue);outline-offset:1px}
+.ns-row input{height:36px;border:1px solid #BDCCEF;border-radius:8px;padding:0 10px;font:inherit;font-size:13.5px;color:#344766;background:#FCFDFF;min-width:0}
+.ns-row input:focus{outline:2px solid var(--blue);outline-offset:1px}
+.ns-row .ns-del{margin-top:2px;height:32px;width:32px;border:1px solid var(--line);border-radius:8px;background:#fff;color:#6B7690;font-size:16px;line-height:1}
+.ns-head{display:grid;grid-template-columns:minmax(0,1fr) 158px 32px;gap:8px;margin-top:8px;font-size:11px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;color:#6B7690}
+.ns-add{margin-top:8px}
+.ns-preview{margin-top:10px;padding:8px 10px;border:1px dashed var(--line);border-radius:8px;font-size:12px;line-height:1.6;color:#55617C;white-space:pre-wrap}
+.ns-preview b{display:block;font-size:11px;letter-spacing:.4px;text-transform:uppercase;color:#6B7690;margin-bottom:2px}
+@media (max-width:560px){.ns-row,.ns-head{grid-template-columns:minmax(0,1fr) 132px 32px}}
 .due{display:flex;gap:10px;align-items:center;margin-top:12px;font-size:12.5px;flex-wrap:wrap}.due input{height:32px;border:1px solid var(--line);border-radius:7px;padding:0 10px;font-size:12.5px;width:150px}
 .rotation-preview{margin-top:16px;border:1px solid #E2E8F4;border-radius:8px;overflow:hidden}.rotation-preview h3{font-size:11px;font-weight:650;padding:9px 12px;background:#F4F7FC;color:#526786;border-bottom:1px solid #E2E8F4}.rotation-row{padding:9px 12px;display:grid;grid-template-columns:110px 1fr;gap:10px;font-size:12px;line-height:1.6}.rotation-row+.rotation-row{border-top:1px solid #EDF1F8}.rotation-name{font-weight:650;color:#697B9A}.rotation-content{color:#7A879E;white-space:pre-line;overflow-wrap:anywhere}.rotation-explain{font-size:10.5px;color:#98A3B6;margin-top:8px;line-height:1.7}
 .dialog-actions{padding:12px 24px;border-top:1px solid #E9EEF7;display:flex;justify-content:flex-end;gap:8px;background:#FCFDFF}
@@ -116,7 +129,9 @@ HEADER = '''<header class="site-header"><div class="header-inner"><a class="bran
 TOOLBAR = '''<div class="toolbar"><div class="seg" id="owner-seg" role="group" aria-label="Filter by owner"><button type="button" class="on" data-owner="all">All <span class="cnt" data-cnt="all">0</span></button><button type="button" class="rg" data-owner="RG"><span class="avatar">RG</span>Ramiro <span class="cnt" data-cnt="RG">0</span></button><button type="button" class="nc" data-owner="NC"><span class="avatar nc">NC</span>Nico <span class="cnt" data-cnt="NC">0</span></button><button type="button" class="ndl" data-owner="NDL"><span class="avatar ndl">NDL</span>Nicolás de León <span class="cnt" data-cnt="NDL">0</span></button></div><div class="tb-right">__LAYOUT_TOGGLE__</div><div class="search-wrap"><label class="sr-only" for="company-search">Search companies</label><input class="search" id="company-search" type="search" value="" autocomplete="off" tabindex="-1" aria-hidden="true"></div><label class="sr-only" for="owner-filter">Filter by owner</label><select class="owner-filter" id="owner-filter" tabindex="-1" aria-hidden="true"><option value="all">All founders</option><option value="RG">Ramiro · RG</option><option value="NC">Nico · NC</option><option value="NDL">Nicolás de León · NDL</option></select></div>'''
 LAYOUT_TOGGLE = '<div class="layout-toggle" role="group" aria-label="Layout"><button type="button" class="on" data-theme-pick="war-room">War room</button><button type="button" data-theme-pick="focus">Focus</button></div>'
 
-DIALOG_EXTRA = '''<div class="mode" role="group" aria-label="Next Step write mode"><button type="button" class="on" data-mode="replace">Replace Next Step</button><button type="button" data-mode="append">Keep current bullets + add these</button></div><span class="proposed">Proposed - not wired</span><p class="field-help">Replace is what the build does today (previous Next Step moves into Last progress). Keep + add is the cumulative option for the founders to decide.</p><div class="due"><span>Due date for this step</span><input type="text" value="" placeholder="e.g. Nov 13" aria-label="Due date (proposed, not saved)"><span class="proposed" style="margin-left:0">Proposed - not saved</span></div>'''
+DIALOG_EXTRA = '''<div class="mode-row"><div class="mode" id="edit-mode" role="group" aria-label="Next Step write mode"><button type="button" class="on" data-mode-pick="replace" aria-pressed="true">Replace Next Step</button><button type="button" data-mode-pick="append" aria-pressed="false">Keep current bullets + add these</button></div></div><p class="field-help">Replace writes only these steps to Next Step. Keep + add leaves the bullets already in the Sheet and adds these below them. Either way the previous Next Step is copied to Last progress. The same switch is on the card.</p>'''
+ROWS_EDITOR = '''<div class="ns-head" aria-hidden="true"><span>Next step</span><span>Complete by</span><span></span></div><div class="ns-rows" id="ns-rows"></div><button type="button" class="pill ns-add" data-action="ns-add">+ Add next step</button><div class="ns-preview" id="ns-preview" aria-live="polite"></div>'''
+ROWS_HELP = 'One row per next step, with an optional date. The date is written into the Next Step cell after the step as "(complete by Nov 4, 2026)" - no new Sheet column. Leave every row empty to keep Next Step and Last progress unchanged.'
 
 # ------------------------------------------------------------------------------------------------ presentation module (shared)
 WR_JS = r"""
@@ -161,10 +176,13 @@ const BiancaWarRoom = (() => {
   function move(step){ const rows = [...document.querySelectorAll('.wr-row')]; const i = rows.findIndex(r => r.dataset.select === selected); const n = rows[i + step]; if(n){ selected = n.dataset.select; rerender(); } }
   function closeMenus(except){ document.querySelectorAll('.ign-menu.open').forEach(m => { if(m !== except) m.classList.remove('open'); }); }
   document.addEventListener('click', e => {
-    const b = e.target.closest('[data-action], [data-owner], [data-theme-pick]'); if(!b) { closeMenus(); return; }
+    const b = e.target.closest('[data-action], [data-owner], [data-theme-pick], [data-mode-pick]'); if(!b) { closeMenus(); return; }
+    if(b.dataset.modePick){ const id = b.dataset.modeFor || editingRows; if(id){ modes.set(id, b.dataset.modePick); paintDialogMode(id); drawPreview(); rerender(); } return; }
     if(b.dataset.owner !== undefined){ const sel = $('#owner-filter'); sel.value = b.dataset.owner; selected = null; sel.dispatchEvent(new Event('change')); return; }
     if(b.dataset.themePick){ document.body.dataset.theme = b.dataset.themePick; __STORE_THEME__ rerender(); return; }
     const a = b.dataset.action;
+    if(a === 'ns-add'){ rows.push(blankRow()); drawRows(rows.length - 1); syncRows(); return; }
+    if(a === 'ns-del'){ rows.splice(Number(b.closest('.ns-row').dataset.row), 1); if(!rows.length) rows.push(blankRow()); drawRows(); syncRows(); return; }
     if(a === 'wr-select'){ selected = b.dataset.select; rerender(); }
     else if(a === 'wr-prev') move(-1);
     else if(a === 'wr-next') move(1);
@@ -182,7 +200,37 @@ const BiancaWarRoom = (() => {
     else return; e.preventDefault();
   });
   try{ const q = new URLSearchParams(location.search).get('theme'); const t = (q === 'focus' || q === 'war-room') ? q : __READ_THEME__; if(t === 'focus' || t === 'war-room') document.body.dataset.theme = t; }catch(_){ }
-  return {shell, avatar, ownerName, stageClass, shortDate, esc, get selected(){ return selected; }};
+  // ---- Next Step write mode per card + row editor with a date per step (11/09/2026, Kellogg team).
+  // Still presentation only: the page's own approve / decide path sends the bullets; nothing here calls the connector.
+  const modes = new Map();
+  const mode = id => modes.get(id) === 'append' ? 'append' : 'replace';
+  const cellBullets = v => String(v || '').split(/\r?\n/).map(l => l.trim().replace(/^(?:[-*•]\s*)/, '').trim()).filter(Boolean);
+  // Keep + add: the bullets already in the Sheet cell, then the new ones (identical lines not repeated).
+  function merged(id, bullets, currentCell){ if(mode(id) !== 'append' || !bullets || !bullets.length) return bullets; const cur = cellBullets(currentCell), seen = new Set(cur); return [...cur, ...bullets.filter(x => !seen.has(x))]; }
+  function modeControl(id){ const m = mode(id); return `<div class="mode-row"><div class="mode" role="group" aria-label="Next Step write mode"><button type="button" class="${m==='replace'?'on':''}" data-mode-pick="replace" data-mode-for="${esc(id)}" aria-pressed="${m==='replace'}">Replace Next Step</button><button type="button" class="${m==='append'?'on':''}" data-mode-pick="append" data-mode-for="${esc(id)}" aria-pressed="${m==='append'}">Keep current bullets + add these</button></div><span class="mode-hint">${m==='append'?'Bullets already in the Sheet stay; these are added below.':'These replace what is in Next Step now.'}</span></div>`; }
+  function paintDialogMode(id){ const m = mode(id); document.querySelectorAll('#edit-mode [data-mode-pick]').forEach(x => { const on = x.dataset.modePick === m; x.classList.toggle('on', on); x.setAttribute('aria-pressed', String(on)); }); }
+  const fmtDate = iso => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || ''); return m ? new Date(Date.UTC(+m[1], +m[2]-1, +m[3])).toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric', timeZone:'UTC'}) : ''; };
+  const toISO = text => { if(!/\b\d{4}\b/.test(text)) return ''; const t = Date.parse(text + ' UTC'); return Number.isFinite(t) ? new Date(t).toISOString().slice(0, 10) : ''; };
+  function splitBullet(bullet){
+    let m = /\s*\(complete by ([^)]+)\)\s*$/i.exec(bullet);
+    if(m){ const iso = toISO(m[1]); if(iso) return {text: bullet.slice(0, m.index).trim(), date: iso}; }
+    m = /\s*[—–-]\s*due (\d{4}-\d{2}-\d{2})\s*$/i.exec(bullet);
+    if(m) return {text: bullet.slice(0, m.index).trim(), date: m[1]};
+    return {text: bullet, date: ''};
+  }
+  const joinBullet = (text, date) => { const t = String(text || '').replace(/[\r\n]+/g, ' ').trim(); if(!t) return ''; const d = fmtDate(date); return d ? `${t} (complete by ${d})` : t; };
+  let rows = [], editingRows = null;
+  const blankRow = () => ({text:'', date:'', t0:null, d0:null});
+  // An untouched row goes back exactly as suggested, so its source link survives.
+  const rowBullet = r => (r.orig !== undefined && r.text === r.t0 && r.date === r.d0) ? r.orig : joinBullet(r.text, r.date);
+  function drawRows(focusIndex){ const box = $('#ns-rows'); if(!box) return; box.innerHTML = rows.map((r, i) => `<div class="ns-row" data-row="${i}"><textarea class="ns-text" rows="2" maxlength="3900" placeholder="Next step" aria-label="Next step ${i+1}">${esc(r.text)}</textarea><input type="date" class="ns-date" value="${esc(r.date)}" aria-label="Complete by date for next step ${i+1}"><button type="button" class="ns-del" data-action="ns-del" aria-label="Remove next step ${i+1}">&times;</button></div>`).join(''); if(focusIndex !== undefined) box.querySelectorAll('.ns-text')[focusIndex]?.focus(); drawPreview(); }
+  function drawPreview(){ const out = $('#ns-preview'); if(!out) return; const lines = rows.map(rowBullet).filter(Boolean); out.innerHTML = lines.length ? `<b>${mode(editingRows)==='append'?'Added to Next Step, below the current bullets':'Written to Next Step'}</b>${lines.map(l => esc('- ' + l)).join('\n')}` : '<b>Next Step</b>No rows - Next Step and Last progress stay as they are.'; }
+  function syncRows(){ const ta = $('#edit-content'); if(!ta) return; ta.value = rows.map(rowBullet).filter(Boolean).map(x => '- ' + x).join('\n'); ta.dispatchEvent(new Event('input', {bubbles:true})); drawPreview(); }
+  // Called by the page right after it fills the hidden #edit-content textarea and opens the dialog.
+  function openRows(id){ try{ const ta = $('#edit-content'), box = $('#ns-rows'); if(!ta || !box) return; editingRows = id; rows = cellBullets(ta.value).map(x => { const p = splitBullet(x); return {orig:x, text:p.text, date:p.date, t0:p.text, d0:p.date}; }); if(!rows.length) rows = [blankRow()]; paintDialogMode(id); drawRows(0); }catch(_){ } }
+  document.addEventListener('input', e => { const row = e.target.closest?.('.ns-row'); if(!row) return; const r = rows[Number(row.dataset.row)]; if(!r) return; if(e.target.classList.contains('ns-text')) r.text = e.target.value; else if(e.target.classList.contains('ns-date')) r.date = e.target.value; syncRows(); });
+  document.addEventListener('keydown', e => { if(e.key === 'Enter' && !e.shiftKey && e.target.closest?.('.ns-row') && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')){ e.preventDefault(); rows.push(blankRow()); drawRows(rows.length - 1); } });
+  return {shell, avatar, ownerName, stageClass, shortDate, esc, mode, merged, modeControl, openRows, get selected(){ return selected; }};
 })();
 """
 
@@ -198,7 +246,7 @@ CARD_JS = r"""function card(p){
     const open=expandedNextSteps.has(p.id);
     return `<article class="review-card" data-id="${esc(p.id)}" aria-labelledby="title-${esc(p.id)}">
 <div class="card-top"><div><h2 class="company-title" id="title-${esc(p.id)}">${esc(p.company)}</h2><div class="meta-bar"><span><span class="k">Stage:</span><span class="${WR.stageClass(p.stage)}">${esc(p.stage||'-')}</span></span><span><span class="k">Owner:</span>${WR.avatar(p.owner)}${esc(WR.ownerName(p.owner))}</span><span><span class="k">Country:</span>${esc(p.country||'-')}</span></div></div></div>
-<div class="ns-box"><div class="sec-label ns-label">Suggested next steps</div>${bulletList(p,nextBullets,'nextStep',data)}</div>
+<div class="ns-box"><div class="sec-label ns-label">Suggested next steps</div>${bulletList(p,nextBullets,'nextStep',data)}${!applying&&!legacy&&!lineageBlocked&&nextBullets.length?WR.modeControl(p.id):''}</div>
 <div class="sec-label">What's new</div>${whatsNew}
 <div class="sec-label">Client context <span class="proposed">Column proposed</span></div>${bulletList(p,contextBullets,'clientContext',data)}
 ${traceNote?`<p class="approval-note trace-note" role="status">${esc(traceNote)}</p>`:''}${legacy?`<p class="approval-note legacy-note" role="status">${esc(p.error)}</p>`:''}${applying&&!legacy?`<p class="approval-note" role="status">${esc(p.error||'This approval has a saved write request. Retry checks that same request; it will not move the cells twice.')}</p>`:''}
@@ -229,6 +277,28 @@ def patch(src_html: str, demo: bool) -> str:
     s = s.replace('<h3>Current sheet context</h3><div class="rotation-row"><span class="rotation-name">Next Step</span>',
                   '<h3>What will happen in the Sheet copy</h3><div class="rotation-row"><span class="rotation-name">Last progress &#8592;</span><span class="rotation-content">the current Next Step (when Next Step bullets are approved)</span></div><div class="rotation-row"><span class="rotation-name">Next Step (now)</span>', 1)
     s = s.replace('<span>Approve sends actions and blockers to “Next Step,” and needs, signals, and objections to “Client Context.”</span>', '<span>Approve or edit to update Pipeline Next Steps.</span>')
+    # 5b. Next Step editor: one row per step (text + date); the original textarea stays as the hidden value the page submits
+    assert s.count('<textarea class="editor" id="edit-content"') == 1
+    s = s.replace('<textarea class="editor" id="edit-content"', '<textarea class="editor" id="edit-content" hidden', 1)
+    s = s.replace('aria-describedby="edit-help edit-error"></textarea><p id="edit-help" class="field-help">One bullet per line. Commitments, next steps, and blockers belong here. Leave empty to keep Next Step and Last progress unchanged.</p>',
+                  'aria-describedby="edit-help edit-error"></textarea>' + ROWS_EDITOR + '<p id="edit-help" class="field-help">' + ROWS_HELP + '</p>', 1)
+    assert 'id="ns-rows"' in s, "edit-help anchor not found"
+    assert s.count("$('#edit-dialog').showModal();$('#edit-content').focus();}") == 1
+    s = s.replace("$('#edit-dialog').showModal();$('#edit-content').focus();}", "$('#edit-dialog').showModal();$('#edit-content').focus();BiancaWarRoom.openRows(id);}", 1)
+    # 5c. Replace / Keep + add: applied where the page builds the bullets it approves (card Approve and the editor submit)
+    if demo:
+        cur = "state.rows.find(r=>r.id===ID)?.nextStep"
+        a_old = "if(action==='approve')approve(id,state.proposals.find(p=>p.id===id));"
+        a_new = "if(action==='approve'){const p=state.proposals.find(p=>p.id===id);if(BiancaWarRoom.mode(id)==='append'&&p.nextStepBullets.length)approve(id,{nextStepBullets:BiancaWarRoom.merged(id,p.nextStepBullets," + cur.replace('ID','id') + "),clientContextBullets:p.clientContextBullets},true);else approve(id,p);}"
+        s_old = "nextStepBullets:BiancaCore.parseBullets($('#edit-content').value)"
+        s_new = "nextStepBullets:BiancaWarRoom.merged(editingId,BiancaCore.parseBullets($('#edit-content').value)," + cur.replace('ID','editingId') + ")"
+    else:
+        a_old = "if(action==='approve')decide(id,'approve',state.proposals.find(p=>p.id===id));"
+        a_new = "if(action==='approve'){const p=state.proposals.find(p=>p.id===id);if(p&&BiancaWarRoom.mode(id)==='append'&&p.nextStepBullets?.length)decide(id,'approve',{nextStepBullets:BiancaWarRoom.merged(id,p.nextStepBullets,currentNextStep(p)),clientContextBullets:p.clientContextBullets},true);else decide(id,'approve',p);}"
+        s_old = "nextStepBullets:BiancaLive.parseBullets($('#edit-content').value)"
+        s_new = "nextStepBullets:BiancaWarRoom.merged(editingId,BiancaLive.parseBullets($('#edit-content').value),currentNextStep(state.proposals.find(p=>p.id===editingId)||{}))"
+    assert s.count(a_old) == 1 and s.count(s_old) == 1, "approve / submit anchors not found"
+    s = s.replace(a_old, a_new, 1).replace(s_old, s_new, 1)
     # 6. footer copy
     s = s.replace("Built alongside your daily brief · Changes require your approval", "Built alongside the daily brief · Approvals write Next Step, Last progress and Client Context only · * synced / sent times are illustrative until the backend exposes them")
     s = s.replace("Built alongside your daily brief · Fictional updates for design review", "Built alongside the daily brief · Demo data: real Nov 3 companies from the Sheet copy, client context illustrative · * times illustrative")

@@ -173,7 +173,7 @@ def test_shell_contains_live_ui_and_demo_is_separate():
     live = client.get("/review/app")
     assert live.status_code == 200
     assert "Sales Pipeline Updates" in live.text
-    assert "Nico · NDL" in live.text
+    assert "Nicolás de León" in live.text
     assert live.headers["cache-control"] == "no-store"
     assert "Pernod Ricard" not in live.text
     demo = client.get("/review/demo")

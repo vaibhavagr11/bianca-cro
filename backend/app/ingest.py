@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from app import db, gmail, google_calendar, notes
 from app.config import settings
 from app.pipeline import (
+    BASE_TRACKED_FIELDS,
     TRACKED_FIELDS,
     ExistingDeal,
     PipelineValidationError,
@@ -83,16 +84,18 @@ def ingest_pipeline(payload: PipelinePayload, dry_run: bool = False,
                     x_ingest_token: str | None = Header(default=None)) -> dict:
     """Sync the pipeline Sheet. dry_run=true reports what would change and writes nothing (not even a sync run)."""
     require_token(x_ingest_token)
+    include_client_context = settings.review_enabled
 
     if dry_run:
         try:
-            rows = parse_rows(payload.rows)
+            rows = parse_rows(payload.rows, include_client_context=include_client_context)
         except PipelineValidationError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
         with db.connect() as conn:
-            existing = _load_existing(conn, _workspace_id(conn))
+            existing = _load_existing(conn, _workspace_id(conn), include_client_context=include_client_context)
         return {"dry_run": True, "received": len(payload.rows),
-                **describe_plan(plan_sync(existing, rows, guard=False), existing, payload.rows)}
+                **describe_plan(plan_sync(existing, rows, guard=False), existing, payload.rows,
+                                include_client_context=include_client_context)}
 
     with db.connect() as conn:
         workspace_id = _workspace_id(conn)
@@ -100,10 +103,11 @@ def ingest_pipeline(payload: PipelinePayload, dry_run: bool = False,
         conn.commit()  # the run is recorded even if everything below fails
 
         try:
-            rows = parse_rows(payload.rows)
+            rows = parse_rows(payload.rows, include_client_context=include_client_context)
             with conn.transaction():
-                plan = plan_sync(_load_existing(conn, workspace_id), rows)
-                _apply(conn, workspace_id, run_id, plan)
+                existing = _load_existing(conn, workspace_id, include_client_context=include_client_context)
+                plan = plan_sync(existing, rows)
+                _apply(conn, workspace_id, run_id, plan, include_client_context=include_client_context)
                 counts = {
                     "created": len(plan.creates),
                     "updated": len(plan.updates),
@@ -381,22 +385,26 @@ def _fail(conn: psycopg.Connection, run_id, error: str) -> None:
     conn.commit()
 
 
-def _load_existing(conn: psycopg.Connection, workspace_id) -> list[ExistingDeal]:
+def _load_existing(conn: psycopg.Connection, workspace_id, *, include_client_context: bool = True) -> list[ExistingDeal]:
+    context_column = ", o.client_context" if include_client_context else ""
     rows = conn.execute(
         "select o.id, c.normalized_name, o.owner_code, o.stage, c.country, o.primary_buyer, o.contacts_text,"
-        " o.last_progress, o.next_step, o.client_context, o.row_hash, o.removed_at is not null"
+        f" o.last_progress, o.next_step{context_column}, o.row_hash, o.removed_at is not null"
         " from opportunities o join companies c on c.id = o.company_id where o.workspace_id = %s",
         (workspace_id,),
     ).fetchall()
-    # Column order above matches TRACKED_FIELDS.
+    tracked = TRACKED_FIELDS if include_client_context else BASE_TRACKED_FIELDS
     return [
-        ExistingDeal(str(r[0]), r[1], dict(zip(TRACKED_FIELDS, r[2:2 + len(TRACKED_FIELDS)])), r[-2], r[-1])
+        ExistingDeal(str(r[0]), r[1], dict(zip(tracked, r[2:-2])), r[-2], r[-1])
         for r in rows
     ]
 
 
-def _apply(conn: psycopg.Connection, workspace_id, run_id, plan: SyncPlan) -> None:
+def _apply(conn: psycopg.Connection, workspace_id, run_id, plan: SyncPlan, *, include_client_context: bool) -> None:
     changes: list[tuple] = []  # (opportunity_id, field, old, new)
+    context_column = ", client_context" if include_client_context else ""
+    context_value = ", %s" if include_client_context else ""
+    context_update = ", client_context = %s" if include_client_context else ""
 
     for row in plan.creates:
         company_id = conn.execute(
@@ -407,7 +415,8 @@ def _apply(conn: psycopg.Connection, workspace_id, run_id, plan: SyncPlan) -> No
         ).fetchone()[0]
         opp_id = conn.execute(
             "insert into opportunities (workspace_id, company_id, owner_code, stage, stage_rank, primary_buyer,"
-            " contacts_text, last_progress, next_step, client_context, row_hash) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            f" contacts_text, last_progress, next_step{context_column}, row_hash)"
+            f" values (%s, %s, %s, %s, %s, %s, %s, %s, %s{context_value}, %s)"
             " returning id",
             (workspace_id, company_id, *_opp_values(row), row.row_hash),
         ).fetchone()[0]
@@ -416,7 +425,7 @@ def _apply(conn: psycopg.Connection, workspace_id, run_id, plan: SyncPlan) -> No
     for opp_id, row, field_changes, restored in plan.updates:
         conn.execute(
             "update opportunities set owner_code = %s, stage = %s, stage_rank = %s, primary_buyer = %s,"
-            " contacts_text = %s, last_progress = %s, next_step = %s, client_context = %s, row_hash = %s,"
+            f" contacts_text = %s, last_progress = %s, next_step = %s{context_update}, row_hash = %s,"
             " last_seen_at = now(), removed_at = null where id = %s",
             (*_opp_values(row), row.row_hash, opp_id),
         )
@@ -447,5 +456,6 @@ def _apply(conn: psycopg.Connection, workspace_id, run_id, plan: SyncPlan) -> No
 
 def _opp_values(row) -> tuple:
     f = row.fields
-    return (f["owner_code"], f["stage"], parse_stage(f["stage"]), f["primary_buyer"],
-            f["contacts_text"], f["last_progress"], f["next_step"], f["client_context"])
+    values = (f["owner_code"], f["stage"], parse_stage(f["stage"]), f["primary_buyer"],
+              f["contacts_text"], f["last_progress"], f["next_step"])
+    return (*values, f["client_context"]) if "client_context" in f else values

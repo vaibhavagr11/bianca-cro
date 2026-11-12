@@ -18,6 +18,7 @@ MAX_TEXT_CHARS = 30_000
 
 InsightType = Literal["need", "buying_signal", "objection", "commitment", "blocker", "next_step"]
 ActionScope = Literal["deal_progression", "delivery", "out_of_scope"]
+SALES_SCOPES = ("deal_progression", None)  # None is the legacy scope before per-insight classification.
 APPROXIMATE_TIMING = re.compile(
     r"\b(?:around|approximately|soon|(?:this|next) (?:week|month)|end of (?:the )?month|"
     r"alrededor de|aproximadamente|pronto|esta semana|la (?:pr[oó]xima semana|semana que viene)|fin de mes)\b",

@@ -34,10 +34,10 @@ flowchart LR
     Writer --> Sheet[Source-of-truth Pipeline tab]
 ```
 
-The queue reuses the commercial classifications and quotation-validated insights already extracted for the brief.
-It does not run a second summarization model, reuse the brief watermark, or apply the brief's four-company display cap.
-Every active pipeline company with unreviewed linked commercial Gmail, meeting-note, or calendar records can get a card.
-Unknown/unlinked companies first need an authoritative pipeline row and entity resolution in the existing ingestion flow.
+The queue reuses the Daily Brief's per-insight sales scope. It accepts deal progression and legacy insights with blank scope
+from unreviewed, linked commercial sources for active pipeline companies. Delivery and out-of-scope insights stay out of
+both writable sections. Each suggestion requires a supporting quote, tied to its exact source when available. A source
+without a qualifying insight produces no suggestion.
 
 The first review cycle imports only records whose `occurred_at` falls inside the inclusive interval from initialization minus
 14 days through initialization. The database persists that boundary and the original versions excluded as undated or outside
@@ -49,12 +49,11 @@ After bootstrap, there is no rolling date cutoff. New records and changed source
 later daily checks, including a newly arrived historical item or a real update to an excluded old version. The unchanged
 initially excluded version stays excluded. Re-extracting the same text with new insight UUIDs does not create new source content.
 
-While a company card is pending, each daily build appends new distinct bullets, preserves earlier bullets and evidence snapshots,
-and unions supporting sources when the same bullet has multiple citations. Unreviewed bullets do not age out after 14 days or
-disappear merely because an extraction's task status changes. A newer revision invalidates an older editor snapshot. Only Approve,
-Save & approve, or Ignore closes the card and consumes its accumulated versions; new content after that can create another card.
-Calendar cancellation status is part of source identity. Title-only or otherwise unextracted updates say that an email,
-note, or scheduled/cancelled meeting was recorded and ask the founder to review it; they do not invent buying intent.
+While a company card is pending, each build refreshes its bullets against current eligible evidence and combines the supporting
+sources for duplicate text. The initial 14-day window does not limit later cycles. If a reclassification or changed source
+removes eligibility, the next build revises the card or supersedes it if empty. A newer revision invalidates the older editor
+snapshot. Approve, Save & approve, and Ignore consume the reviewed source versions. Superseding an empty card leaves its source
+versions available for later review if evidence qualifies.
 
 ## Daily cycles and source lineage
 
@@ -66,9 +65,8 @@ controls the date, independently of the viewer's browser timezone.
 
 The graph is explicit: every source has an ID derived from source type, external identity, and content version. Each aligned
 `bulletLineage.nextStep[]` or `.clientContext[]` entry contains `bulletId`, the exact `text`, and `sourceIds`. A source edge is
-created only when the supporting passage is validated against that record, or when that record supplies its own conservative
-fallback. Duplicate bullets retain the union of their real supporting source IDs. Two emails on the same date remain distinct.
-Historical versions retain captured metadata/quotes, so an expanded pending card does not silently reattribute old text to a newer version.
+created only when the supporting passage is validated against that record. Duplicate bullets retain the union of their supporting
+source IDs. Two emails on the same date remain distinct. New approvals check current eligibility before writing to the Sheet.
 
 Clicking a source button highlights only its linked bullets across both destinations, with a pressed state and announced match count.
 Selection is local to its company card and survives refresh while the source still exists. Missing or malformed metadata shows an
@@ -78,7 +76,8 @@ matches an original bullet in the same destination; manual edits are recorded as
 ## Deploy the backend
 
 1. Check out this branch and install the locked Python dependencies with `uv sync` in `backend/`.
-2. Apply migrations with `uv run python -m scripts.migrate`. Migration 012 adds proposals, durable decisions, and consumed-source receipts; migration 013 adds Client Context, typed destination lists, and durable target binding; migration 014 adds daily/bootstrap state and exact source lineage.
+2. Apply migrations with `uv run python -m scripts.migrate --sheet-review`. Migrations 012–014 add proposals, decision history,
+   source receipts, Client Context, daily queue state, and source lineage. The default migration command defers these three files.
    Existing domain tables and the new tables retain RLS with backend-only access.
 3. Enable the Google Sheets API in the service account's Google Cloud project. Share the intended spreadsheet with that
    service-account email as **Editor**. The application reads the configured tab and writes only changed values among Client Context, Last progress, and Next step.
