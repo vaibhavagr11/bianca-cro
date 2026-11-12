@@ -83,18 +83,13 @@ def create_sales_consent_router(config: Settings) -> APIRouter:
 <body>
   <main data-config="{browser_config}" data-authorization-id="{authorization_ids[0]}">
     <h1>Connect Bianca Sales</h1>
-    <p>Use your invited email address to continue to Claude.</p>
-    <form id="send-code">
+    <p>Sign in to approve the connection to Claude.</p>
+    <form id="sign-in" hidden>
       <label for="email">Email address</label>
       <input id="email" type="email" autocomplete="email" maxlength="254" required>
-      <button type="submit">Send code</button>
-    </form>
-    <form id="verify-code" hidden>
-      <label for="code">Email code</label>
-      <input id="code" inputmode="numeric" autocomplete="one-time-code"
-        pattern="[0-9]{{6,10}}" maxlength="10" required>
-      <button type="submit">Verify code</button>
-      <button type="button" id="change-email">Use a different email</button>
+      <label for="password">Bianca Sales password</label>
+      <input id="password" type="password" autocomplete="off" required>
+      <button type="submit">Sign in</button>
     </form>
     <section id="consent" hidden>
       <p>Allow Claude to use Bianca Sales to read sales information and cite sources in your chats?</p>
