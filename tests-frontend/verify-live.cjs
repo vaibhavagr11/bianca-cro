@@ -159,11 +159,11 @@ test('Ignore is a server decision with no approval bullets or local sheet change
   assert.deepEqual(calls[1],{name:'bianca_ignore_update',args:{proposal_id:'p-1',revision:2,idempotency_key:'ignore-key'}});
 });
 
-test('A saved decision with a failed refresh is reported without fabricating a local result',async()=>{
+test('A saved decision with a failed refresh clears the stale workspace',async()=>{
   let reads=0;
   const client=core.createClient(async name=>{if(name===core.TOOLS.workspace){if(++reads>1)throw Error('View unavailable');return snapshot();}return {status:'approved'};});await client.refresh();
   await assert.rejects(approve(client,['Confirm the scope.']),/decision was saved, but the latest view could not load/);
-  assert.equal(client.state.proposals.length,1);assert.equal(client.state.rows[0].nextStep,'Old next step');
+  assert.deepEqual(json(client.state),{proposals:[],rows:[],activity:[]});
 });
 
 test('Blank edited approvals never reach the connector',async()=>{
@@ -186,6 +186,7 @@ function fakePage(connector,pathname='/artifact'){
   class Element {
     constructor(){this.textContent='';this.innerHTML='';this.value='';this.hidden=false;this.disabled=false;this.handlers={};}
     addEventListener(name,handler){this.handlers[name]=handler;}
+    replaceChildren(){this.textContent='';this.innerHTML='';}
     close(){this.open=false;}showModal(){this.open=true;}focus(){}removeAttribute(){}setAttribute(){}
     querySelectorAll(){return [];}querySelector(){return new Element();}
   }
@@ -341,6 +342,18 @@ test('A historical failed mirror sync is shown when reopening an unsynced worksp
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(page.get('#mirror-sync-notice').hidden,false);
   assert.ok(page.get('#mirror-sync-notice').textContent.includes('A real company'));
+});
+
+test('A company removed from the sales workspace is also removed from its cached sync notice',async()=>{
+  const stale=completed();stale.rows=snapshot().rows;stale.activity[0].mirror_refreshed=false;
+  let current=stale;
+  const page=fakePage({callTool:async()=>({structuredContent:current})});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.ok(page.get('#mirror-sync-notice').textContent.includes('A real company'));
+  current={proposals:[],rows:[],activity:[]};
+  await page.get('#refresh-updates').onclick();
+  assert.equal(page.get('#mirror-sync-notice').textContent,'');
+  assert.equal(page.get('#activity-list').innerHTML.includes('A real company'),false);
 });
 
 test('A later full Pipeline sync resolves an older mirror warning even after legitimate manual edits',async()=>{
