@@ -38,6 +38,11 @@ connection, and separate founder review credentials. Apply the review migrations
 
 For changes to Daily Brief wording or delivery, see the [Daily Brief review handoff](DAILY_BRIEF_REVIEW.md).
 
+## Bianca Sales in Claude
+
+The optional `/sales/mcp` connector lets founders ask Claude about live pipeline data through the existing backend.
+See [the Bianca Sales setup guide](docs/bianca-sales-connector.md) for the staging database, founder OAuth, and shared Claude Project.
+
 ## Run the backend locally
 
 ```bash
