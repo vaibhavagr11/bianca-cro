@@ -1,6 +1,7 @@
 """Authenticated, read-only MCP tools for founder sales questions."""
 
 import logging
+import re
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
@@ -135,8 +136,21 @@ def create_sales_transport(settings: Settings):
     if public.path != SALES_PATH:
         raise ValueError("Bianca Sales endpoint URL must end in /sales/mcp.")
 
+    supabase_client_id = settings.sales_mcp_supabase_client_id
+    publishable_key = settings.sales_mcp_supabase_publishable_key
+    if supabase_client_id is not None:
+        if not publishable_key or not re.fullmatch(r"sb_publishable_[A-Za-z0-9_-]+", publishable_key):
+            raise ValueError("Bianca Sales Supabase OAuth requires a Supabase publishable key.")
+        if not re.fullmatch(r"https://[a-z0-9]{20}\.supabase\.co/auth/v1", issuer) or (
+            jwks_url != f"{issuer}/.well-known/jwks.json"
+        ):
+            raise ValueError("Bianca Sales Supabase OAuth requires the canonical issuer and JWKS of one project.")
+    elif publishable_key is not None:
+        raise ValueError("Bianca Sales Supabase OAuth requires a registered OAuth client ID.")
+
     verifier = SalesTokenVerifier(
         issuer=issuer, audience=url, jwks_url=jwks_url, allowed_subjects=founders,
+        supabase_client_id=supabase_client_id,
     )
     server = MCPServer(
         "Bianca Sales",

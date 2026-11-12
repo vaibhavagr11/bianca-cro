@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Collection
 from urllib.parse import urlsplit
+from uuid import UUID
 
 import jwt
 from jwt.exceptions import PyJWTError
@@ -17,6 +18,7 @@ class SalesTokenVerifier(TokenVerifier):
         audience: str,
         jwks_url: str,
         allowed_subjects: Collection[str],
+        supabase_client_id: UUID | None = None,
     ) -> None:
         jwks_endpoint = urlsplit(jwks_url)
         if jwks_endpoint.scheme != "https" or not jwks_endpoint.hostname:
@@ -25,6 +27,8 @@ class SalesTokenVerifier(TokenVerifier):
         self._issuer = issuer
         self._audience = audience
         self._allowed_subjects = frozenset(allowed_subjects)
+        self._supabase_client_id = str(supabase_client_id) if supabase_client_id is not None else None
+        self._algorithms = ("RS256", "ES256") if supabase_client_id is not None else ("RS256",)
         self._jwks = jwt.PyJWKClient(jwks_url, timeout=2)
 
     async def verify_token(self, token: str) -> AccessToken | None:
@@ -41,16 +45,17 @@ class SalesTokenVerifier(TokenVerifier):
 
         try:
             header = jwt.get_unverified_header(token)
+            algorithm = header.get("alg")
             key_id = header.get("kid")
-            if header.get("alg") != "RS256" or not isinstance(key_id, str) or not key_id:
+            if algorithm not in self._algorithms or not isinstance(key_id, str) or not key_id:
                 return None
             signing_key = self._jwks.get_signing_key(key_id)
-            if signing_key.algorithm_name != "RS256":
+            if signing_key.algorithm_name != algorithm:
                 return None
             claims = jwt.decode(
                 token,
                 signing_key,
-                algorithms=["RS256"],
+                algorithms=[algorithm],
                 audience=self._audience,
                 issuer=self._issuer,
                 options={
@@ -72,6 +77,12 @@ class SalesTokenVerifier(TokenVerifier):
             or not client_id
             or type(expires_at) is not int
             or not isinstance(scope, str)
+        ):
+            return None
+
+        if self._supabase_client_id is not None and (
+            client_id != self._supabase_client_id
+            or claims["aud"] not in (self._audience, [self._audience])
         ):
             return None
 

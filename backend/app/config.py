@@ -1,4 +1,5 @@
 from typing import Literal
+from uuid import UUID
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -55,6 +56,8 @@ class Settings(BaseSettings):
     sales_mcp_url: str | None = None
     sales_mcp_issuer: str | None = None
     sales_mcp_jwks_url: str | None = None
+    sales_mcp_supabase_client_id: UUID | None = None
+    sales_mcp_supabase_publishable_key: str | None = None
     sales_mcp_founders: dict[str, Literal["RG", "NC", "NDL"] | None] = Field(default_factory=dict)
     sales_mcp_database_url: SecretStr | None = None
     sales_mcp_include_pilots: bool = False
