@@ -44,6 +44,14 @@ Use an MCP-compatible OAuth provider with invited founder accounts. WorkOS AuthK
 
 An unauthenticated request to the endpoint should return HTTP 401 with the protected resource metadata location. The metadata must advertise the exact URL and issuer. If a founder leaves, remove their subject from the Render setting and redeploy. For a full rollback, set `SALES_MCP_ENABLED=false` and redeploy.
 
+### Supabase OAuth
+
+On the staging Supabase project, enable the OAuth server with dynamic registration disabled. Set the Auth Site URL to the staging Render origin and the authorization path to `/sales/oauth/consent`. Register a public OAuth client for Claude with the exact callback `https://claude.ai/api/mcp/auth_callback` and select **Use your own OAuth client** in Claude.
+
+Use the staging project issuer `https://<project-ref>.supabase.co/auth/v1` and its `/.well-known/jwks.json` endpoint. Set `SALES_MCP_SUPABASE_CLIENT_ID` to the registered client UUID and `SALES_MCP_SUPABASE_PUBLISHABLE_KEY` to the staging project's publishable key. The project must sign access tokens with ES256 or RS256. Configure the project's Custom Access Token Hook to set the exact connector URL as the audience only for this OAuth client's tokens. The connector verifies the audience, client, and invited user before serving tools.
+
+Create the tester as a confirmed user in staging Supabase Auth and add their Auth UUID to `SALES_MCP_FOUNDERS`. The tester signs in on the consent page with their own staging credentials. [Supabase OAuth setup](https://supabase.com/docs/guides/auth/oauth-server/getting-started)
+
 ## Shared Claude Project
 
 1. A Claude Team or Enterprise admin adds a custom Web connector in **Organization settings → Connectors**. Use **Bianca Sales (Staging)** for the staging URL and choose **Sign in now**. For an issuer configured for Claude's published identity, select that option. Use the issuer's registered client details if the issuer requires a pre-registered client.
