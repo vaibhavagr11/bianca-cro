@@ -11,7 +11,7 @@ import re, sys, os, base64, json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from seed_data import to_js
 
-SHEET_URL = "https://docs.google.com/spreadsheets/d/11HXJsfGHIqnr_mekiV6l277v61C2qz_ELNxA0RyaNcA/edit?gid=1869050409#gid=1869050409"
+SHEET_URL = "https://docs.google.com/spreadsheets/d/1iPYYPFiFRokytN8xYOpByoQY-UYjdtoLeerWsuRGyHs/edit?gid=1869050409#gid=1869050409"
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOGO_BLUE = base64.b64encode(open(os.path.join(HERE, "bianca-blue-360.png"), "rb").read()).decode()
 LOGO_WHITE = base64.b64encode(open(os.path.join(HERE, "bianca-white-360.png"), "rb").read()).decode()
