@@ -1,6 +1,6 @@
 import pytest
 
-from app.pipeline import normalize_name, parse_stage
+from app.pipeline import is_working_client, normalize_name, parse_stage
 
 
 @pytest.mark.parametrize(
@@ -32,6 +32,16 @@ def test_normalize_name(raw, expected):
 )
 def test_parse_stage(raw, expected):
     assert parse_stage(raw) == expected
+
+
+@pytest.mark.parametrize("stage", ["5. Working client", " 5 ) WORKING  CLIENTS ", "working clients", "Working Client"])
+def test_working_client_status(stage):
+    assert is_working_client(stage)
+
+
+@pytest.mark.parametrize("stage", ["4. Pilot", "5. Other", "6. Former Working Client", "", None])
+def test_other_statuses_are_not_working_clients(stage):
+    assert not is_working_client(stage)
 
 
 # --- parse_rows ---------------------------------------------------------------
@@ -91,6 +101,13 @@ def test_parse_rows_rejects_duplicates():
 def test_parse_rows_rejects_missing_company_column():
     with pytest.raises(PipelineValidationError, match="Empresa"):
         parse_rows([{"Company": "Acme"}])
+
+
+def test_parse_rows_requires_status_header_but_accepts_blank_values():
+    with pytest.raises(PipelineValidationError, match="Status"):
+        parse_rows([{"Empresa": "Acme"}])
+    [row] = parse_rows([{"Empresa": "Acme", " STATUS ": ""}])
+    assert row.fields["stage"] is None
 
 
 def test_parse_rows_rejects_empty_payload():

@@ -51,7 +51,50 @@ def test_workspace_uses_ndl_identity(monkeypatch):
     monkeypatch.setattr(review_api, "_workspace", lambda: {"proposals": [], "rows": [], "activity": []})
     result = client.get("/review/workspace", headers=HEADERS)
     assert result.status_code == 200
+    assert result.headers["cache-control"] == "no-store"
     assert result.json()["viewer"] == "NDL"
+
+
+def test_workspace_live_status_failure_returns_no_workspace_data(monkeypatch):
+    @contextmanager
+    def connect():
+        yield type("Connection", (), {})()
+
+    def status_unavailable(*_args):
+        raise review_service.ReviewUnavailable("Current sales status could not be confirmed from the Sheet.")
+
+    monkeypatch.setattr(review_api.db, "connect", connect)
+    monkeypatch.setattr(review_api, "_workspace_id", lambda _conn: "workspace")
+    monkeypatch.setattr(review_service, "workspace_view", status_unavailable)
+    rest = client.get("/review/workspace", headers=HEADERS)
+    assert rest.status_code == 503 and rest.headers["cache-control"] == "no-store"
+    assert set(rest.json()) == {"detail"}
+    tool = rpc("tools/call", {"name": "bianca_review_workspace", "arguments": {}}).json()["result"]
+    assert tool["isError"] is True
+    assert tool["structuredContent"] == {"status": 503, "detail": rest.json()["detail"]}
+
+
+@pytest.mark.parametrize("action", ["approve", "ignore"])
+def test_stale_working_client_decisions_return_conflict_in_rest_and_mcp(monkeypatch, action):
+    @contextmanager
+    def connect():
+        yield None
+
+    def excluded(*_args):
+        raise review_service.ReviewConflict(review_service.OUTSIDE_SALES_PIPELINE)
+
+    monkeypatch.setattr(review_api.db, "connect", connect)
+    monkeypatch.setattr(review_api, "_workspace_id", lambda _conn: "workspace")
+    monkeypatch.setattr(review_service, "decide", excluded)
+    proposal_id = str(uuid4())
+    body = {"revision": 1, "idempotency_key": KEY}
+    if action == "approve":
+        body.update(next_step_bullets=["Confirm the pilot date."], client_context_bullets=[])
+    rest = client.post(f"/review/proposals/{proposal_id}/{action}", json=body, headers=HEADERS)
+    assert rest.status_code == 409 and rest.json() == {"detail": review_service.OUTSIDE_SALES_PIPELINE}
+    tool = rpc("tools/call", {"name": f"bianca_{action}_update", "arguments": {"proposal_id": proposal_id, **body}}).json()["result"]
+    assert tool["isError"] is True
+    assert tool["structuredContent"] == {"status": 409, "detail": rest.json()["detail"]}
 
 
 def test_untrusted_origin_is_denied_before_read(monkeypatch):

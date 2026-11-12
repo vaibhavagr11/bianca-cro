@@ -50,7 +50,8 @@ def proposal(**overrides):
              "source_versions": [version], "observed_source_versions": [version], "lineage_version": 1,
              "bullet_lineage": lineage,
              "snapshot_last_progress": "Pilot terms agreed.", "snapshot_next_step": "Ask for the signed agreement.",
-             "revision": 1, "status": "pending", "created_at": NOW, "updated_at": NOW, "removed_at": None}
+             "revision": 1, "status": "pending", "created_at": NOW, "updated_at": NOW, "removed_at": None,
+             "current_stage": "4. Pilot", "current_company_name": "Pernod Ricard"}
     value.update(overrides)
     return value
 
@@ -164,7 +165,9 @@ class DecisionConnection:
         if "pg_try_advisory_lock" in q:
             return Result([{"locked": self.store.locked}])
         if q.startswith("select p.*"):
-            return Result([copy.deepcopy(p)] if str(p["workspace_id"]) == str(params[0]) and str(p["id"]) == params[1] else [])
+            row = {**p, "current_stage": p.get("current_stage", p["stage"]),
+                   "current_company_name": p.get("current_company_name", p["company_name"])}
+            return Result([copy.deepcopy(row)] if str(p["workspace_id"]) == str(params[0]) and str(p["id"]) == params[1] else [])
         if q.startswith("select * from source_records"):
             return Result([self.store.source_record])
         if q.startswith("select * from insights"):
@@ -221,12 +224,28 @@ class FakeSheets:
         self.calls = []
         self.uncertain = False
         self.conflict_on_write = False
+        self.status = "4. Pilot"
+        self.flip_on_apply = False
 
     def read_company(self, company):
         self.store.events.append("sheet-read")
-        return SimpleNamespace(last_progress=self.last_progress, next_step=self.next_step, client_context=self.client_context)
+        return SimpleNamespace(last_progress=self.last_progress, next_step=self.next_step, client_context=self.client_context,
+                               status=self.status)
 
-    def apply_update(self, company, old_last, old_next, new_last, new_next, *, expected_client_context, new_client_context):
+    def read_company_statuses(self):
+        self.store.events.append("status-read")
+        return {"pernod ricard": self.status}
+
+    def apply_update(self, company, old_last, old_next, new_last, new_next, *, expected_client_context, new_client_context,
+                     allow_write=True, recovering=False):
+        current, before, after = ((self.last_progress, self.next_step, self.client_context),
+                                  (old_last, old_next, expected_client_context), (new_last, new_next, new_client_context))
+        if self.flip_on_apply:
+            self.status = "5. Working client"
+        if not allow_write or review.is_working_client(self.status):
+            if recovering and current == after:
+                return self.read_company(company)
+            raise review.SheetWorkingClient("outside sales")
         self.store.events.append("sheet-write")
         # Approval must be durably recorded before leaving the process for Google.
         saved = self.store.data["intents"][-1]
@@ -236,8 +255,6 @@ class FakeSheets:
         self.calls.append((company, old_last, old_next, new_last, new_next, expected_client_context, new_client_context))
         if self.conflict_on_write:
             raise SheetConflict("changed")
-        current, before, after = ((self.last_progress, self.next_step, self.client_context),
-                                  (old_last, old_next, expected_client_context), (new_last, new_next, new_client_context))
         if current == after:
             return self.read_company(company)
         if current != before:
@@ -290,14 +307,14 @@ def test_edited_approval_is_audited_and_duplicate_key_does_not_rotate_twice(serv
         approve(["A different decision using the old key."])
 
 
-def test_ignore_does_not_open_sheets_or_mutate_cells_and_consumes_source_versions(service, monkeypatch):
+def test_ignore_only_reads_live_status_and_consumes_source_versions(service):
     store, sheets = service
-    monkeypatch.setattr(review, "SheetsClient", lambda: pytest.fail("Ignore must not touch Google Sheets"))
     result = review.decide(WORKSPACE, PROPOSAL, "RG", "ignore", 1, "ignored-key-1")
     assert result["status"] == "ignored"
     assert store.data["proposal"]["status"] == "ignored"
     assert result["activity"]["before"] == result["activity"]["after"]
     assert store.data["receipts"]
+    assert "status-read" in store.events and "sheet-read" not in store.events
     assert not sheets.calls
 
 
@@ -393,13 +410,16 @@ def test_uncertain_write_followed_by_a_human_edit_remains_reserved_for_reconcili
     assert not store.data["receipts"]
 
 
-def test_missing_credentials_map_to_unavailable_and_completed_retry_needs_no_google(service, monkeypatch):
-    _, _ = service
-    result = approve()
+def test_completed_retry_cannot_resurface_a_company_if_live_status_is_unavailable(service, monkeypatch):
+    store, sheets = service
+    approve()
     def unavailable():
         raise review.SheetError("missing credentials")
     monkeypatch.setattr(review, "SheetsClient", unavailable)
-    assert approve() == result
+    with pytest.raises(review.ReviewUnavailable, match="could not be read"):
+        approve()
+    assert store.data["intents"][0]["status"] == "succeeded"
+    assert len(sheets.calls) == 1
 
 
 def test_missing_credentials_before_first_approval_does_not_save_an_intent(service, monkeypatch):
@@ -535,6 +555,22 @@ def test_builder_does_not_recreate_ignored_or_approved_source_versions(monkeypat
     assert not conn.proposals
 
 
+def test_builder_withdraws_working_client_pending_cards_without_consuming_evidence(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
+    conn = BuildConnection(3)
+    conn.deals[1]["stage"] = "5. Working client"
+    assert review.build_proposals(conn, WORKSPACE)["created"] == 2
+    assert "company-1" not in conn.proposals
+    conn.deals[0]["stage"] = "5. Working client"
+    assert review.build_proposals(conn, WORKSPACE, force=True)["updated"] == 1
+    assert conn.proposals["company-0"]["status"] == "superseded"
+    assert conn.proposals["company-2"]["status"] == "pending"
+    assert not conn.receipts
+    conn.deals[0]["stage"] = "4. Pilot"
+    assert review.build_proposals(conn, WORKSPACE, force=True)["created"] == 1
+    assert conn.proposals["company-0"]["sources"]
+
+
 def test_pending_card_revision_tracks_changed_sheet_baseline_without_losing_new_sources(monkeypatch):
     monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20))
     conn = BuildConnection(1)
@@ -610,6 +646,54 @@ def test_removed_company_cannot_be_approved(service):
         approve()
     assert not sheets.calls
     assert not store.data["intents"]
+
+
+@pytest.mark.parametrize("action", ["approve", "ignore"])
+@pytest.mark.parametrize("status_source", ["synced", "live"])
+def test_working_client_stale_decision_is_rejected_before_intent_or_write(service, action, status_source):
+    store, sheets = service
+    if status_source == "synced":
+        store.data["proposal"]["current_stage"] = "5. Working client"
+    else:
+        sheets.status = "5. Working client"
+    with pytest.raises(review.ReviewConflict, match="outside the sales pipeline"):
+        review.decide(WORKSPACE, PROPOSAL, "RG", action, 1, "stale-decision")
+    assert not (sheets.calls or store.data["intents"] or store.data["receipts"])
+
+
+def test_working_client_status_flip_between_prepare_and_apply_stops_the_write(service):
+    store, sheets = service
+    sheets.flip_on_apply = True
+    with pytest.raises(review.ReviewConflict, match="outside the sales pipeline"):
+        approve()
+    assert store.data["intents"][0]["status"] == "conflict"
+    assert not sheets.calls and not store.data["receipts"]
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_working_client_approval_recovery_never_writes_or_surfaces_data(service, confirmed):
+    store, sheets = service
+    sheets.uncertain = True
+    with pytest.raises(review.ReviewUnavailable):
+        approve()
+    if not confirmed:
+        sheets.last_progress = store.data["proposal"]["snapshot_last_progress"]
+        sheets.next_step = store.data["proposal"]["snapshot_next_step"]
+    sheets.status = "5. Working client"
+    with pytest.raises(review.ReviewConflict, match="outside the sales pipeline"):
+        approve()
+    assert len(sheets.calls) == 1
+    assert store.data["intents"][0]["status"] == ("succeeded" if confirmed else "applying")
+    assert bool(store.data["receipts"]) is confirmed
+
+
+def test_completed_approval_retry_cannot_resurface_working_client(service):
+    _, sheets = service
+    approve()
+    sheets.status = "5. Working client"
+    with pytest.raises(review.ReviewConflict, match="outside the sales pipeline"):
+        approve()
+    assert len(sheets.calls) == 1
 
 
 def test_insight_categories_route_to_separate_columns_without_inference_from_text():
@@ -780,13 +864,20 @@ def test_workspace_recovery_exposes_exact_split_payload_and_not_legacy_or_redire
     class WorkspaceConnection:
         def execute(self, sql, params=()):
             if sql.startswith("select p.*"):
-                return Result([copy.deepcopy(store.data["proposal"])])
+                return Result([copy.deepcopy(store.data["proposal"])] if OPPORTUNITY in params[1] else [])
             if sql.startswith("select idempotency_key"):
                 return Result([copy.deepcopy(store.data["intents"][0])])
             if sql.startswith("select o.*"):
-                return Result([])
+                item = store.data["proposal"]
+                name = "pernod ricard"
+                if name not in params[1] and (item["removed_at"] is None or name in params[2]):
+                    return Result([])
+                return Result([{"id": OPPORTUNITY, "name": item["company_name"], "stage": item["current_stage"],
+                                "normalized_name": name, "owner_code": "NDL", "last_progress": "Done",
+                                "next_step": "Later", "removed_at": item["removed_at"], "approved": 0}])
             if sql.startswith("select d.*"):
-                return Result([])
+                return Result([{**copy.deepcopy(store.data["intents"][0]),
+                                "company_name": store.data["proposal"]["company_name"]}] if OPPORTUNITY in params[1] else [])
             raise AssertionError(sql)
 
     view = review.workspace_view(WorkspaceConnection(), WORKSPACE)
@@ -807,6 +898,21 @@ def test_workspace_recovery_exposes_exact_split_payload_and_not_legacy_or_redire
     legacy = review.workspace_view(WorkspaceConnection(), WORKSPACE)["proposals"][0]
     assert "retry" not in legacy
     assert "predates column routing" in legacy["error"]
+    assert len(view["rows"]) == len(view["activity"]) == 1
+    sheets.status = "5. Working client"
+    excluded = review.workspace_view(WorkspaceConnection(), WORKSPACE)
+    assert excluded["proposals"] == excluded["rows"] == excluded["activity"] == []
+    store.data["proposal"].update(current_stage="4. Pilot", removed_at=NOW)
+    sheets.read_company_statuses = lambda: {}
+    removed = review.workspace_view(WorkspaceConnection(), WORKSPACE)
+    assert len(removed["activity"]) == 1 and removed["proposals"] == removed["rows"] == []
+    sheets.read_company_statuses = lambda: {"pernod ricard": None}
+    ambiguous = review.workspace_view(WorkspaceConnection(), WORKSPACE)
+    assert ambiguous["proposals"] == ambiguous["rows"] == ambiguous["activity"] == []
+    sheets.status = "4. Pilot"
+    store.data["proposal"]["current_stage"] = "5. Working client"
+    excluded = review.workspace_view(WorkspaceConnection(), WORKSPACE)
+    assert excluded["proposals"] == excluded["rows"] == excluded["activity"] == []
 
 
 def test_context_mirror_updates_tracked_value_and_logs_its_change():

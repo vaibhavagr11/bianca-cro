@@ -3,25 +3,19 @@
   "active": false,
   "nodes": [
     {
-      "parameters": {"rule": {"interval": [{"field": "cronExpression", "expression": "0 0 9 * * *"}]}},
+      "parameters": {"inputSource": "workflowInputs", "workflowInputs": {"values": [{"name": "pipeline_sync_run_id", "type": "string"}]}},
       "id": "5ef90222-f9bc-4ccb-93e5-f4d8916e4761",
-      "name": "Every day at 09:00",
-      "type": "n8n-nodes-base.scheduleTrigger",
-      "typeVersion": 1.2,
+      "name": "After Pipeline sync and daily processing",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
       "position": [0, 0]
-    },
-    {
-      "parameters": {},
-      "id": "d3baf1be-cf27-4a01-9779-ff4b9fab8e4c",
-      "name": "Run once manually",
-      "type": "n8n-nodes-base.manualTrigger",
-      "typeVersion": 1,
-      "position": [0, 200]
     },
     {
       "parameters": {
         "method": "POST",
         "url": "https://bianca-cro-api.onrender.com/review/daily",
+        "sendQuery": true,
+        "queryParameters": {"parameters": [{"name": "pipeline_sync_run_id", "value": "={{ $('After Pipeline sync and daily processing').first().json.pipeline_sync_run_id || 'missing' }}"}]},
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "options": {"timeout": 120000}
@@ -32,7 +26,7 @@
       "typeVersion": 4.2,
       "position": [260, 0],
       "notesInFlow": true,
-      "notes": "Set the deployed backend URL and select Header Auth: name X-Ingest-Token, value your existing ingest credential. Run after all source ingestion and /process/daily finish successfully."
+      "notes": "Set the deployed backend URL and select Header Auth for X-Ingest-Token. The caller passes the receipt from a successful full Pipeline sync after /process/daily reaches stage=done."
     },
     {
       "parameters": {
@@ -68,7 +62,7 @@
     },
     {
       "parameters": {
-        "content": "## Configure before activation\n1. Deploy migrations 012-014 and the matching backend/UI.\n2. Select Header Auth on the HTTP node: X-Ingest-Token / existing ingest secret.\n3. Confirm the backend URL and workflow timezone. Default: 09:00 America/Argentina/Buenos_Aires.\n4. Schedule AFTER the existing Google ingestion + /process/daily workflow.\n5. Publish/activate after testing.\n\nThe first queue cycle considers the prior 14 days only. Later cycles add new versions once per workspace day. Retries and batch continuation do not duplicate cards. This workflow never approves cards, changes Sheets, or builds/sends another brief.\n\nIf the existing daily brief workflow already calls /process/publish, it can drive the same daily review cycle; use one normal scheduling path. A duplicate trigger is safely skipped after the day's review is complete.",
+        "content": "## Configure before use\n1. Set the deployed backend URL and select Header Auth for X-Ingest-Token.\n2. Call this workflow after full Pipeline ingestion and successful daily processing. Map the ingest response's sync_run_id to pipeline_sync_run_id.\n3. Use this workflow or /process/publish to drive the same date-gated review cycle.\n\nThe first queue cycle considers the prior 14 days only. Later cycles add new versions once per workspace day. Retries and batch continuation do not duplicate cards.",
         "height": 440,
         "width": 500
       },
@@ -80,8 +74,7 @@
     }
   ],
   "connections": {
-    "Every day at 09:00": {"main": [[{"node": "Build the next review batch", "type": "main", "index": 0}]]},
-    "Run once manually": {"main": [[{"node": "Build the next review batch", "type": "main", "index": 0}]]},
+    "After Pipeline sync and daily processing": {"main": [[{"node": "Build the next review batch", "type": "main", "index": 0}]]},
     "Build the next review batch": {"main": [[{"node": "All companies checked?", "type": "main", "index": 0}]]},
     "All companies checked?": {"main": [[{"node": "Daily review complete", "type": "main", "index": 0}], [{"node": "Wait before next batch", "type": "main", "index": 0}]]},
     "Wait before next batch": {"main": [[{"node": "Build the next review batch", "type": "main", "index": 0}]]}

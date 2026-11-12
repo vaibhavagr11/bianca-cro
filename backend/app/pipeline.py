@@ -20,7 +20,7 @@ COLUMN_MAP = {
     "next step": "next_step",
     "client context": "client_context",
 }
-REQUIRED_COLUMN = "empresa"
+REQUIRED_COLUMNS = ("Empresa", "Status")
 
 # Fields compared between syncs; a change in any of them is logged to opportunity_changes.
 BASE_TRACKED_FIELDS = ("owner_code", "stage", "country", "primary_buyer", "contacts_text", "last_progress", "next_step")
@@ -52,6 +52,12 @@ def parse_stage(stage: str | None) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def is_working_client(stage: str | None) -> bool:
+    """Match the Pipeline's Working Client status, including its numbered label."""
+    label = _STAGE_RE.sub("", stage or "", count=1)
+    return " ".join(label.casefold().split()) in {"working client", "working clients"}
+
+
 @dataclass(frozen=True)
 class PipelineRow:
     company: str
@@ -78,8 +84,9 @@ def parse_rows(raw_rows: list[dict], *, include_client_context: bool = True) -> 
         raise PipelineValidationError("payload has no rows")
 
     headers = {h.strip().lower() for row in raw_rows for h in row}
-    if REQUIRED_COLUMN not in headers:
-        raise PipelineValidationError("required column 'Empresa' not found")
+    for column in REQUIRED_COLUMNS:
+        if column.casefold() not in headers:
+            raise PipelineValidationError(f"required column '{column}' not found")
 
     tracked = TRACKED_FIELDS if include_client_context else BASE_TRACKED_FIELDS
     rows: list[PipelineRow] = []
