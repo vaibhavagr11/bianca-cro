@@ -21,6 +21,8 @@ from app.brief_text import prepare_table_text
 from app.config import settings
 from app.gmail import domain
 from app.ingest import _workspace_id, require_token
+from app.pipeline import is_working_client
+from app.pipeline_freshness import check_fresh_pipeline, require_fresh_pipeline
 from app.process import _claude
 
 log = logging.getLogger("bianca_cro.brief")
@@ -33,6 +35,26 @@ router = APIRouter(prefix="/brief")
 FOUNDER_ORDER = ["RG", "NC"]  # sections in this order; NDL gets the small shared table
 # Two founders are named Nicolás, so the brief uses these names, not first names.
 DISPLAY = {"RG": ("Ramiro", "Ramiro Godfrid"), "NC": ("Nico", "Nico Casaux"), "NDL": ("Nico DL", "Nico de León")}
+
+
+def _sales_deals(conn, workspace_id) -> tuple[dict[str, dict], set[str]]:
+    active = {}
+    working_clients = set()
+    for deal in conn.execute(
+            "select o.id, o.company_id, c.name, o.stage, o.stage_rank, o.owner_code, o.removed_at from opportunities o"
+            " join companies c on c.id = o.company_id where o.workspace_id = %s order by o.id",
+            (workspace_id,)):
+        company_id = str(deal["company_id"])
+        if is_working_client(deal["stage"]):
+            working_clients.add(company_id)
+        elif deal["removed_at"] is None:
+            active[company_id] = deal
+    return active, working_clients
+
+
+def _working_client_record(record: dict, working_clients: set[str]) -> bool:
+    # A rules link can identify the company even when the primary link is absent or disputed.
+    return str(record["company_id"]) in working_clients or str(record.get("rules_company_id")) in working_clients
 
 
 def _insight_rows(conn, workspace_id) -> list[dict]:
@@ -80,7 +102,7 @@ def _profile_sales_entry(entry: dict, profile: dict, sales_by_id: dict[str, dict
                                   for r in evidence)
 
 
-def _upcoming_meetings(conn, workspace_id, today, tz, deals, email_to_code, sales) -> list[brief.Meeting]:
+def _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, email_to_code, sales) -> list[brief.Meeting]:
     # Preserve prep only when a qualifying action is supported by this particular meeting.
     prep: dict[str, str] = {}
     for r in sales:
@@ -90,10 +112,12 @@ def _upcoming_meetings(conn, workspace_id, today, tz, deals, email_to_code, sale
     start = datetime.combine(today, time.min, tz)
     meetings = []
     for m in conn.execute(
-            "select id, subject, occurred_at, participants, company_id from source_records"
+            "select id, subject, occurred_at, participants, company_id, rules_company_id from source_records"
             " where workspace_id = %s and source = 'calendar' and occurred_at >= %s and occurred_at < %s"
             " and coalesce(meta->>'status', 'confirmed') <> 'cancelled' and (classification->>'is_commercial')::bool"
             " order by occurred_at", (workspace_id, start, start + timedelta(days=2))):
+        if _working_client_record(m, working_clients):
+            continue
         deal = deals.get(str(m["company_id"]))
         codes = sorted({email_to_code[a["address"]] for a in (m["participants"] or {}).get("attendees") or []
                         if a.get("address") in email_to_code})
@@ -110,32 +134,40 @@ class BuildSyncReceipts(BaseModel):
 @router.post("/build")
 def build_brief(dry_run: bool = False, version: str = "v1", x_ingest_token: str | None = Header(default=None),
                 verification: Literal["off", "shadow", "required"] = "off",
-                build_id: UUID | None = None, receipts: BuildSyncReceipts | None = None) -> dict:
+                build_id: UUID | None = None, receipts: BuildSyncReceipts | None = None,
+                pipeline_sync_run_id: UUID | None = None) -> dict:
     require_token(x_ingest_token)
+    if pipeline_sync_run_id is not None:
+        require_fresh_pipeline(pipeline_sync_run_id)
     if settings.brief_verification_required and not dry_run and verification != "required":
         raise HTTPException(status_code=409, detail="This brief requires action verification before sending.")
     if verification == "shadow" and not dry_run:
         raise HTTPException(status_code=422, detail="Shadow verification requires dry_run=true.")
     builder = build_brief_v2 if version == "v2" else build_brief_v1
+    pipeline_args = {"pipeline_sync_run_id": pipeline_sync_run_id} if pipeline_sync_run_id is not None else {}
     if verification == "off":
-        return builder(dry_run)
+        return builder(dry_run, **pipeline_args)
     try:
         gate = create_gate(receipts.sync_run_ids if receipts else [], build_id,
                            "v2" if version == "v2" else "v1", dry_run)
-        return builder(dry_run, gate=gate)
+        return builder(dry_run, gate=gate, **pipeline_args)
     except VerificationPending as pending:
         return pending.response
 
 
 def _finish(workspace_id, for_date, payload: dict, recipients: list[str], response: dict,
-            dry_run: bool, gate: DeliveryGate | None) -> dict:
+            dry_run: bool, gate: DeliveryGate | None, pipeline_sync_run_id: UUID | None = None) -> dict:
     if gate is not None:
         response.update(gate.ready_fields())
     if dry_run:
         if gate is not None:
             gate.finalize(None, response)
+        if pipeline_sync_run_id is not None:
+            require_fresh_pipeline(pipeline_sync_run_id)
         return response
     with db.connect() as conn:
+        if pipeline_sync_run_id is not None:
+            check_fresh_pipeline(conn, workspace_id, pipeline_sync_run_id)
         if gate is not None:
             gate.finalize(conn, response)
         conn.execute("insert into briefs (workspace_id, for_date, subject, html, payload, recipients)"
@@ -154,7 +186,7 @@ def _reply_to(subject: str | None) -> str:
 
 
 def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
-                   gate: DeliveryGate | None = None) -> dict:
+                   gate: DeliveryGate | None = None, pipeline_sync_run_id: UUID | None = None) -> dict:
     """The production brief. `since` overrides the change window for side-by-side replays only."""
     now = gate.as_of if gate else timeline.utcnow()
     sources: dict[str, ActionSource] = {}
@@ -172,10 +204,7 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
                             (workspace_id,)).fetchone()
         since = since or (last["created_at"] if last else now - timedelta(hours=24))
 
-        deals = {str(d["company_id"]): d for d in conn.execute(
-            "select o.id, o.company_id, c.name, o.stage, o.stage_rank, o.owner_code from opportunities o"
-            " join companies c on c.id = o.company_id where o.workspace_id = %s and o.removed_at is null order by o.id",
-            (workspace_id,))}
+        deals, working_clients = _sales_deals(conn, workspace_id)
         profiles = {str(r["opportunity_id"]): r for r in conn.execute(
             "select distinct on (opportunity_id) opportunity_id, profile, generated_at, profiler_version"
             " from opportunity_profiles"
@@ -251,11 +280,13 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
         # Unanswered customer emails: thread's latest message is from outside Bianca.
         seen_threads = set()
         for t in conn.execute(
-                "select id, thread_id, company_id, subject, body, occurred_at, participants"
+                "select id, thread_id, company_id, rules_company_id, subject, body, occurred_at, participants"
                 " from source_records where workspace_id = %s and source = 'gmail' and company_id is not null"
                 " and (classification->>'is_commercial')::bool and occurred_at >= %s"
                 " and occurred_at <= %s order by thread_id, occurred_at desc, id",
                 (workspace_id, now - timedelta(days=brief.UNANSWERED_MAX_DAYS), now)):
+            if _working_client_record(t, working_clients):
+                continue
             d = deals.get(str(t["company_id"]))
             senders = [p["address"] for p in (t["participants"] or {}).get("from") or []]
             thread = t["thread_id"]
@@ -301,7 +332,7 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
                 cands.append(c)
 
         # Meetings today and tomorrow (local time), not cancelled.
-        meetings = _upcoming_meetings(conn, workspace_id, today, tz, deals, email_to_code, sales)
+        meetings = _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, email_to_code, sales)
 
         # Changes since the last brief.
         changes: list[brief.Change] = []
@@ -309,22 +340,26 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
             "select id from sync_runs where workspace_id = %s and source = 'pipeline' and status = 'succeeded'"
             " order by started_at limit 1", (workspace_id,)).fetchone()
         for ch in conn.execute(
-                "select c.name, o.owner_code, x.field, x.old_value, x.new_value, x.sync_run_id from opportunity_changes x"
+                "select c.name, o.company_id, o.owner_code, x.field, x.old_value, x.new_value, x.sync_run_id"
+                " from opportunity_changes x"
                 " join opportunities o on o.id = x.opportunity_id join companies c on c.id = o.company_id"
                 " where x.workspace_id = %s and x.detected_at > %s and x.field in ('stage', 'created', 'removed', 'owner_code')"
                 " order by x.detected_at desc", (workspace_id, since)):
+            if str(ch["company_id"]) in working_clients:
+                continue
             if ch["field"] == "created" and first_pipeline_run and ch["sync_run_id"] == first_pipeline_run["id"]:
                 continue
             text = {"created": "New deal in pipeline", "removed": "Removed from pipeline"}.get(
                 ch["field"], f"{'Stage' if ch['field'] == 'stage' else 'Owner'}: {ch['old_value']} → {ch['new_value']}")
             changes.append(brief.Change(ch["name"], text, ch["owner_code"]))
         for r in conn.execute(
-                "select distinct on (source, thread_id) source, thread_id, subject, company_id, participants, meta"
+                "select distinct on (source, thread_id) source, thread_id, subject, company_id, rules_company_id,"
+                " participants, meta"
                 " from source_records where workspace_id = %s and company_id is not null and occurred_at > %s"
                 " and occurred_at <= now() and (classification->>'is_commercial')::bool"
                 " order by source, thread_id, occurred_at desc", (workspace_id, since)):
             d = deals.get(str(r["company_id"]))
-            if not d:
+            if not d or _working_client_record(r, working_clients):
                 continue
             if r["source"] == "gmail":
                 senders = [p["address"] for p in (r["participants"] or {}).get("from") or []]
@@ -335,10 +370,12 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
                 changes.append(brief.Change(d["name"], f"New meeting notes: {r['subject'] or '(no subject)'}", d["owner_code"],
                                             timeline.DOC_URL.format((r["meta"] or {}).get("doc_id", ""))))
         for r in conn.execute(
-                "select subject, company_id from source_records where workspace_id = %s and source = 'calendar'"
+                "select subject, company_id, rules_company_id from source_records where workspace_id = %s and source = 'calendar'"
                 " and meta->>'status' = 'cancelled' and updated_at > %s and occurred_at >= now()",
                 (workspace_id, since)):
-            d = deals.get(str(r["company_id"])) if r["company_id"] else None
+            if _working_client_record(r, working_clients):
+                continue
+            d = deals.get(str(r["company_id"]))
             changes.append(brief.Change(d["name"] if d else "-", f"Meeting cancelled: {r['subject'] or '(no subject)'}",
                                         d["owner_code"] if d else None))
 
@@ -400,7 +437,7 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
                 "candidates": len(cands), "dry_run": dry_run}
     if gate:
         response["payload"] = json.loads(_dumps(payload))
-    return _finish(workspace_id, today, payload, to, response, dry_run, gate)
+    return _finish(workspace_id, today, payload, to, response, dry_run, gate, pipeline_sync_run_id)
 
 
 # ---------------------------------------------------------------- v2 (deal-grouped, owner-checked, stage-aware)
@@ -423,7 +460,7 @@ def _event_day(rec: dict, tz) -> "date":
 
 
 def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
-                   gate: DeliveryGate | None = None) -> dict:
+                   gate: DeliveryGate | None = None, pipeline_sync_run_id: UUID | None = None) -> dict:
     """Build the sales brief with compact deal-level selection (see brief_v2).
 
     `since` overrides the change window for side-by-side replays only.
@@ -446,10 +483,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                             (workspace_id,)).fetchone()
         since = since or (last["created_at"] if last else now - timedelta(hours=24))
 
-        deals = {str(d["company_id"]): d for d in conn.execute(
-            "select o.id, o.company_id, c.name, o.stage, o.stage_rank, o.owner_code from opportunities o"
-            " join companies c on c.id = o.company_id where o.workspace_id = %s and o.removed_at is null order by o.id",
-            (workspace_id,))}
+        deals, working_clients = _sales_deals(conn, workspace_id)
         profiles = {str(r["opportunity_id"]): r for r in conn.execute(
             "select distinct on (opportunity_id) opportunity_id, profile, generated_at, profiler_version"
             " from opportunity_profiles"
@@ -493,11 +527,14 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         threads: dict[str, list[dict]] = {}
         unclassified_latest: dict[str, datetime] = {}
         for t in conn.execute(
-                "select id, thread_id, company_id, subject, body, occurred_at, participants, external_id, content_hash,"
+                "select id, thread_id, company_id, rules_company_id, subject, body, occurred_at, participants,"
+                " external_id, content_hash,"
                 " classification is null as unclassified, classification->'reply_expectation' as reply_expectation"
                 " from source_records where workspace_id = %s and source = 'gmail' and occurred_at <= %s"
                 " and (classification is null or (company_id is not null and (classification->>'is_commercial')::bool))"
                 " order by thread_id, occurred_at, external_id", (workspace_id, now)):
+            if _working_client_record(t, working_clients):
+                continue
             p = t["participants"] or {}
             frm = [x["address"] for x in p.get("from") or []]
             automated = brief_v2.is_automated(frm, t["subject"])
@@ -580,16 +617,18 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                     if gate:
                         sources[f"thread:{thread_id}"] = ActionSource("reply", str(t["id"]), t["occurred_at"])
 
-        meetings = _upcoming_meetings(conn, workspace_id, today, tz, deals, email_to_code, sales)
+        meetings = _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, email_to_code, sales)
 
         # What changed: only records stored since the last brief can hold a development; each is then dated by
         # its source event time (email sent, meeting date), never by when we stored it.
-        new_records = conn.execute(
-            "select id, source, thread_id, subject, body, company_id, participants, meta, occurred_at, created_at"
+        new_records = [record for record in conn.execute(
+            "select id, source, thread_id, subject, body, company_id, rules_company_id, participants, meta,"
+            " occurred_at, created_at"
             " from source_records where workspace_id = %s and company_id is not null and created_at > %s"
-            " and (classification->>'is_commercial')::bool order by occurred_at", (workspace_id, since)).fetchall()
+            " and (classification->>'is_commercial')::bool order by occurred_at", (workspace_id, since))
+            if not _working_client_record(record, working_clients)]
         stage_changes = conn.execute(
-            "select c.name, x.field, x.old_value, x.new_value, x.sync_run_id from opportunity_changes x"
+            "select c.name, o.company_id, x.field, x.old_value, x.new_value, x.sync_run_id from opportunity_changes x"
             " join opportunities o on o.id = x.opportunity_id join companies c on c.id = o.company_id"
             " where x.workspace_id = %s and x.detected_at > %s and x.field in ('stage', 'created', 'removed', 'owner_code')"
             " order by x.detected_at desc", (workspace_id, since)).fetchall()
@@ -734,6 +773,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
 
     changes: list[brief_v2.ChangeRow] = []
     for ch in stage_changes:
+        if str(ch["company_id"]) in working_clients:
+            continue
         if ch["field"] == "created" and first_pipeline_run and ch["sync_run_id"] == first_pipeline_run["id"]:
             continue
         text = {"created": "New deal in the pipeline Sheet", "removed": "Removed from the pipeline Sheet"}.get(
@@ -825,4 +866,4 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
     log.info("brief v2 built for %s: items=%s changes=%s dry_run=%s", today, len(items), len(changes), dry_run)
     response = {"subject": subj, "html": html_body, "text": text_body, "to": ",".join(to), "for_date": today.isoformat(),
                 "candidates": len(items), "dry_run": dry_run, "version": "v2", "payload": json.loads(_dumps(payload))}
-    return _finish(workspace_id, today, payload, to, response, dry_run, gate)
+    return _finish(workspace_id, today, payload, to, response, dry_run, gate, pipeline_sync_run_id)
