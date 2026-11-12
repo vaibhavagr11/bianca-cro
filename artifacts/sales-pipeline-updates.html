@@ -231,7 +231,26 @@ const BiancaLive = (() => {
   function createClient(transport,{onChange=()=>{},makeKey=()=>crypto.randomUUID()}={}){
     let state={proposals:[],rows:[],activity:[]},refreshSequence=0;
     const intents=new Map(),busy=new Set();
-    async function refresh(){const sequence=++refreshSequence;const next=workspace(await transport(TOOLS.workspace,{}));if(sequence!==refreshSequence)return state;state=next;for(const id of intents.keys()){const p=next.proposals.find(p=>p.id===id);if(!p||p.status!=='applying')intents.delete(id);}onChange(next);return next;}
+    async function refresh(){
+      const sequence=++refreshSequence;
+      let next;
+      try{next=workspace(await transport(TOOLS.workspace,{}));}
+      catch(error){
+        if(sequence===refreshSequence){
+          state={proposals:[],rows:[],activity:[]};
+          onChange(state,{unavailable:true});
+        }
+        throw error;
+      }
+      if(sequence!==refreshSequence)return state;
+      state=next;
+      for(const id of intents.keys()){
+        const p=next.proposals.find(p=>p.id===id);
+        if(!p||p.status!=='applying')intents.delete(id);
+      }
+      onChange(next);
+      return next;
+    }
     function pendingIntent(id){return intents.get(id)?.payload;}
     async function decide(id,action,update){
       if(busy.has(id))throw new ReviewError('This company update is already being saved.');
@@ -382,14 +401,32 @@ const BiancaWarRoom = (() => {
   function toast(message){clearTimeout(toastTimer);$('#toast-region').innerHTML=`<div class="toast"><span>${esc(message)}</span><button type="button" class="toast-close" aria-label="Dismiss notification">×</button></div>`;$('.toast-close').onclick=()=>$('#toast-region').replaceChildren();announce(message);toastTimer=setTimeout(()=>$('#toast-region').replaceChildren(),12000);}
   function setTab(id,focus=false){document.querySelectorAll('[role=tab]').forEach(tab=>{const selected=tab.id===id;tab.setAttribute('aria-selected',String(selected));tab.tabIndex=selected?0:-1;$('#'+tab.getAttribute('aria-controls')).hidden=!selected;if(selected&&focus)tab.focus();});}
   function connectionError(message){setText('#connection-error',message);$('#connection-error').hidden=false;setText('#connection-status','Connection needed');$('#connection-panel').hidden=false;announce(message);}
-  function attach(transport){const attachedSession=++session;loaded=false;state={proposals:[],rows:[],activity:[]};mirrorPending.clear();expandedNextSteps.clear();activeSources.clear();render();client=BiancaLive.createClient(transport,{onChange:next=>{if(attachedSession!==session)return;state=next;loaded=true;render();}});}
+  function attach(transport){
+    const attachedSession=++session;
+    loaded=false;state={proposals:[],rows:[],activity:[]};mirrorPending.clear();expandedNextSteps.clear();activeSources.clear();render();
+    client=BiancaLive.createClient(transport,{onChange:(next,{unavailable=false}={})=>{
+      if(attachedSession!==session)return;
+      state=next;loaded=!unavailable;
+      $('#toast-region').replaceChildren();
+      if(editingId&&!next.proposals.some(p=>p.id===editingId)){
+        $('#edit-dialog').close();editingId=null;editingRevision=null;
+        for(const id of ['#edit-content','#edit-client-context'])$(id).value='';
+        for(const id of ['#edit-title','#previous-next-step','#previous-client-context','#ns-rows','#ns-preview'])$(id).replaceChildren();
+      }
+      render();
+    }});
+  }
   async function refresh(){
     if(refreshing)return;
     if(!client&&window.biancaConnector?.callTool)attach(BiancaLive.connectorTransport(window.biancaConnector));
     if(!client){connectionError(hosted?'Enter your workspace access token to load updates.':'Connect the Bianca Review connector in Claude, then refresh this artifact.');return;}
     const active=client,startedSession=session;refreshing=true;$('#refresh-updates').disabled=true;setText('#connection-status','Refreshing…');
     try{await active.refresh();if(startedSession!==session)return;$('#connection-panel').hidden=true;$('#connection-error').hidden=true;setText('#connection-status','Connected');setText('#last-refreshed','Updated '+new Date().toLocaleTimeString([],{hour:'numeric',minute:'2-digit'}));announce('Sales pipeline updates refreshed.');}
-    catch(error){if(startedSession!==session)return;if(!loaded||error.status===401||error.status===403)connectionError(error.message);else toast(error.message);if(loaded)setText('#connection-status','Refresh needed');}
+    catch(error){
+      if(startedSession!==session)return;
+      if(error.status===401||error.status===403)connectionError(error.message);
+      else {toast(error.message);setText('#connection-status','Refresh needed');}
+    }
     finally{if(startedSession===session){refreshing=false;$('#refresh-updates').disabled=false;}}
   }
   function empty(title,text,action,label){return `<div class="empty-state"><div class="empty-icon" aria-hidden="true">${action==='clear-filters'?'⌕':'✓'}</div><h2>${esc(title)}</h2><p>${esc(text)}</p>${action?`<button class="secondary" type="button" data-action="${action}">${label}</button>`:''}</div>`;}
@@ -405,7 +442,7 @@ const BiancaWarRoom = (() => {
       const row=state.rows.find(r=>r.company===company),expected=intent.after;
       const matches=expected&&row&&['lastProgress','nextStep','clientContext'].every(k=>String(row[k]||'').trim()===String(expected[k]||'').trim());
       const syncedLater=row&&Number.isFinite(Date.parse(row.lastSyncedAt))&&Number.isFinite(Date.parse(intent.at))&&Date.parse(row.lastSyncedAt)>Date.parse(intent.at);
-      if(matches||syncedLater)mirrorPending.delete(company);
+      if(!row||matches||syncedLater)mirrorPending.delete(company);
     }
     const companies=[...mirrorPending.keys()];
     $('#mirror-sync-notice').hidden=!companies.length;
@@ -418,8 +455,8 @@ const BiancaWarRoom = (() => {
     const pending=state.proposals.filter(p=>['pending','applying'].includes(p.status));setText('#pending-count',pending.length);setText('#activity-count',state.activity.length);
     const query=$('#company-search').value.trim().toLocaleLowerCase(),owner=$('#owner-filter').value;
     const filtered=pending.filter(p=>(owner==='all'||p.owner===owner)&&p.company.toLocaleLowerCase().includes(query));
-    setText('#results-count',!loaded?'Connect your workspace to load updates':query||owner!=='all'?`${filtered.length} of ${pending.length} companies`:`${pending.length} ${pending.length===1?'company':'companies'} to review`);
-    $('#review-list').innerHTML=BiancaWarRoom.shell(filtered,card,state)||(!loaded?empty('Your workspace is ready to connect.','Connect Bianca Review in Claude, or sign in on your hosted Bianca page.','',''):empty(pending.length?'No companies match your filters.':'You’re all caught up.',pending.length?'Try another company name or founder.':'All current suggestions have been reviewed. New updates will appear after the next processing run.',pending.length?'clear-filters':'refresh',pending.length?'Clear filters':'Refresh updates'));
+    setText('#results-count',!loaded?(client?'Refresh to load updates':'Connect your workspace to load updates'):query||owner!=='all'?`${filtered.length} of ${pending.length} companies`:`${pending.length} ${pending.length===1?'company':'companies'} to review`);
+    $('#review-list').innerHTML=BiancaWarRoom.shell(filtered,card,state)||(!loaded?(client?empty('Updates unavailable','Refresh to check current sales status.','refresh','Refresh updates'):empty('Your workspace is ready to connect.','Connect Bianca Review in Claude, or sign in on your hosted Bianca page.','','')):empty(pending.length?'No companies match your filters.':'You’re all caught up.',pending.length?'Try another company name or founder.':'All current suggestions have been reviewed. New updates will appear after the next processing run.',pending.length?'clear-filters':'refresh',pending.length?'Clear filters':'Refresh updates'));
     $('#activity-list').innerHTML=state.activity.map(a=>`<article class="activity-row"><span class="activity-symbol ${a.kind==='ignored'?'ignored':''}" aria-hidden="true">${a.kind==='ignored'?'−':'✓'}</span><div><h3 class="activity-company">${esc(a.company)}</h3><p class="activity-description">${a.kind==='ignored'?'Ignored · nothing written':a.edited?'Edited and approved · written to the Sheet copy':'Approved · written to the Sheet copy'}${a.actor?' · '+esc(a.actor):''}</p>${a.kind==='approved'?`<details class="activity-details"><summary>View approved update</summary><div class="rotation-content">${a.before.nextStep!==a.after.nextStep||a.before.lastProgress!==a.after.lastProgress?`<strong>Next Step</strong>
 ${esc(a.after.nextStep)}
 `:''}${a.before.clientContext!==a.after.clientContext?`<strong>Client Context</strong>
@@ -479,11 +516,15 @@ ${traceNote?`<p class="approval-note trace-note" role="status">${esc(traceNote)}
     el?.querySelectorAll('button').forEach(b=>b.disabled=true);if(fromEditor)$('#save-approve').disabled=true;
     try{
       const result=await active.decide(id,action,bullets);if(startedSession!==session)return;
+      if(!state.rows.some(row=>row.company===p.company)&&!state.activity.some(item=>item.company===p.company)){
+        if(fromEditor)$('#edit-dialog').close();restore();toast('Decision saved.');return;
+      }
       if(action==='approve'&&result?.mirror_refreshed===false){mirrorPending.set(p.company,{after:result.activity?.after||null,at:result.activity?.at});updateMirrorNotice();}
       if(fromEditor)$('#edit-dialog').close();restore();toast(action==='approve'?`${p.company} approved. Written to the Sheet copy.${result?.mirror_refreshed===false?' Pipeline snapshot needs a full sync.':''}`:`${p.company} ignored. Nothing written to the Sheet copy.`);
     }catch(error){
+      if(error.status===409)await refresh();
       if(startedSession!==session)return;const message=error.status===409?error.message+' Refresh to review the current company update.':error.message;
-      if(fromEditor){setText('#edit-error',message);$('#edit-error').hidden=false;}
+      if(fromEditor&&editingId===id){setText('#edit-error',message);$('#edit-error').hidden=false;}
       else {const current=[...document.querySelectorAll('article[data-id]')].find(x=>x.dataset.id===id)?.querySelector('.card-error');if(current){current.textContent=message;current.hidden=false;}toast(message);}
       setText('#connection-status','Refresh needed');
     }finally{if(startedSession!==session)return;$('#save-approve').disabled=false;const current=[...document.querySelectorAll('article[data-id]')].find(x=>x.dataset.id===id);current?.querySelectorAll('button').forEach(b=>b.disabled=b.dataset?.sourceUnavailable==='true'||b.dataset?.reviewBlocked==='true');}
