@@ -57,8 +57,9 @@ def _scoped_rows(rows: list[dict], deals: dict[str, dict]) -> list[dict]:
 def _email_asks(rows: list[dict]) -> dict[tuple[str, str, str], list[dict]]:
     asks: dict[tuple[str, str, str], list[dict]] = {}
     for r in rows:
+        reply_evidence = r["type"] == "next_step" or (r["type"] == "commitment" and r["owner_side"] == "customer")
         if (r["source"] == "gmail" and r["origin_record_id"] and r["status"] == "open"
-                and r["type"] == "next_step" and r["owner_side"] in ("bianca", "customer")):
+                and reply_evidence and r["owner_side"] in ("bianca", "customer")):
             key = (str(r["origin_record_id"]), str(r["company_id"]), r["owner_side"])
             asks.setdefault(key, []).append(r)
     return asks
@@ -68,6 +69,30 @@ def _message_asks(asks: dict[tuple[str, str, str], list[dict]], message: dict, s
     key = str(message["id"]), str(message["company_id"]), side
     # The subject can be inherited from an earlier email. The actual ask must be in the message body.
     return [r for r in asks.get(key, []) if extractor.quote_in_record(r["quote"], message, body_only=True)]
+
+
+def _waiting_action(asks: dict[tuple[str, str, str], list[dict]], wait: dict) -> tuple[str | None, frozenset[str]]:
+    expectation = wait["last"]["reply_expectation"]
+    quote = " ".join((expectation.get("evidence_quote") or "").casefold().split())
+    if not quote:
+        # Older expectations may only identify the message. Keep the existing latest-message ask.
+        customer_asks = [ask for ask in _message_asks(asks, wait["last"]["row"], "customer")
+                         if ask["type"] == "next_step"][:1]
+        matched = customer_asks
+    else:
+        evidence = wait["evidence"]["row"]
+
+        def matches(ask: dict) -> bool:
+            extracted = " ".join(ask["quote"].casefold().split())
+            return bool(extracted) and (extracted in quote or quote in extracted)
+
+        customer_asks = [ask for ask in _message_asks(asks, evidence, "customer") if matches(ask)]
+        matched = customer_asks
+        if wait["evidence_outbound"]:
+            # Older extractions can record our outbound ask as a Bianca-side proposal.
+            matched = matched + [ask for ask in _message_asks(asks, evidence, "bianca") if matches(ask)]
+    action = customer_asks[0]["text"] if customer_asks else expectation.get("response")
+    return action, frozenset(str(ask["id"]) for ask in matched)
 
 
 def _profile_sales_entry(entry: dict, profile: dict, sales_by_id: dict[str, dict], deal: dict) -> bool:
@@ -545,7 +570,6 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                 unclassified_at = unclassified_latest.get(thread_id)
                 if unclassified_at is not None and unclassified_at >= t["occurred_at"]:
                     continue  # newer real mail can resolve or change the request before it is classified
-                asks = _message_asks(email_asks, t, "customer")   # what we asked for, when extraction found it
                 w = brief_v2.waiting_on_them(msgs, internal, now)
                 if not w or (not gate and (last_reply.get(d["name"], t["occurred_at"]) > t["occurred_at"]
                                            or last_ours.get(d["name"], t["occurred_at"]) > t["occurred_at"])):
@@ -555,12 +579,13 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                 replied = last_reply.get(d["name"])
                 nudges = sum(1 for at in ours_sent.get(d["name"], []) if not replied or at > replied)  # every thread
                 if d["name"] not in waiting or sent.date() > waiting[d["name"]].sent:
+                    action, evidence = _waiting_action(email_asks, w)
                     waiting[d["name"]] = brief_v2.Waiting(
                         d["name"], d["stage"], w["to"], sent.date(), w["days"], max(nudges, w["nudges"]), replied is not None,
                         w["auto_reply"] or last_auto.get(d["name"], t["occurred_at"]) > t["occurred_at"],
                         timeline.GMAIL_THREAD_URL.format(thread_id), f"Email · {sent:%b} {sent.day}",
                         thread_id, sender if sender in FOUNDER_ORDER else d["owner_code"], d["stage_rank"],
-                        action=asks[0]["text"] if asks else None)
+                        action=action, evidence=evidence)
                     if gate:
                         sources[f"wait:{thread_id}"] = ActionSource("waiting", str(t["id"]), t["occurred_at"])
                 continue
@@ -713,13 +738,17 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             views[deals[str(r["company_id"])]["name"]].developments += 1
 
     names = {t["owner_code"]: t["full_name"] for t in team}
+    waits = list(waiting.values())
+    picked_waits = {code: brief_v2.pick_waiting(waits, code) for code in FOUNDER_ORDER}
+    displayed_waits = [w for shown, _ in picked_waits.values() for w in shown]
     sections = []
     for code in FOUNDER_ORDER:
         short, full = DISPLAY.get(code, (code, names.get(code, code)))
+        shown, more = picked_waits[code]
         sections.append(brief_v2.build_section(
             code, full, short, views, items, [(m, m.context) for m in meetings if code in m.attendees], today, display,
-            0 if gate else hidden.get(code, 0), settings.brief_critical_ahead_days, settings.brief_in_talks_target))
-        sections[-1].waiting, sections[-1].more_waiting = brief_v2.pick_waiting(list(waiting.values()), code)
+            0 if gate else hidden.get(code, 0), settings.brief_critical_ahead_days, settings.brief_in_talks_target,
+            waiting=shown, more_waiting=more, displayed_waits=displayed_waits))
 
     ndl = [brief_v2.TodayRow(i.deal, views[i.deal].stage, "Due now", i.text, f"due {i.due:%b} {i.due.day}", "Nico DL",
                              i.link, i.id, i.source, f"insight:{i.id}")
