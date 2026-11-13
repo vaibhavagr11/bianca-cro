@@ -11,6 +11,8 @@ from typing import Literal
 import anthropic
 from pydantic import BaseModel, Field
 
+from app.pipeline import is_pilot
+
 EXTRACTOR_VERSION = "extract-v5"
 # Units extracted by these versions are not re-extracted automatically (re-extracting all history is deliberate).
 KEPT_VERSIONS = ("extract-v3", "extract-v4", EXTRACTOR_VERSION)
@@ -24,6 +26,25 @@ APPROXIMATE_TIMING = re.compile(
     r"alrededor de|aproximadamente|pronto|esta semana|la (?:pr[oó]xima semana|semana que viene)|fin de mes)\b",
     re.I,
 )
+
+PILOT_SCOPE_PROMPT = """
+Use these tighter Pilot rules for the new source records identified above the source text in the request.
+When only new material is supplied, apply them to all of it. For those records, mark an insight
+deal_progression only if its source identifies a specific Bianca
+commercial step or decision that the insight itself advances, informs, or blocks. Examples include agreeing
+pilot evaluation criteria for a purchase, obtaining a buyer's go/no-go, getting pricing or procurement approval,
+and deciding on a paid rollout, renewal, or expansion. The Pilot label, ordinary usage, and deadlines do not
+establish that link. Apply this to actions and to context such as needs, buying signals, objections, and blockers.
+Classify routine setup, dashboard changes, recurring reports, data fixes, and support as delivery. If the source
+states a commercial dependency, capture the decision, blocker, or commercial follow-up separately and leave
+the execution work under delivery. Use out_of_scope when commercial relevance is unclear.
+
+Pilot examples:
+- "Can you fix the dashboard by Friday?" is a delivery request. "We need the dashboard results to decide on
+  Friday whether to proceed with a paid rollout" supports a deal_progression blocker about the rollout decision.
+- "Please add 20 more dashboard users" is a delivery request. "Please send pricing for 20 additional seats"
+  is a deal_progression next_step, a request for pricing.
+"""
 
 
 class ExtractedInsight(BaseModel):
@@ -182,9 +203,15 @@ def validate(extraction: Extraction, text: str, records: dict[str, dict] | None 
     return kept, dropped
 
 
-def extract(client: anthropic.Anthropic, model: str, system_prompt: str, deal: dict, item_text: str) -> Extraction:
-    request = (f"Deal: {deal['company']} (pipeline stage: {deal['stage']}, owner: {deal['owner_code']}).\n"
-               f"Extract the commercial intelligence from this item.\n\n<text>\n{item_text[-MAX_TEXT_CHARS:]}\n</text>")
+def extract(client: anthropic.Anthropic, model: str, system_prompt: str, deal: dict, item_text: str, *,
+            new_source_refs: list[str] | None = None) -> Extraction:
+    request = f"Deal: {deal['company']} (pipeline stage: {deal['stage']}, owner: {deal['owner_code']}).\n"
+    if is_pilot(deal["stage"]) and new_source_refs != []:
+        system_prompt += PILOT_SCOPE_PROMPT
+        if new_source_refs is not None:
+            request += (f"Apply the new Pilot rules only to insights sourced from: {', '.join(new_source_refs)}. "
+                        "Other records can still resolve earlier actions. Use the normal scope rules for those records.\n")
+    request += f"Extract the commercial intelligence from this item.\n\n<text>\n{item_text[-MAX_TEXT_CHARS:]}\n</text>"
     response = client.messages.parse(
         model=model,
         max_tokens=8000,

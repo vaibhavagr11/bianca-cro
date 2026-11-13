@@ -14,7 +14,7 @@ from app.main import app
 NOW = datetime(2026, 11, 5, 14, tzinfo=UTC)
 SALES = "deal_progression"
 DELIVERY = "delivery"
-SALES_ASK = "Send the signed pricing terms"
+SALES_ASK = "Send pricing for the paid rollout"
 
 
 def deal(key: str) -> dict:
@@ -125,7 +125,9 @@ def brief_client(monkeypatch):
 
 @pytest.fixture
 def scoped_brief(brief_client):
-    inbound = email("mixed-email", "mixed", f"Can you {SALES_ASK.lower()}? Please fix the sales dashboard.")
+    rollout_ask = "Can you send pricing for the paid rollout by November 5?"
+    dashboard_ask = "Please fix the sales dashboard export."
+    inbound = email("mixed-email", "mixed", f"{rollout_ask} {dashboard_ask}")
     old_quote = "Could you send the renewal proposal?"
     old = email("old-email", "repeat", old_quote, days=6, thread="repeat-thread")
     repeat = email("quoted-support-email", "repeat", f"Could you fix the export? Earlier: {old_quote}",
@@ -138,9 +140,10 @@ def scoped_brief(brief_client):
     insights = [
         insight("pricing", "mixed", "Share the pricing deck", SALES),
         insight("pilot", "mixed", "Send the pilot terms", SALES),
-        insight("dashboard", "mixed", "Fix the sales dashboard", DELIVERY, origin=inbound),
+        insight("dashboard", "mixed", "Fix the sales dashboard export", DELIVERY, type_="next_step",
+                origin=inbound, quote=dashboard_ask),
         insight("incoming", "mixed", SALES_ASK, SALES, type_="next_step", origin=inbound,
-                quote="Can you send the signed pricing terms?"),
+                quote=rollout_ask),
         insight("old-ask", "repeat", "Send the renewal proposal", SALES, type_="next_step",
                 origin=old, quote=old_quote, dated=False),
         insight("outgoing", "sales-wait", "Customer to approve the proposal", SALES, type_="next_step",
@@ -167,7 +170,8 @@ def scoped_brief(brief_client):
               "evidence": ["I1"], "action_scope": DELIVERY},
          ]}},
     ]
-    deals = [deal(key) for key in ("mixed", "repeat", "sales-wait", "support-wait", "unscoped")]
+    deals = [deal(key) for key in ("repeat", "sales-wait", "support-wait", "unscoped")]
+    deals.append({**deal("mixed"), "stage": "4. Pilot", "stage_rank": 4})
     deals.append({**deal("renewal"), "stage": "5. Working Client", "stage_rank": 5})
     return brief_client(BriefData(deals, messages, insights, profiles))
 
@@ -183,7 +187,7 @@ def test_brief_requires_sales_scope_for_stored_actions_and_exact_email_asks(scop
     assert "Send the pilot terms" in html
     assert SALES_ASK in html
     assert "Confirm the renewal decision date" not in html
-    assert "Fix the sales dashboard" not in html
+    assert "Fix the sales dashboard export" not in html
     assert "Refactor the analytics exporter" not in html
     assert "Repair the data connector" not in html
     assert "Add another dashboard" in html       # extracted before scopes existed: shown until re-extracted
