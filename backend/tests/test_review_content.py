@@ -117,31 +117,37 @@ def test_calendar_title_and_gmail_subject_do_not_create_next_steps():
     assert validate_lineage(*content)
 
 
-def test_mixed_source_keeps_sales_actions_and_context_without_delivery_fallback():
-    sales = record(body="We will share the proposal on Friday. Can you send pilot pricing by Friday? "
-                        "Budget approval depends on pilot cost. Fix the dashboard. Send dashboard usage metrics.")
+def test_mixed_pilot_source_keeps_sales_actions_and_context():
+    promise = "We will share the rollout proposal on Friday."
+    pricing = "Can you send pricing for the paid rollout by Friday?"
+    approval = "Approval for the paid rollout depends on pricing."
+    dashboard = "Please fix the sales dashboard export."
+    reporting = "Our weekly dashboard export is missing two regions."
+    field_sales = "Our field sales team is tracking its visit targets."
+    sales = record(body=" ".join((promise, pricing, approval, dashboard, reporting, field_sales)))
     support = record(2, body="Please rebuild the sales dashboard.")
     content = proposal_content([sales, support], [
-        insight(type="commitment", text="We will share the proposal.", quote="We will share the proposal on Friday.",
+        insight(type="commitment", text="Share the rollout proposal.", quote=promise,
                 origin_record_id=sales["id"], due_date="2026-11-06"),
-        insight(text="Customer requested pilot pricing.", quote="Can you send pilot pricing by Friday?",
+        insight(text="Send pricing for the paid rollout.", quote=pricing,
                 origin_record_id=sales["id"], due_date="2026-11-06"),
-        insight(type="objection", text="Budget approval depends on pilot cost.",
-                quote="Budget approval depends on pilot cost.", origin_record_id=sales["id"]),
-        insight(type="commitment", text="Fix the dashboard.", quote="Fix the dashboard.",
-                origin_record_id=sales["id"], action_scope="delivery"),
-        insight(type="need", text="Send dashboard usage metrics.", quote="Send dashboard usage metrics.",
-                origin_record_id=sales["id"], action_scope="out_of_scope"),
+        insight(type="objection", text=approval, quote=approval, origin_record_id=sales["id"]),
+        insight(text="Fix the sales dashboard export.", quote=dashboard, origin_record_id=sales["id"],
+                action_scope="delivery"),
+        insight(type="need", text=reporting, quote=reporting, origin_record_id=sales["id"], action_scope="delivery"),
+        insight(type="need", text=field_sales, quote=field_sales, origin_record_id=sales["id"],
+                action_scope="out_of_scope"),
         insight(text="Please rebuild the sales dashboard.", quote="Please rebuild the sales dashboard.",
                 origin_record_id=support["id"], action_scope="delivery"),
     ])
     actions, context, sources, lineage = content
     assert actions == [
-        "Next step: Customer requested pilot pricing. — requested by 2026-11-06",
-        "We owe: We will share the proposal. — due 2026-11-06",
+        "Next step: Send pricing for the paid rollout. — requested by 2026-11-06",
+        "We owe: Share the rollout proposal. — due 2026-11-06",
     ]
-    assert context == ["Objection: Budget approval depends on pilot cost."]
+    assert context == ["Objection: Approval for the paid rollout depends on pricing."]
     assert [s["recordId"] for s in sources] == [sales["id"]]
+    assert set(sources[0]["quotes"]) == {promise, pricing, approval}
     assert validate_lineage(*content)
 
 
