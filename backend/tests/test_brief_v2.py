@@ -660,9 +660,10 @@ def test_waiting_omits_outbound_with_no_reply_expectation():
 
 
 def wait(deal, days, owner="RG", rank=2, **kw):
-    return Waiting(deal, STAGES[rank], "Juan Pérez", (NOV4 - timedelta(days=days)).date(), days, kw.get("nudges", 1),
+    return Waiting(deal, STAGES[rank], "Juan Pérez", kw.get("sent", NOV4.date() - timedelta(days=days)), days,
+                   kw.get("nudges", 1),
                    kw.get("replied", False), kw.get("auto", False), "https://mail/t", "Email · Oct 1", f"t-{deal}",
-                   owner, rank, kw.get("action"))
+                   owner, rank, kw.get("action"), evidence=kw.get("evidence", frozenset()))
 
 
 def test_waiting_list_is_per_founder_prospects_first_newest_silence_first():
@@ -671,6 +672,62 @@ def test_waiting_list_is_per_founder_prospects_first_newest_silence_first():
     assert [w.deal for w in shown] == ["Andina Chile", "Arca Peru", "Customer Co"] and more == 0
     assert waiting_text(wait("Arca Peru", 50, nudges=3, auto=True)) == "To Juan Pérez · no reply to our 3 emails, out-of-office received"
     assert waiting_text(wait("Farmater", 7, nudges=8, replied=True)) == "To Juan Pérez · 8 emails since their last reply"
+
+
+@pytest.mark.parametrize("has_evidence", [True, False])
+def test_waiting_proposal_leaves_its_highlight_slot_for_another_deal(has_evidence):
+    sent = TODAY - timedelta(days=9)
+    proposal = item("Andina Chile", "Confirm the pilot approval date", recorded=sent, deal_owner="RG",
+                    id="proposal", kind="proposed")
+    other_deals = [view(f"Prospect {n}", 3, owner="RG") for n in range(4)]
+    views = [view(proposal.deal, 4, owner="RG", last=sent), *other_deals]
+    baseline = section("RG", views, [proposal])
+    assert baseline.highlights[0][1].item_id == proposal.id
+    assert baseline.highlights[0][1].tag == "Follow up"
+
+    action = "Customer to confirm the pilot approval date" if has_evidence else proposal.text
+    evidence = frozenset({proposal.id}) if has_evidence else frozenset()
+    waiting = wait(proposal.deal, 9, rank=4, sent=sent, action=action, evidence=evidence)
+    proposal.link = waiting.link
+    brief = build_section("RG", "Ramiro", "Ramiro", {v.deal: v for v in views}, [proposal], [], TODAY, DISPLAY,
+                          waiting=[waiting])
+
+    assert brief.waiting == [waiting]
+    assert {v.deal for v, _, _ in brief.highlights} == {v.deal for v in other_deals}
+    audit = {record.deal: record for record in brief.audit}
+    assert not audit[proposal.deal].selected and not audit[proposal.deal].signals
+
+
+def test_deal_with_waiting_proposal_can_show_a_separate_commitment_on_the_same_thread():
+    sent = TODAY - timedelta(days=9)
+    waiting = wait("Andina Chile", 9, sent=sent, action="Confirm the pilot approval date",
+                   evidence=frozenset({"proposal"}))
+    proposal = item(waiting.deal, waiting.action, recorded=sent, deal_owner="RG", id="proposal", kind="proposed")
+    promise = item(waiting.deal, "Send the revised pricing sheet", due=TODAY + timedelta(days=4), recorded=sent,
+                   deal_owner="RG", id="pricing")
+    proposal.link = promise.link = waiting.link
+    v = view(waiting.deal, 2, owner="RG", last=sent)
+
+    brief = build_section("RG", "Ramiro", "Ramiro", {v.deal: v}, [proposal, promise], [], TODAY, DISPLAY,
+                          waiting=[waiting])
+
+    assert brief.waiting == [waiting]
+    assert [(deal.deal, move.tag, move.item_id) for deal, move, _ in brief.highlights] == [
+        (waiting.deal, "We owe", promise.id)
+    ]
+    assert "next milestone: our proposal awaiting reply" not in brief.audit[0].signals
+
+
+def test_same_wording_can_refer_to_two_actions_with_separate_evidence():
+    action = "Send the signed agreement"
+    recommendation = Note(action, verified=True, evidence=frozenset({"bianca-copy"}), ref="signed-copy")
+    v = view("Andina Chile", 2, owner="RG", recommendation=recommendation, recommendations=[recommendation])
+    waiting = wait(v.deal, 9, action=action, evidence=frozenset({"customer-copy"}))
+
+    brief = build_section("RG", "Ramiro", "Ramiro", {v.deal: v}, [], [], TODAY, DISPLAY, waiting=[waiting])
+
+    assert brief.waiting == [waiting]
+    assert [move.done for _, move, _ in brief.highlights] == ["rec:signed-copy"]
 
 
 def test_waiting_list_renders_with_a_done_button():
