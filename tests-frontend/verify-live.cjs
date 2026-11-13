@@ -187,7 +187,7 @@ function fakePage(connector,pathname='/artifact'){
     constructor(){this.textContent='';this.innerHTML='';this.value='';this.hidden=false;this.disabled=false;this.handlers={};}
     addEventListener(name,handler){this.handlers[name]=handler;}
     replaceChildren(){this.textContent='';this.innerHTML='';}
-    close(){this.open=false;}showModal(){this.open=true;}focus(){}removeAttribute(){}setAttribute(){}
+    close(){this.open=false;}showModal(){this.open=true;}focus(){}removeAttribute(name){delete this[name];}setAttribute(){}
     querySelectorAll(){return [];}querySelector(){return new Element();}
   }
   const elements=new Map(),events={};
@@ -206,6 +206,34 @@ test('The actual live UI starts empty and explains missing connector access',()=
   assert.ok(page.get('#review-list').innerHTML.includes('Your workspace is ready to connect.'));
   assert.equal(page.get('#review-list').innerHTML.includes('Pernod Ricard'),false);
   assert.equal(page.get('#sign-in-form').hidden,true);
+  assert.equal(page.get('#pipeline-sheet-link').hidden,true);
+  assert.equal(page.get('#pipeline-sheet-link').href,undefined);
+});
+
+test('Header and cards follow the connected Pipeline Sheet and clear invalid or stale links',async()=>{
+  const stageUrl='https://docs.google.com/spreadsheets/d/staging-sheet/edit?gid=0#gid=0';
+  const productionUrl='https://docs.google.com/spreadsheets/d/production-sheet/edit?gid=42#gid=42';
+  let current={...snapshot(),sheetUrl:stageUrl};
+  const page=fakePage({callTool:async()=>({structuredContent:current})});
+  await new Promise(resolve=>setImmediate(resolve));
+  const link=page.get('#pipeline-sheet-link');
+  assert.equal(link.hidden,false);
+  assert.equal(link.href,stageUrl);
+  assert.ok(page.get('#review-list').innerHTML.includes('href="'+stageUrl+'"'));
+
+  current={...snapshot(),sheetUrl:productionUrl};
+  await page.get('#refresh-updates').onclick();
+  assert.equal(link.href,productionUrl);
+  assert.ok(page.get('#review-list').innerHTML.includes('href="'+productionUrl+'"'));
+  assert.equal(page.get('#review-list').innerHTML.includes(stageUrl),false);
+
+  for(const sheetUrl of ['https://example.com/redirect','javascript:alert(1)',productionUrl+'\n',null]){
+    current={...snapshot(),sheetUrl};
+    await page.get('#refresh-updates').onclick();
+    assert.equal(link.hidden,true);
+    assert.equal(link.href,undefined);
+    assert.equal(page.get('#review-list').innerHTML.includes('Open in Pipeline Sheet'),false);
+  }
 });
 
 test('Company cards display escaped source labels in closed disclosures without exposing source quotes',async()=>{
@@ -329,7 +357,7 @@ test('An approval with a stale mirror shows a persistent full-sync notice until 
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(page.get('#mirror-sync-notice').hidden,false);
   assert.ok(page.get('#mirror-sync-notice').textContent.includes('pipeline snapshot needs a full sync'));
-  assert.ok(page.get('#toast-region').innerHTML.includes('Written to the Sheet copy. Pipeline snapshot needs a full sync.'));
+  assert.ok(page.get('#toast-region').innerHTML.includes('Written to the Pipeline Sheet. Pipeline snapshot needs a full sync.'));
   assert.equal(page.get('#pending-count').textContent,0,'A confirmed decision removes its card even when the pipeline mirror needs a sync.');
   assert.ok(page.get('#activity-list').innerHTML.includes('Confirm the scope.'),'Confirmed approval remains visible in the decision history.');
   await page.get('#refresh-updates').onclick();

@@ -356,7 +356,12 @@ def workspace_view(conn, workspace_id) -> dict:
         "select d.*, p.company_name from review_decisions d join review_proposals p on p.id = d.proposal_id"
         " where d.workspace_id = %s and p.opportunity_id = any(%s) and d.status = 'succeeded'"
         " order by d.completed_at desc limit 200", (workspace_id, historical_ids))]
-    return {"proposals": proposals, "rows": rows, "activity": activity,
+    target = _sheet_target()
+    sheet_url = None
+    if _target_is_pinned(target):
+        sheet_url = (f"https://docs.google.com/spreadsheets/d/{target['spreadsheet_id']}/edit"
+                     f"?gid={target['sheet_id']}#gid={target['sheet_id']}")
+    return {"proposals": proposals, "rows": rows, "activity": activity, "sheetUrl": sheet_url,
             "routingVersion": ROUTING_VERSION, "clientContextMode": settings.review_client_context_mode,
             "owners": [{"code": "RG", "name": "Ramiro"}, {"code": "NC", "name": "Nico"}, {"code": "NDL", "name": "Nico"}]}
 
