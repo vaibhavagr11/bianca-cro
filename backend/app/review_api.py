@@ -23,6 +23,7 @@ from starlette.concurrency import run_in_threadpool
 from app import brief_api, db, review_service
 from app.config import settings
 from app.ingest import _workspace_id, require_token
+from app.pipeline_freshness import require_fresh_pipeline
 
 log = logging.getLogger("bianca_cro.review")
 router = APIRouter(prefix="/review", tags=["Sheet review"])
@@ -98,10 +99,13 @@ class IgnoreTool(IgnoreRequest):
 
 
 def _workspace() -> dict:
-    with db.connect() as conn:
-        workspace_id = _workspace_id(conn)
-        conn.row_factory = dict_row
-        return review_service.workspace_view(conn, workspace_id)
+    try:
+        with db.connect() as conn:
+            workspace_id = _workspace_id(conn)
+            conn.row_factory = dict_row
+            return review_service.workspace_view(conn, workspace_id)
+    except review_service.ReviewUnavailable as exc:
+        raise HTTPException(503, str(exc), headers={"Cache-Control": "no-store"}) from exc
 
 
 def _build(force: bool = False) -> dict:
@@ -143,7 +147,8 @@ def _decision(proposal_id: str, actor: str, action: str, payload: IgnoreRequest)
 
 
 @router.get("/workspace")
-def workspace(actor: str = Depends(reviewer)) -> dict:
+def workspace(response: Response, actor: str = Depends(reviewer)) -> dict:
+    response.headers["Cache-Control"] = "no-store"
     return {**_workspace(), "viewer": actor}
 
 
@@ -155,10 +160,13 @@ def build(force: bool = False, x_ingest_token: str | None = Header(default=None)
 
 
 @router.post("/daily")
-def daily_review(x_ingest_token: str | None = Header(default=None)) -> dict:
+def daily_review(x_ingest_token: str | None = Header(default=None),
+                 pipeline_sync_run_id: UUID | None = None) -> dict:
     """Daily scheduler entry point; never builds or sends a second email brief."""
     enabled()
     require_token(x_ingest_token)
+    if pipeline_sync_run_id is not None:
+        require_fresh_pipeline(pipeline_sync_run_id)
     _daily_ready()
     return _build()
 
@@ -190,7 +198,8 @@ def demo() -> FileResponse:
 
 
 @publish_router.post("/publish")
-def publish(version: Literal["v1", "v2"] = "v2", x_ingest_token: str | None = Header(default=None)) -> dict:
+def publish(version: Literal["v1", "v2"] = "v2", x_ingest_token: str | None = Header(default=None),
+            pipeline_sync_run_id: UUID | None = None) -> dict:
     """n8n calls after daily succeeds. Build brief and review queue independently in parallel.
 
     This returns email content; n8n still sends the email. Repeated calls build another
@@ -198,10 +207,13 @@ def publish(version: Literal["v1", "v2"] = "v2", x_ingest_token: str | None = He
     """
     enabled()
     require_token(x_ingest_token)
+    if pipeline_sync_run_id is not None:
+        require_fresh_pipeline(pipeline_sync_run_id)
     _daily_ready()
     result = {}
+    pipeline_args = {"pipeline_sync_run_id": pipeline_sync_run_id} if pipeline_sync_run_id is not None else {}
     with ThreadPoolExecutor(max_workers=2) as pool:
-        tasks = {"brief": pool.submit(brief_api.build_brief, False, version, x_ingest_token),
+        tasks = {"brief": pool.submit(brief_api.build_brief, False, version, x_ingest_token, **pipeline_args),
                  "review": pool.submit(_build)}
         for name, future in tasks.items():
             try:

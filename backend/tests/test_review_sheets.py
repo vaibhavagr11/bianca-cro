@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from pydantic import SecretStr
 
-from app.review_sheets import SheetConflict, SheetError, SheetsClient, SheetWriteUncertain
+from app.review_sheets import SheetConflict, SheetError, SheetsClient, SheetWorkingClient, SheetWriteUncertain
 
 
 class Credentials:
@@ -124,6 +124,32 @@ def test_empty_old_next_step_replaces_last_progress_with_empty_text():
 def test_retry_after_success_does_not_write_or_rotate_again():
     api, transport = client(document(rows=[["Campari", "RG", "Previous next step", "- Approved update", "4. Pilot"]]))
     assert approve(api).last_progress == "Previous next step"
+    assert [c[0] for c in transport.calls] == ["GET"]
+
+
+def test_working_client_cannot_write_even_with_unchanged_reviewed_cells():
+    api, transport = client()
+    assert api.read_company("Campari").status == "4. Pilot"
+    transport.data["sheets"][0]["data"][0]["rowData"][1]["values"][4] = cell("5. Working client")
+    with pytest.raises(SheetWorkingClient):
+        approve(api)
+    assert [c[0] for c in transport.calls] == ["GET", "GET"]
+
+
+def test_working_client_retry_only_recognizes_already_applied_values():
+    api, transport = client(document(rows=[["Campari", "RG", "Previous next step", "- Approved update", "5. Working client"]]))
+    with pytest.raises(SheetWorkingClient):
+        approve(api)
+    assert approve(api, recovering=True).next_step == "- Approved update"
+    assert [c[0] for c in transport.calls] == ["GET", "GET"]
+
+
+def test_live_statuses_read_once_and_exclude_ambiguous_rows():
+    api, transport = client(document(headers=[" Status ", "Empresa"], rows=[
+        ["4. Pilot", "One"], ["5. Working client", "Cámpári"], ["2. In Talks", "Another"],
+        ["2. In Talks", " campari "], ["2. In Talks", ""],
+    ]))
+    assert api.read_company_statuses() == {"one": "4. Pilot", "another": "2. In Talks", "campari": None}
     assert [c[0] for c in transport.calls] == ["GET"]
 
 
@@ -259,8 +285,8 @@ def test_completed_three_cell_retry_does_not_append_or_rotate_again():
 
 
 def test_moved_context_column_is_resolved_case_insensitively():
-    api, transport = client(document(headers=[" CLIENT CONTEXT ", "Next Step", "Empresa", "LAST PROGRESS"],
-                                     rows=[["Keep original", "Previous next step", "Campari", "Old progress"]]))
+    api, transport = client(document(headers=[" CLIENT CONTEXT ", "Next Step", "Empresa", "LAST PROGRESS", "Status"],
+                                     rows=[["Keep original", "Previous next step", "Campari", "Old progress", "4. Pilot"]]))
     row = approve(api, expected_client_context="Keep original", new_client_context="- Approved client context")
     assert (row.client_context_col, row.next_step_col, row.last_progress_col) == (0, 1, 3)
     assert row.client_context == "- Approved client context"
@@ -287,6 +313,17 @@ def test_missing_client_context_header_is_not_silently_ignored():
     with pytest.raises(SheetConflict, match="Client Context"):
         approve(api)
     assert all(call[0] == "GET" for call in transport.calls)
+
+
+def test_missing_or_duplicate_status_header_fails_closed():
+    for headers in (["Empresa", "Last progress", "Next step", "Client Context"],
+                    ["Empresa", "Last progress", "Next step", "Client Context", "Status", "STATUS"]):
+        api, transport = client(document(headers=headers))
+        with pytest.raises(SheetConflict, match="Status"):
+            approve(api)
+        with pytest.raises(SheetConflict, match="Status"):
+            api.read_company_statuses()
+        assert [c[0] for c in transport.calls] == ["GET", "GET"]
 
 
 @pytest.mark.parametrize("context", [

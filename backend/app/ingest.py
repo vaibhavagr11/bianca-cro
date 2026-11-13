@@ -68,6 +68,11 @@ def _start_sync(conn, workspace_id, source: str, payload: FeedPayload, received:
         raise HTTPException(status_code=422, detail="mailbox is required for a mail or calendar receipt")
     feed = f"{source}:{mailbox.strip().upper()}" if mailbox else source
     if payload.sync_batch_id is None:
+        if source == "pipeline" and payload.coverage_complete:
+            return conn.execute(
+                "insert into sync_runs (workspace_id, source, rows_received, coverage_complete)"
+                " values (%s, %s, %s, true) returning id", (workspace_id, source, received),
+            ).fetchone()[0]
         return conn.execute(
             "insert into sync_runs (workspace_id, source, rows_received) values (%s, %s, %s) returning id",
             (workspace_id, source, received),

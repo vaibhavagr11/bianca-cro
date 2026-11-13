@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
+import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -17,7 +18,7 @@ SALES_ASK = "Send the signed pricing terms"
 
 def deal(key: str) -> dict:
     return {"id": f"{key}-opportunity", "company_id": key, "name": key,
-            "stage": "2. In Talks", "stage_rank": 2, "owner_code": "RG"}
+            "stage": "2. In Talks", "stage_rank": 2, "owner_code": "RG", "removed_at": None}
 
 
 def email(key: str, company: str, body: str, *, days: int = 2, outgoing: bool = False,
@@ -55,11 +56,13 @@ class Result(list):
 
 
 class BriefData:
-    def __init__(self, deals, messages, insights, profiles):
+    def __init__(self, deals, messages, insights, profiles, *, meetings=(), changes=()):
         self.deals = deals
         self.messages = messages
         self.insights = insights
         self.profiles = profiles
+        self.meetings = meetings
+        self.changes = changes
 
     def execute(self, query, params=()):
         if "from workspaces" in query:
@@ -75,12 +78,17 @@ class BriefData:
             return Result(self.deals)
         if "from insights i" in query:
             return Result() if "count(*)" in query else Result(self.insights)
-        if "from opportunity_changes" in query or "from sync_runs" in query or "source = 'calendar'" in query:
+        if "from opportunity_changes" in query:
+            return Result(self.changes)
+        if "source = 'calendar'" in query:
+            cancelled = "and meta->>'status' = 'cancelled'" in query
+            return Result(m for m in self.meetings if (m["meta"]["status"] == "cancelled") == cancelled)
+        if "from sync_runs" in query:
             return Result()
         if "max(occurred_at) as last" in query:
             return Result([{"company_id": d["company_id"], "last": NOW - timedelta(days=2)} for d in self.deals])
         if "created_at >" in query or "occurred_at > %s" in query:
-            return Result()  # The fixture has no source records in the current change window.
+            return Result(m for m in self.messages if m["occurred_at"] > params[1])
         if "from source_records" in query and "source = 'gmail'" in query:
             if "distinct on (thread_id)" in query:
                 latest = {}
@@ -95,17 +103,27 @@ class BriefData:
         raise AssertionError(f"Unexpected query: {query}")
 
 
-def brief_client(monkeypatch, data):
-    monkeypatch.setattr(brief_api.db, "connect", lambda: nullcontext(data))
+@pytest.fixture
+def brief_client(monkeypatch):
     monkeypatch.setattr(brief_api.timeline, "utcnow", lambda: NOW)
     monkeypatch.setattr(brief_api.actions, "latest", lambda *_: {})
     monkeypatch.setattr(brief_api, "_workspace_id", lambda _: "workspace")
     monkeypatch.setattr(brief_api, "_claude", lambda: None)
-    return TestClient(app)
+
+    def unavailable_plan(*_):
+        raise ValueError("Simulate the planner being unavailable")
+
+    monkeypatch.setattr(brief_api.brief, "plan_for", unavailable_plan)
+
+    def client_for(data):
+        monkeypatch.setattr(brief_api.db, "connect", lambda: nullcontext(data))
+        return TestClient(app)
+
+    return client_for
 
 
 @pytest.fixture
-def scoped_brief(monkeypatch):
+def scoped_brief(brief_client):
     inbound = email("mixed-email", "mixed", f"Can you {SALES_ASK.lower()}? Please fix the sales dashboard.")
     old_quote = "Could you send the renewal proposal?"
     old = email("old-email", "repeat", old_quote, days=6, thread="repeat-thread")
@@ -150,11 +168,7 @@ def scoped_brief(monkeypatch):
     ]
     deals = [deal(key) for key in ("mixed", "repeat", "sales-wait", "support-wait", "unscoped")]
     deals.append({**deal("renewal"), "stage": "5. Working Client", "stage_rank": 5})
-    def unavailable_plan(*_):
-        raise ValueError("Simulate the planner being unavailable")
-
-    monkeypatch.setattr(brief_api.brief, "plan_for", unavailable_plan)
-    return brief_client(monkeypatch, BriefData(deals, messages, insights, profiles))
+    return brief_client(BriefData(deals, messages, insights, profiles))
 
 
 @pytest.mark.parametrize("version", ["v1", "v2"])
@@ -167,8 +181,7 @@ def test_brief_requires_sales_scope_for_stored_actions_and_exact_email_asks(scop
     assert "Share the pricing deck" in html
     assert "Send the pilot terms" in html
     assert SALES_ASK in html
-    # Customer-account suggestions only appear in v1: master removed v2's Customer accounts section.
-    assert ("Confirm the renewal decision date" in html) == (version == "v1")
+    assert "Confirm the renewal decision date" not in html
     assert "Fix the sales dashboard" not in html
     assert "Refactor the analytics exporter" not in html
     assert "Repair the data connector" not in html
@@ -188,10 +201,66 @@ def test_brief_requires_sales_scope_for_stored_actions_and_exact_email_asks(scop
         assert f"{NOW:%b} {NOW.day}" not in ask_row
 
 
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_brief_excludes_working_clients_after_sheet_status_changes(brief_client, version):
+    working = deal("Existing Account") | {"stage": "4. Pilot", "stage_rank": 4}
+    pilot = deal("Sales Pilot") | {"stage": "4. Pilot", "stage_rank": 4}
+    work_text = "Send the operational delivery report"
+    pilot_text = "Send the pilot acceptance terms"
+    insights = [
+        insight("working-promise", working["company_id"], work_text, SALES),
+        insight("pilot-promise", pilot["company_id"], pilot_text, SALES),
+    ]
+
+    def calendar(title, company, *, rules_company=None, status="confirmed"):
+        return {"id": title, "subject": title, "company_id": company, "rules_company_id": rules_company,
+                "occurred_at": NOW + timedelta(hours=2),
+                "participants": {"attendees": [{"address": "ramiro@bianca.example"}]}, "meta": {"status": status}}
+
+    meetings = [
+        calendar("Delivery check-in", working["company_id"]),
+        calendar("Rescheduled implementation workshop", None, rules_company=working["company_id"]),
+        calendar("Onboarding review called off", None, rules_company=working["company_id"], status="cancelled"),
+        calendar("Pilot scoping call", pilot["company_id"]),
+        calendar("Partner discussion", None),
+    ]
+    messages = [email("Operations agenda", working["company_id"], "We have an update for the operations team.", days=0)]
+    changes = [{"company_id": pilot["company_id"], "name": pilot["name"], "owner_code": "RG",
+                "field": "stage", "old_value": "3. Proposal", "new_value": "4. Pilot", "sync_run_id": "sync"}]
+    data = BriefData([working, pilot], messages, insights, [], meetings=meetings, changes=changes)
+    client = brief_client(data)
+
+    def build():
+        response = client.post(f"/brief/build?dry_run=true&version={version}", headers={"X-Ingest-Token": "test-token"})
+        assert response.status_code == 200
+        return response.json()
+
+    before = build()
+    for text in (working["name"], work_text, "Delivery check-in", "Rescheduled implementation workshop",
+                 "Operations agenda", pilot_text, "Pilot scoping call", "Partner discussion"):
+        assert text in before["html"]
+    if version == "v1":
+        assert "Onboarding review called off" in before["html"]
+
+    working.update(stage=" 5.  WORKING CLIENTS ", stage_rank=5)
+    changes.insert(0, {"company_id": working["company_id"], "name": working["name"], "owner_code": "RG",
+                       "field": "stage", "old_value": "4. Pilot", "new_value": working["stage"],
+                       "sync_run_id": "next-sync"})
+
+    after = build()
+    output = json.dumps(after)
+    for text in (working["name"], work_text, "Delivery check-in", "Rescheduled implementation workshop",
+                 "Onboarding review called off", "Operations agenda", "WORKING CLIENTS", "working-promise"):
+        assert text not in output
+    for text in (pilot_text, "Pilot scoping call", "Partner discussion"):
+        assert text in after["html"] and text in after["text"]
+    assert "3. Proposal" in after["html"]
+
+
 @pytest.mark.parametrize("verification", ["off", "shadow"])
 @pytest.mark.parametrize("customer_commitment", [False, True], ids=["original-ask", "customer-commitment"])
-def test_waiting_on_a_reply_excludes_the_same_action_across_founder_sections(monkeypatch, verification,
-                                                                           customer_commitment):
+def test_waiting_on_a_reply_excludes_the_same_action_across_founder_sections(
+        monkeypatch, brief_client, verification, customer_commitment):
     company = {**deal("buyer"), "owner_code": "NC"}
     quote = "I'll confirm approval." if customer_commitment else "Can you approve the proposal?"
     waiting_action = "Customer to approve the proposal"
@@ -235,7 +304,7 @@ def test_waiting_on_a_reply_excludes_the_same_action_across_founder_sections(mon
             pass
 
     monkeypatch.setattr(brief_api, "create_gate", lambda *_: Gate())
-    client = brief_client(monkeypatch, BriefData([company], [original, latest], insights, profiles))
+    client = brief_client(BriefData([company], [original, latest], insights, profiles))
     response = client.post(f"/brief/build?dry_run=true&version=v2&verification={verification}",
                            headers={"X-Ingest-Token": "test-token"})
     assert response.status_code == 200
@@ -252,7 +321,7 @@ def test_waiting_on_a_reply_excludes_the_same_action_across_founder_sections(mon
         assert all(a.text != duplicate_move for a in checked)
 
 
-def test_waiting_row_beyond_display_cap_does_not_exclude_its_move(monkeypatch):
+def test_waiting_row_beyond_display_cap_does_not_exclude_its_move(monkeypatch, brief_client):
     monkeypatch.setattr(brief_v2, "MAX_WAITING", 1)
     deals, messages, insights, profiles = [], [], [], []
     for name, age in (("visible", 7), ("capped", 8)):
@@ -269,7 +338,7 @@ def test_waiting_row_beyond_display_cap_does_not_exclude_its_move(monkeypatch):
             "refs": {"I1": f"{name}-approval"},
             "recommended_actions": [{"action": action, "evidence": ["I1"], "action_scope": SALES}],
         }})
-    client = brief_client(monkeypatch, BriefData(deals, messages, insights, profiles))
+    client = brief_client(BriefData(deals, messages, insights, profiles))
     response = client.post("/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"})
     assert response.status_code == 200
     founder = response.json()["payload"]["sections"][0]

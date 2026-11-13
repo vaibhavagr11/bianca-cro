@@ -138,8 +138,9 @@ Official references: [Claude connector-backed artifacts](https://code.claude.com
 
 ## n8n: generate the brief and review queue in parallel
 
-Keep the existing four ingestion paths and `/process/daily` loop. After the loop returns both `done=true` and `stage="done"`,
-replace its brief-build call with `POST /process/publish?version=v2`, authenticated with `X-Ingest-Token`.
+Keep the existing four ingestion paths and `/process/daily` loop. Post the full Pipeline snapshot with
+`coverage_complete:true` and retain the returned `sync_run_id`. After processing returns `stage="done"`,
+call `POST /process/publish?version=v2&pipeline_sync_run_id=<uuid>`, authenticated with `X-Ingest-Token`.
 This endpoint independently runs the existing brief builder and the review builder in two workers. It rejects a daily run that
 is absent, incomplete, `timed_out`, or still has pending source records; existing `/process/daily` and `/brief/build` behavior is unchanged.
 
@@ -155,8 +156,8 @@ The response has independent `brief` and `review` results:
 In n8n:
 
 1. Send the email only when `brief.ok` is true, using `brief.result.subject`, `.html`, `.text`, and `.to`.
-2. If `review.ok` is true but `review.result.done` is false, repeat `POST /review/build` until it returns `done=true`.
-3. If one branch fails, retry **that branch only**: `/brief/build?version=v2` or `/review/build`. Repeating `/process/publish`
+2. If `review.ok` is true but `review.result.done` is false, call `POST /review/daily` with the same receipt until it returns `done=true`.
+3. If one branch fails, retry **that branch only** using the same receipt on `/brief/build?version=v2` or `/review/daily`. Repeating `/process/publish`
    builds another brief and advances its history again; do not use it as the retry for a failed review build.
 4. Continue the full Pipeline-sheet sync on its usual schedule; a successful approval also refreshes the backend mirror when
    its reviewed baseline is still current. The mirror now includes Client Context. If `mirror_refreshed=false`, trigger the existing **full** pipeline sync before relying
@@ -165,11 +166,9 @@ In n8n:
 You can choose `version=v1` explicitly if the live email workflow still uses v1. Review generation remains independent.
 No n8n workflow or production email settings are changed merely by committing this branch.
 
-For a dedicated once-daily review check, import [the supplied n8n workflow](../n8n/sales-pipeline-updates-daily.json) and follow
-[its setup instructions](../n8n/README.md). It calls `POST /review/daily`, requires completed upstream processing, and drains batches
-without generating another brief. Its default schedule is 09:00 America/Argentina/Buenos_Aires; set the real workspace timezone,
-backend URL, Header Auth credential, and a time after ingestion before activation. The JSON is inactive by default and contains no secrets.
-The existing daily publisher or this workflow can drive the same date-gated builder; browser Refresh does not run the schedule.
+For a dedicated review branch, import [the supplied n8n subworkflow](../n8n/sales-pipeline-updates-daily.json) and follow
+[its setup instructions](../n8n/README.md). Invoke it with `pipeline_sync_run_id` after ingestion and processing.
+It calls `POST /review/daily` and drains batches without generating another brief.
 
 `POST /review/build?force=true` is an ingest-authenticated manual repair path, not a normal scheduler setting. Approvals do not
 trigger a new build. New same-day arrivals after a completed cycle wait for the next normal daily cycle unless an operator explicitly rebuilds.

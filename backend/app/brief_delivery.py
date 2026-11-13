@@ -15,7 +15,7 @@ from app import brief_verification, db, timeline
 from app.config import settings
 from app.ingest import _workspace_id
 
-CHECKER = "brief-send-v1"
+CHECKER = "brief-send-v2"
 
 
 class VerificationPending(Exception):
@@ -97,9 +97,11 @@ _SNAPSHOT_SQL = ("select md5(coalesce(string_agg(version, ',' order by version),
 
 
 def _snapshot(conn, workspace_id, since) -> str:
-    return conn.cursor(row_factory=dict_row).execute(
+    digest = conn.cursor(row_factory=dict_row).execute(
         _SNAPSHOT_SQL, {"workspace": workspace_id, "since": since},
     ).fetchone()["snapshot"]
+    # A build prepared under earlier eligibility rules can contain rows the current rules exclude.
+    return f"{CHECKER}:{digest}"
 
 
 def _action_digest(actions: list[brief_verification.VerificationAction]) -> str:
@@ -263,6 +265,8 @@ def create_gate(sync_run_ids: list, build_id: UUID | str | None, version: str, d
                           (build_id, workspace_id)).fetchone()
         if run is None or run["sync_batch_id"] != batch_id or run["version"] != version or run["dry_run"] != dry_run:
             _fail("Build ID belongs to another verification request.", build_id)
+        if not run["snapshot"].startswith(f"{CHECKER}:"):
+            _fail("Brief eligibility rules changed. Start a new build against current receipts.", build_id)
         if snapshot != run["snapshot"]:
             _fail("Activity or founder decisions changed. Start a new build.", build_id)
         if run["response"] is not None:

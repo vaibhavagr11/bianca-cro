@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -92,6 +93,26 @@ def test_stale_verification_cannot_release_an_email(monkeypatch):
     with pytest.raises(brief_delivery.VerificationPending) as exc:
         gate.finalize(Cursor([{"response": None}]), {"html": "would have been sent"})
     assert exc.value.response["ready_to_send"] is False
+    assert "html" not in exc.value.response
+
+
+def test_completed_build_from_old_eligibility_rules_cannot_be_replayed(monkeypatch):
+    workspace_id, batch_id, build_id = uuid4(), uuid4(), uuid4()
+    synced = receipt("pipeline")
+    digest = "unchanged-database-snapshot"
+    old_build = {"sync_batch_id": batch_id, "version": "v2", "dry_run": False, "snapshot": digest,
+                 "response": {"ready_to_send": True, "html": "Working Client details"}}
+    cursor = Cursor([[{"sync_batch_id": batch_id}], {"snapshot": digest}, None, old_build])
+    monkeypatch.setattr(brief_delivery.db, "connect", lambda: nullcontext(cursor))
+    monkeypatch.setattr(brief_delivery, "_workspace_id", lambda _: workspace_id)
+    monkeypatch.setattr(brief_delivery, "_batch_receipts", lambda *_: [synced])
+    monkeypatch.setattr(brief_delivery, "_check_processing", lambda *_: None)
+
+    with pytest.raises(brief_delivery.VerificationPending) as exc:
+        brief_delivery.create_gate([synced["id"]], build_id, "v2", False)
+    assert exc.value.response["verification_status"] == "blocked"
+    assert exc.value.response["ready_to_send"] is False
+    assert "eligibility rules changed" in exc.value.response["reason"]
     assert "html" not in exc.value.response
 
 

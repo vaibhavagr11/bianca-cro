@@ -12,7 +12,7 @@ from app.brief_v2 import (
     ChangeRow, DealView, Item, Note, TodayRow, Unanswered, _stage_badge, bucket, build_section, classify_event, completable,
     deal_status, describe_change,
     reply_text, first_sentence, has_request,
-    is_new_insight, item_kind, norm, plain_text, primary_move, render, reply_label, resolve_owner, select_changes, subject,
+    is_new_insight, item_kind, norm, primary_move, render, reply_label, resolve_owner, select_changes, subject,
     to_payload,
 )
 from app.main import app
@@ -108,23 +108,6 @@ def test_dated_customer_request_remains_visible_as_a_request():
     assert not s.today
     assert s.highlights[0][1].tag == "Customer asked"
     assert s.highlights[0][1].when == "requested by Oct 29"
-
-
-def test_working_clients_use_existing_action_sections_without_a_standalone_table():
-    overdue = item("Willow Retail", "Send the overdue report", due=TODAY - timedelta(days=5), id="overdue")
-    due_now = item("Willow Retail", "Confirm today's delivery", due=TODAY, id="today")
-    recommendation = Note("Schedule a routine account review", verified=True)
-    s = section("NC", [view("Willow Retail", 5), view("Birch Retail", 5, recommendation=recommendation)],
-                [overdue, due_now])
-
-    assert [(row.deal, row.item_id) for row in s.today] == [("Willow Retail", "today")]
-    assert [move.item_id for move in s.followups] == ["overdue"]
-    assert to_payload([s], [], [])["sections"][0]["customers"] == []
-    html = render([s], [], [], TODAY, 2, "c", False)
-    assert "Follow-ups that may be needed" in html and overdue.text in html
-    for body in (html, plain_text([s], TODAY)):
-        assert "Customer accounts" not in body
-        assert recommendation.text not in body
 
 
 # ---- stale opportunities and coverage (point 4)

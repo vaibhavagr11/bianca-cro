@@ -18,12 +18,13 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from app.config import settings
-from app.pipeline import normalize_name
+from app.pipeline import is_working_client, normalize_name
 
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 API_ROOT = "https://sheets.googleapis.com/v4/spreadsheets"
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
-REQUIRED_HEADERS = ("empresa", "last progress", "next step", "client context")
+STATUS_HEADERS = ("empresa", "status")
+REQUIRED_HEADERS = (*STATUS_HEADERS, "last progress", "next step", "client context")
 
 
 class SheetError(Exception):
@@ -32,6 +33,10 @@ class SheetError(Exception):
 
 class SheetConflict(SheetError, ValueError):
     """The live row is missing, ambiguous, or different from the reviewed row."""
+
+
+class SheetWorkingClient(SheetConflict):
+    """The status excludes this row from new sales updates."""
 
 
 class SheetWriteUncertain(SheetError):
@@ -49,6 +54,7 @@ class SheetRow:
     next_step_col: int
     client_context: str
     client_context_col: int
+    status: str
 
 
 class _AuthResponse:
@@ -200,18 +206,15 @@ class SheetsClient:
                 raise SheetWriteUncertain("The connection ended before the write was confirmed. Retry the same approval.") from None
             raise SheetError("Could not read the Google Sheet. Check connectivity and try again.") from None
 
-    def read_company(self, company: str) -> SheetRow:
-        """Resolve one current company row using headers and normalized Empresa.
-
-        The full configured tab is read because its columns and rows may move.
-        Existing numeric indices are never trusted on the next approval attempt.
-        """
-        if not isinstance(company, str) or not normalize_name(company):
-            raise SheetConflict("The company name is missing or cannot be matched.")
+    def _read_tab(self, *, review_cells: bool) -> tuple[int, dict[int, dict[int, dict]]]:
+        # Columns and rows can move, so the configured tab is read each time.
+        value_fields = "effectiveValue,formattedValue"
+        if review_cells:
+            value_fields = "userEnteredValue," + value_fields
         tab_range = "'" + self.sheet_tab.replace("'", "''") + "'"
         response = self._request("GET", query={
             "ranges": tab_range,
-            "fields": "sheets(properties(sheetId,title),data(startRow,startColumn,rowData(values(userEnteredValue,effectiveValue,formattedValue))))",
+            "fields": f"sheets(properties(sheetId,title),data(startRow,startColumn,rowData(values({value_fields}))))",
         })
         sheets = [s for s in response.get("sheets", []) if (s.get("properties") or {}).get("title") == self.sheet_tab]
         if len(sheets) != 1:
@@ -228,14 +231,40 @@ class SheetsClient:
                 target = cells.setdefault(offset, {})
                 for col, cell in enumerate(row.get("values", []), start=grid.get("startColumn", 0)):
                     target[col] = cell
+        return sheet_id, cells
+
+    @staticmethod
+    def _columns(cells: dict[int, dict], names: tuple[str, ...]) -> tuple[int, ...]:
         headers: dict[str, list[int]] = {}
-        for col, cell in cells.get(0, {}).items():
+        for col, cell in cells.items():
             headers.setdefault(_display_text(cell).strip().casefold(), []).append(col)
-        if any(len(headers.get(name, [])) != 1 for name in REQUIRED_HEADERS):
-            raise SheetConflict("The first row must contain exactly one Empresa, Last progress, Next step, and Client Context header.")
-        company_col, progress_col, next_col, context_col = (headers[name][0] for name in REQUIRED_HEADERS)
+        if any(len(headers.get(name, [])) != 1 for name in names):
+            required = ", ".join(name.title() for name in names)
+            raise SheetConflict(f"The first row must contain unique headers for {required}.")
+        return tuple(headers[name][0] for name in names)
+
+    def read_company_statuses(self) -> dict[str, str | None]:
+        """Read current status by normalized Empresa. An ambiguous row has no usable status."""
+        _, cells = self._read_tab(review_cells=False)
+        company_col, status_col = self._columns(cells.get(0, {}), STATUS_HEADERS)
+        statuses: dict[str, str | None] = {}
+        for number, row in cells.items():
+            if number == 0:
+                continue
+            name = normalize_name(_display_text(row.get(company_col, {})))
+            if name:
+                statuses[name] = None if name in statuses else _display_text(row.get(status_col, {}))
+        return statuses
+
+    def read_company(self, company: str) -> SheetRow:
+        """Resolve one current company row using headers and normalized Empresa."""
+        key = normalize_name(company) if isinstance(company, str) else ""
+        if not key:
+            raise SheetConflict("The company name is missing or cannot be matched.")
+        sheet_id, cells = self._read_tab(review_cells=True)
+        company_col, status_col, progress_col, next_col, context_col = self._columns(cells.get(0, {}), REQUIRED_HEADERS)
         matches = [(number, row) for number, row in cells.items() if number > 0
-                   and normalize_name(_display_text(row.get(company_col, {}))) == normalize_name(company)]
+                   and normalize_name(_display_text(row.get(company_col, {}))) == key]
         if len(matches) != 1:
             raise SheetConflict("The company must have exactly one matching Empresa row. Refresh the pipeline and resolve duplicates.")
         number, row = matches[0]
@@ -243,11 +272,13 @@ class SheetsClient:
                         last_progress=_review_text(row.get(progress_col, {})),
                         next_step=_review_text(row.get(next_col, {})), row_number=number + 1,
                         sheet_id=sheet_id, last_progress_col=progress_col, next_step_col=next_col,
-                        client_context=_review_text(row.get(context_col, {})), client_context_col=context_col)
+                        client_context=_review_text(row.get(context_col, {})), client_context_col=context_col,
+                        status=_display_text(row.get(status_col, {})))
 
     def apply_update(self, company: str, expected_last_progress: str, expected_next_step: str,
                      new_last_progress: str, new_next_step: str, *,
-                     expected_client_context: str, new_client_context: str) -> SheetRow:
+                     expected_client_context: str, new_client_context: str,
+                     allow_write: bool = True, recovering: bool = False) -> SheetRow:
         """Apply one persisted three-cell plan; retries never rotate or append twice."""
         before = (expected_last_progress, expected_next_step, expected_client_context)
         after = (new_last_progress, new_next_step, new_client_context)
@@ -258,6 +289,8 @@ class SheetsClient:
             raise SheetError("An approved cell exceeds Google's 50,000-character limit. Shorten the update.")
         row = self.read_company(company)
         current = (row.last_progress, row.next_step, row.client_context)
+        if (not allow_write or is_working_client(row.status)) and not (recovering and current == after):
+            raise SheetWorkingClient("This update is outside the sales pipeline.")
         if current == after:
             return row
         if current != before:

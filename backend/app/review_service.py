@@ -19,8 +19,8 @@ from psycopg.errors import UniqueViolation
 
 from app import db
 from app.config import settings
-from app.pipeline import PipelineRow, TRACKED_FIELDS, normalize_name
-from app.review_sheets import SheetsClient, SheetConflict, SheetError, SheetWriteUncertain
+from app.pipeline import PipelineRow, TRACKED_FIELDS, is_working_client, normalize_name
+from app.review_sheets import SheetsClient, SheetConflict, SheetError, SheetWorkingClient, SheetWriteUncertain
 from app.review_content import Content, approved_lineage, proposal_content, source_version, validate_lineage
 
 
@@ -44,6 +44,7 @@ MAX_CELL_CHARS = 45_000
 ROUTING_VERSION = 1
 ACTION_TYPES = {"commitment", "next_step", "blocker"}
 CONTEXT_TYPES = {"need", "buying_signal", "objection"}
+OUTSIDE_SALES_PIPELINE = "This update is outside the sales pipeline."
 
 
 def _json(value: Any) -> str:
@@ -213,6 +214,14 @@ def build_proposals(conn, workspace_id, *, force: bool = False) -> dict:
         existing = conn.execute(
             "select * from review_proposals where workspace_id = %s and company_id = %s"
             " and status in ('pending', 'applying') for update", (workspace_id, deal["company_id"])).fetchone()
+        if is_working_client(deal["stage"]):
+            if existing and existing["status"] == "pending":
+                if counts["created"] + counts["updated"] >= limit:
+                    counts["remaining"] += 1
+                    continue
+                _supersede_pending(conn, existing["id"])
+                counts["updated"] += 1
+            continue
         if existing and existing["status"] == "applying":
             counts["applying"] += 1
             continue
@@ -245,8 +254,7 @@ def build_proposals(conn, workspace_id, *, force: bool = False) -> dict:
             counts["remaining"] += 1
             continue
         if not (next_steps or context):
-            conn.execute("update review_proposals set status = 'superseded', revision = revision + 1"
-                         " where id = %s and status = 'pending'", (existing["id"],))
+            _supersede_pending(conn, existing["id"])
             counts["updated"] += 1
             continue
         if existing:
@@ -280,6 +288,11 @@ def build_proposals(conn, workspace_id, *, force: bool = False) -> dict:
     return {**counts, "done": done, "skipped": False, **_cycle_info(state)}
 
 
+def _supersede_pending(conn, proposal_id) -> None:
+    conn.execute("update review_proposals set status = 'superseded', revision = revision + 1"
+                 " where id = %s and status = 'pending'", (proposal_id,))
+
+
 def _activity(row: dict, company: str) -> dict:
     return {"id": str(row["id"]), "proposalId": str(row["proposal_id"]), "company": company,
             "kind": "approved" if row["action"] == "approve" else "ignored", "edited": row["edited"],
@@ -292,11 +305,24 @@ def _activity(row: dict, company: str) -> dict:
 
 def workspace_view(conn, workspace_id) -> dict:
     conn.row_factory = dict_row
+    try:
+        statuses = SheetsClient().read_company_statuses()
+    except SheetError as exc:
+        raise ReviewUnavailable("Current sales status could not be confirmed from the Sheet. Refresh to try again.") from exc
+    live_sales = {name for name, stage in statuses.items() if stage is not None and not is_working_client(stage)}
+    eligible = [r for r in conn.execute(
+        "select o.*, c.name, c.normalized_name, (select count(*) from review_proposals p where p.workspace_id = o.workspace_id"
+        " and p.opportunity_id = o.id and p.status = 'approved') as approved from opportunities o"
+        " join companies c on c.id = o.company_id where o.workspace_id = %s"
+        " and (c.normalized_name = any(%s) or (o.removed_at is not null and c.normalized_name <> all(%s)))"
+        " order by c.name", (workspace_id, sorted(live_sales), sorted(statuses))) if not is_working_client(r["stage"])]
+    eligible_ids = [r["id"] for r in eligible if r["normalized_name"] in live_sales]
+    historical_ids = [r["id"] for r in eligible]
     proposals = []
     for row in conn.execute(
             "select p.* from review_proposals p join opportunities o on o.id = p.opportunity_id"
-            " where p.workspace_id = %s and p.status in ('pending', 'applying')"
-            " and (o.removed_at is null or p.status = 'applying') order by p.company_name", (workspace_id,)):
+            " where p.workspace_id = %s and p.opportunity_id = any(%s) and p.status in ('pending', 'applying')"
+            " and (o.removed_at is null or p.status = 'applying') order by p.company_name", (workspace_id, eligible_ids)):
         item = _proposal_data(row)
         if row["status"] == "applying":
             intent = conn.execute(
@@ -325,15 +351,11 @@ def workspace_view(conn, workspace_id) -> dict:
     rows = [{"id": str(r["id"]), "company": r["name"], "owner": r["owner_code"] or "", "stage": r["stage"] or "",
              "lastProgress": _cell(r["last_progress"]), "nextStep": _cell(r["next_step"]),
              "clientContext": _cell(r.get("client_context")), "revision": r["approved"],
-             "lastSyncedAt": _stamp(r.get("last_seen_at"))}
-            for r in conn.execute(
-                "select o.*, c.name, (select count(*) from review_proposals p where p.workspace_id = o.workspace_id"
-                " and p.opportunity_id = o.id and p.status = 'approved') as approved from opportunities o"
-                " join companies c on c.id = o.company_id where o.workspace_id = %s and o.removed_at is null"
-                " order by c.name", (workspace_id,))]
+             "lastSyncedAt": _stamp(r.get("last_seen_at"))} for r in eligible if r["removed_at"] is None]
     activity = [_activity(r, r["company_name"]) for r in conn.execute(
         "select d.*, p.company_name from review_decisions d join review_proposals p on p.id = d.proposal_id"
-        " where d.workspace_id = %s and d.status = 'succeeded' order by d.completed_at desc limit 200", (workspace_id,))]
+        " where d.workspace_id = %s and p.opportunity_id = any(%s) and d.status = 'succeeded'"
+        " order by d.completed_at desc limit 200", (workspace_id, historical_ids))]
     return {"proposals": proposals, "rows": rows, "activity": activity,
             "routingVersion": ROUTING_VERSION, "clientContextMode": settings.review_client_context_mode,
             "owners": [{"code": "RG", "name": "Ramiro"}, {"code": "NC", "name": "Nico"}, {"code": "NDL", "name": "Nico"}]}
@@ -440,14 +462,24 @@ def _require_current_content(conn, workspace_id, proposal: dict) -> None:
         raise ReviewConflict("The sales evidence changed since this card was generated. Refresh the review queue before deciding.")
 
 
+def _require_live_sales_status(sheets: SheetsClient, company: str) -> None:
+    status = sheets.read_company_statuses().get(normalize_name(company))
+    if status is None or is_working_client(status):
+        raise ReviewConflict(OUTSIDE_SALES_PIPELINE)
+
+
 def _prepare(conn, workspace_id, proposal_id: str, actor: str, action: str, revision: int,
              idempotency_key: str, next_step_bullets: list[str] | None,
              client_context_bullets: list[str] | None, sheets: SheetsClient) -> tuple[dict, dict, bool]:
     proposal = conn.execute(
-        "select p.*, o.removed_at from review_proposals p join opportunities o on o.id = p.opportunity_id"
+        "select p.*, o.removed_at, o.stage as current_stage, c.name as current_company_name"
+        " from review_proposals p join opportunities o on o.id = p.opportunity_id join companies c on c.id = o.company_id"
         " where p.workspace_id = %s and p.id::text = %s for update of p", (workspace_id, proposal_id)).fetchone()
     if not proposal:
         raise ReviewNotFound("This company update was not found.")
+    excluded = is_working_client(proposal["current_stage"])
+    if excluded and proposal["status"] != "applying":
+        raise ReviewConflict(OUTSIDE_SALES_PIPELINE)
     if proposal.get("routing_version") != ROUTING_VERSION:
         raise ReviewConflict("This proposal predates column routing. Rebuild pending proposals; reconcile legacy applying approvals before retrying.")
     next_steps: list[str] = []
@@ -469,6 +501,7 @@ def _prepare(conn, workspace_id, proposal_id: str, actor: str, action: str, revi
         if str(intent["proposal_id"]) != str(proposal["id"]) or intent["request_hash"] != request_hash:
             raise ReviewConflict("This approval key belongs to a different decision. Reload the review queue.")
         if intent["status"] == "succeeded":
+            _require_live_sales_status(sheets, proposal["current_company_name"])
             return proposal, intent, True
         if intent["status"] != "applying" or proposal["status"] != "applying":
             raise ReviewConflict("This attempt could not be applied. Resync the Pipeline sheet and reload before approving again.")
@@ -494,7 +527,9 @@ def _prepare(conn, workspace_id, proposal_id: str, actor: str, action: str, revi
         target = _sheet_target()
         if not _target_is_pinned(target):
             raise ReviewUnavailable("Pin REVIEW_SPREADSHEET_ID, REVIEW_SHEET_TAB, and a numeric REVIEW_SHEET_ID before approving.")
-        live = sheets.read_company(proposal["company_name"])
+        live = sheets.read_company(proposal["current_company_name"])
+        if is_working_client(live.status):
+            raise ReviewConflict(OUTSIDE_SALES_PIPELINE)
         exact_live = _cells(live.last_progress, live.next_step, live.client_context)
         if not _same_cells(before, exact_live):
             raise ReviewConflict("The Sheet row changed since this card was generated. Resync the Pipeline sheet and reload before approving.")
@@ -507,6 +542,8 @@ def _prepare(conn, workspace_id, proposal_id: str, actor: str, action: str, revi
                                       else "\n".join("- " + b for b in context))
         if context and len(after["clientContext"]) > 50_000:
             raise ValueError("The resulting Client Context exceeds one Sheet cell. Shorten the context or update the existing cell first.")
+    else:
+        _require_live_sales_status(sheets, proposal["current_company_name"])
     decision_lineage = approved_lineage(proposal, next_steps, context) if action == "approve" else {"nextStep": [], "clientContext": []}
     edited = action == "approve" and (next_steps != proposal["next_step_bullets"] or context != proposal["client_context_bullets"])
     intent = conn.execute(
@@ -540,7 +577,7 @@ def _record_error(conn, proposal: dict, intent: dict, message: str, *, conflict:
 
 
 class _LazySheets:
-    """A completed idempotent retry or Ignore works even while Google credentials are unavailable."""
+    """Validate stored decisions before opening the live Sheet."""
 
     def __init__(self):
         self.client = None
@@ -552,6 +589,9 @@ class _LazySheets:
 
     def read_company(self, *args):
         return self._get().read_company(*args)
+
+    def read_company_statuses(self):
+        return self._get().read_company_statuses()
 
     def apply_update(self, *args, **kwargs):
         return self._get().apply_update(*args, **kwargs)
@@ -574,7 +614,7 @@ def decide(workspace_id, proposal_id: str, actor: str, action: str, revision: in
         conn.commit()
         if not locked:
             raise ReviewConflict("This update is already being processed. Retry after it finishes.")
-        sheets = _LazySheets() if action == "approve" else None
+        sheets = _LazySheets()
         try:
             proposal, intent, finished = _prepare(conn, workspace_id, proposal_id, actor, action, revision,
                                                   idempotency_key, next_step_bullets, client_context_bullets, sheets)
@@ -593,10 +633,15 @@ def decide(workspace_id, proposal_id: str, actor: str, action: str, revision: in
             "update review_decisions set write_attempts = write_attempts + 1 where id = %s returning *",
             (intent["id"],)).fetchone()
         conn.commit()  # A process interruption after this point may follow an accepted Google write.
+        excluded = is_working_client(proposal["current_stage"])
         try:
-            sheets.apply_update(proposal["company_name"], before["lastProgress"], before["nextStep"],
-                                after["lastProgress"], after["nextStep"],
-                                expected_client_context=before["clientContext"], new_client_context=after["clientContext"])
+            live = sheets.apply_update(proposal["current_company_name"], before["lastProgress"], before["nextStep"],
+                                       after["lastProgress"], after["nextStep"],
+                                       expected_client_context=before["clientContext"], new_client_context=after["clientContext"],
+                                       allow_write=not excluded, recovering=bool(prior_attempts))
+        except SheetWorkingClient as exc:
+            _record_error(conn, proposal, intent, OUTSIDE_SALES_PIPELINE, conflict=not prior_attempts)
+            raise ReviewConflict(OUTSIDE_SALES_PIPELINE) from exc
         except SheetConflict as exc:
             if prior_attempts:
                 message = ("A previous Sheet write is unconfirmed and the row has changed. Keep this saved approval; "
@@ -632,4 +677,6 @@ def decide(workspace_id, proposal_id: str, actor: str, action: str, revision: in
             conn.rollback()
             # The earlier committed intent remains applying. A retry recognizes Google's exact after-values.
             raise ReviewUnavailable("The Sheet write needs confirmation. Retry the saved approval to finish recording it.") from exc
+        if excluded or is_working_client(live.status):
+            raise ReviewConflict(OUTSIDE_SALES_PIPELINE)
         return _result(intent, proposal, mirror_refreshed)
