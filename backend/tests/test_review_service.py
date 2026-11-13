@@ -855,7 +855,7 @@ def test_unpinned_sheet_target_blocks_new_approvals_before_google_or_intent(serv
     assert not sheets.calls
 
 
-def test_workspace_recovery_exposes_exact_split_payload_and_not_legacy_or_redirected_retry(service):
+def test_workspace_recovery_exposes_exact_split_payload_and_not_legacy_or_redirected_retry(service, monkeypatch):
     store, sheets = service
     sheets.uncertain = True
     with pytest.raises(review.ReviewUnavailable):
@@ -890,6 +890,18 @@ def test_workspace_recovery_exposes_exact_split_payload_and_not_legacy_or_redire
     assert "bullets" not in proposal_view
     assert view["routingVersion"] == 1
     assert view["clientContextMode"] == "append"
+    assert view["sheetUrl"] == (
+        "https://docs.google.com/spreadsheets/d/14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw/edit"
+        "?gid=1869050409#gid=1869050409"
+    )
+    with monkeypatch.context() as config:
+        config.setattr(review.settings, "review_spreadsheet_id", "production-sheet")
+        config.setattr(review.settings, "review_sheet_id", 0)
+        assert review.workspace_view(WorkspaceConnection(), WORKSPACE)["sheetUrl"] == (
+            "https://docs.google.com/spreadsheets/d/production-sheet/edit?gid=0#gid=0"
+        )
+        config.setattr(review.settings, "review_sheet_id", None)
+        assert review.workspace_view(WorkspaceConnection(), WORKSPACE)["sheetUrl"] is None
     store.data["intents"][0]["sheet_target"]["sheet_id"] = 999
     redirected = review.workspace_view(WorkspaceConnection(), WORKSPACE)["proposals"][0]
     assert "retry" not in redirected
