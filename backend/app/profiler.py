@@ -46,6 +46,7 @@ class Action(BaseModel):
     urgency: Literal["high", "medium", "low"]
     evidence: list[str]
     action_scope: ActionScope = Field(default="out_of_scope", description="Scope of the suggested action itself.")
+    followup_only: bool = Field(default=False, description="True if Bianca would only nudge or re-ask for a pending reply.")
 
 
 class Profile(BaseModel):
@@ -85,6 +86,8 @@ Rules:
   only when the suggestion itself serves that purpose and cites deal_progression insights. The customer's own
   sales operations, routine delivery, and support stay out, even if cited in a sales conversation. Do not turn
   a request or idea into an agreement, infer a deadline or assignee, or suggest repeating completed work.
+  Set followup_only to true for a check-in, reminder, or repeated ask that just chases a pending response.
+  Use false if Bianca also has a concrete new step, such as sending revised terms or preparing the pilot plan.
 - A blocker is commercially relevant when the evidence shows what Bianca deal decision or step it prevents.
   A support issue alone does not establish a commercial blocker.
 - unknowns: list what matters for closing or growing the deal that the evidence does not say.
