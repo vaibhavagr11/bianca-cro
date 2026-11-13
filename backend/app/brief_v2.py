@@ -23,7 +23,7 @@ UNCLEAR_DAYS = 45           # 15..45 days = status unclear (confirm); older = do
 REPLY_DAYS = 7              # customer email this recent with an extracted sales ask = reply needed
 PROPOSAL_FOLLOWUP_DAYS = (7, 30)   # our proposal with no reply after this many days = follow-up may be needed
 UNDATED_WINDOW_DAYS = 45
-MAX_HIGHLIGHTS, MAX_FOLLOWUPS, MAX_EXCEPTIONS, MAX_NAMES = 4, 3, 1, 3
+MAX_HIGHLIGHTS, MAX_FOLLOWUPS, MAX_EXCEPTIONS, MAX_NAMES = 6, 3, 1, 3
 MAX_WAITING = 6
 IN_TALKS_RANK = 2
 REQUEST_FRESH_DAYS = 21       # a customer request this recent still counts as outstanding
@@ -963,7 +963,7 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, 
                        + done_td(r.done) + "</tr>"
                        for r in s.today]) if s.today else _empty("Nothing due now or waiting on your reply."))
 
-    out.append(_h("Deals to move · prospects & pilots", PURPLE, len(s.highlights)))
+    out.append(_h("Deals to Move", PURPLE))
     if s.highlights:
         rows = []
         for v, m, sit in s.highlights:
@@ -1094,7 +1094,7 @@ def plain_text(sections: list[Section], today: date, ndl_review: VerificationNot
     for s in sections:
         lines.append(f"\n{s.name.upper()}\nNeeds you today ({len(s.today)})")
         lines += [f"• [{r.tag}] {r.deal} — {display(_what_text(r))} ({r.when})" for r in s.today]
-        lines.append(f"Deals to move ({len(s.highlights)})")
+        lines.append("Deals to Move")
         lines += [f"• {v.deal} ({stage_short(v.stage)}): [{m.tag}] {display(_move_text(m))} ({m.when})"
                   for v, m, _ in s.highlights]
         if s.waiting:
