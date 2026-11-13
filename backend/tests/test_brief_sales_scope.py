@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
+import html
 import json
 
 import pytest
@@ -321,7 +322,7 @@ def test_waiting_on_a_reply_excludes_the_same_action_across_founder_sections(
         assert all(a.text != duplicate_move for a in checked)
 
 
-def test_waiting_row_beyond_display_cap_does_not_exclude_its_move(monkeypatch, brief_client):
+def test_waiting_row_beyond_display_cap_stays_out_of_highlights_and_followups(monkeypatch, brief_client):
     monkeypatch.setattr(brief_v2, "MAX_WAITING", 1)
     deals, messages, insights, profiles = [], [], [], []
     for name, age in (("visible", 7), ("capped", 8)):
@@ -336,14 +337,58 @@ def test_waiting_row_beyond_display_cap_does_not_exclude_its_move(monkeypatch, b
                                 owner_side="customer", dated=False))
         profiles.append({"opportunity_id": company["id"], "generated_at": NOW, "profile": {
             "refs": {"I1": f"{name}-approval"},
-            "recommended_actions": [{"action": action, "evidence": ["I1"], "action_scope": SALES}],
+            "recommended_actions": [
+                {"action": f"Follow up on the {name} proposal approval", "evidence": ["I1"], "action_scope": SALES},
+            ],
         }})
     client = brief_client(BriefData(deals, messages, insights, profiles))
     response = client.post("/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"})
     assert response.status_code == 200
-    founder = response.json()["payload"]["sections"][0]
+    result = response.json()
+    founder = result["payload"]["sections"][0]
     assert [w["deal"] for w in founder["waiting"]] == ["visible"]
     assert founder["more_waiting"] == 1
-    assert [(h["deal"], h["move"]["text"]) for h in founder["highlights"]] == [
-        ("capped", "Customer to approve the capped proposal"),
-    ]
+    assert not founder["highlights"]
+    assert not founder["followups"]
+    for body in (result["html"], result["text"]):
+        assert "Customer to approve the visible proposal" in body
+        assert "Customer to approve the capped proposal" not in body
+        assert "Follow up on the capped proposal approval" not in body
+
+
+@pytest.mark.parametrize("with_next_move", [False, True], ids=["follow-up-only", "with-next-move"])
+@pytest.mark.parametrize("tagged", [False, True], ids=["legacy-profile", "tagged-profile"])
+def test_profile_followup_stays_out_of_deals_to_move(brief_client, with_next_move, tagged):
+    company = deal("Prospect Co")
+    company_id = company["company_id"]
+    followup = ("See whether the buyer has an answer on last week's proposal." if tagged else
+                "Check in with the buyer on the proposal we sent last week.")
+    next_move = "Send a revised proposal with the requested pricing options."
+    refs = {"I1": "sent-proposal"}
+    recommendations = [{"action": followup, "evidence": ["I1"], "action_scope": SALES}]
+    if tagged:
+        recommendations[0]["followup_only"] = True
+    insights = [insight("sent-proposal", company_id, "The buyer received the proposal last week.", SALES,
+                        type_="buying_signal", dated=False)]
+    if with_next_move:
+        refs["I2"] = "pricing-options"
+        insights.append(insight("pricing-options", company_id, "The buyer asked to compare pricing options.", SALES,
+                                type_="need", dated=False))
+        recommendations.append({"action": next_move, "evidence": ["I2"], "action_scope": SALES})
+    profiles = [{"opportunity_id": company["id"], "generated_at": NOW, "profile": {
+        "refs": refs, "recommended_actions": recommendations,
+    }}]
+    client = brief_client(BriefData([company], [], insights, profiles))
+    response = client.post("/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"})
+    assert response.status_code == 200
+    result = response.json()
+    founder = result["payload"]["sections"][0]
+    assert [h["move"]["text"] for h in founder["highlights"]] == ([next_move] if with_next_move else [])
+    assert len(founder["followups"]) == 1
+    assert founder["followups"][0]["tag"] == "Follow up"
+    assert followup in founder["followups"][0]["text"]
+    assert not founder["waiting"]
+    for body, wording in ((result["html"], html.escape(followup)), (result["text"], followup)):
+        assert body.count(wording) == 1
+        assert body.index("Follow-ups that may be needed") < body.index(wording)
+        assert (next_move in body) == with_next_move

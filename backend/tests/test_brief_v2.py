@@ -56,12 +56,42 @@ def test_item_kind_separates_promises_requests_proposals_and_notes():
     assert item_kind("next_step", None, "notes", "Armar mapa de zonas") == "next_step"
 
 
-def test_proposal_is_never_shown_as_we_owe_and_becomes_a_follow_up_without_reply():
-    p = item("Arca Peru", "Bianca proposed reconnecting with Renzo", recorded=TODAY - timedelta(days=21),
-             deal_owner="RG", kind="proposed")
-    v = view("Arca Peru", 2, owner="RG", last=TODAY - timedelta(days=21), items=[p])
-    m = primary_move(v, TODAY, set())
-    assert m.tag == "Follow up" and m.text.startswith("No reply since we proposed")
+@pytest.mark.parametrize("days", [9, 21])
+def test_unanswered_proposal_without_a_waiting_row_only_appears_in_followups(days):
+    sent = TODAY - timedelta(days=days)
+    proposal = item("Arca Peru", "Bianca proposed reconnecting with Renzo", recorded=sent,
+                    deal_owner="RG", id="proposal", kind="proposed")
+    v = view(proposal.deal, 2, owner="RG", last=sent)
+
+    s = section("RG", [v], [proposal])
+
+    assert not s.waiting and not s.highlights
+    move, = s.followups
+    assert move.tag == "Follow up" and proposal.text in move.text
+    assert move.done == "insight:proposal"
+
+
+def test_followup_only_proposals_leave_slots_for_deals_with_concrete_moves():
+    proposals = [
+        item("FEMSA MX", "Ask which commercial questions they want to answer", recorded=TODAY - timedelta(days=8),
+             deal_owner="RG", id="femsa-ask", kind="proposed"),
+        item("CCU Chile", "Ask for a date to show recent progress", recorded=TODAY - timedelta(days=9),
+             deal_owner="RG", id="ccu-ask", kind="proposed"),
+    ]
+    moves = [
+        item(f"Prospect {n}", f"Send draft terms for pilot {n}", due=TODAY + timedelta(days=4),
+             deal_owner="RG", id=f"pilot-{n}")
+        for n in range(4)
+    ]
+    views = [view(i.deal, 2, owner="RG", last=i.recorded) for i in proposals + moves]
+
+    s = section("RG", views, proposals + moves)
+
+    assert {v.deal for v, _, _ in s.highlights} == {i.deal for i in moves}
+    assert {m.item_id for m in s.followups} == {i.id for i in proposals}
+    assert {record.deal for record in s.audit if not record.selected and not record.signals} == {
+        i.deal for i in proposals
+    }
 
 
 def test_completed_or_proposed_history_does_not_fill_the_deal_row():
@@ -87,6 +117,23 @@ def test_reply_needed_in_today_but_fyi_email_is_not():
                                                                          "Confirm pilot criteria")),
                        view("Campari", 4, owner="RG", unanswered=Unanswered("Les comparto", 9, "l2", False))], [])
     assert [(r.deal, r.tag) for r in s.today] == [("Pernod", "Reply needed")]
+
+
+@pytest.mark.parametrize("with_promise", [False, True], ids=["followup-only", "independent-promise"])
+def test_older_inbound_ask_stays_in_followups(with_promise):
+    received = TODAY - timedelta(days=9)
+    request = item("Pernod", "Confirm the NDA terms", recorded=received, deal_owner="RG", id="request",
+                   kind="customer_request")
+    promise = item(request.deal, "Send the revised pricing sheet", due=TODAY + timedelta(days=4),
+                   deal_owner="RG", id="pricing")
+    unanswered = Unanswered("NDA terms", 9, request.link, True, action=request.text, item_id=request.id)
+    v = view(request.deal, 2, owner="RG", unanswered=unanswered)
+
+    s = section("RG", [v], [request, promise] if with_promise else [request])
+
+    expected = [("We owe", promise.id)] if with_promise else []
+    assert [(move.tag, move.item_id) for _, move, _ in s.highlights] == expected
+    assert [(move.tag, move.item_id) for move in s.followups] == [("Follow up", request.id)]
 
 
 def test_due_now_only_for_promises_due_within_three_days_or_tomorrow():
@@ -173,6 +220,18 @@ def test_unverified_recommendation_does_not_become_a_move():
     v = view("FEMSA MX", 2, recommendation=Note("Re-engage the buyer", verified=False))
     m = primary_move(v, TODAY, set())
     assert m.tag == "Confirm status" and m.text == "Check where this deal stands" and m.link is None
+
+
+def test_legacy_followup_recommendation_leaves_room_for_an_independent_move():
+    followup = Note("Follow up on pilot approval", verified=True, evidence=frozenset({"approval"}), ref="approval")
+    next_move = Note("Send the revised pricing sheet", verified=True, evidence=frozenset({"pricing"}), ref="pricing")
+    v = view("Andina Chile", 2, owner="RG", recommendation=followup, recommendations=[followup, next_move])
+
+    s = section("RG", [v], [])
+
+    assert [move.text for _, move, _ in s.highlights] == [next_move.text]
+    assert [move.done for move in s.followups] == ["rec:approval"]
+    assert all(move.tag == "Follow up" for move in s.followups)
 
 
 def test_first_sentence_keeps_moves_short():
@@ -664,10 +723,6 @@ def test_waiting_proposal_leaves_its_highlight_slot_for_another_deal(has_evidenc
                     id="proposal", kind="proposed")
     other_deals = [view(f"Prospect {n}", 3, owner="RG") for n in range(4)]
     views = [view(proposal.deal, 4, owner="RG", last=sent), *other_deals]
-    baseline = section("RG", views, [proposal])
-    assert baseline.highlights[0][1].item_id == proposal.id
-    assert baseline.highlights[0][1].tag == "Follow up"
-
     action = "Customer to confirm the pilot approval date" if has_evidence else proposal.text
     evidence = frozenset({proposal.id}) if has_evidence else frozenset()
     waiting = wait(proposal.deal, 9, rank=4, sent=sent, action=action, evidence=evidence)
@@ -677,6 +732,7 @@ def test_waiting_proposal_leaves_its_highlight_slot_for_another_deal(has_evidenc
 
     assert brief.waiting == [waiting]
     assert {v.deal for v, _, _ in brief.highlights} == {v.deal for v in other_deals}
+    assert not brief.followups
     audit = {record.deal: record for record in brief.audit}
     assert not audit[proposal.deal].selected and not audit[proposal.deal].signals
 
@@ -699,6 +755,20 @@ def test_deal_with_waiting_proposal_can_show_a_separate_commitment_on_the_same_t
         (waiting.deal, "We owe", promise.id)
     ]
     assert "next milestone: our proposal awaiting reply" not in brief.audit[0].signals
+
+
+def test_capped_wait_prevents_a_duplicate_followup_or_highlight():
+    sent = TODAY - timedelta(days=9)
+    proposal = item("Andina Chile", "Confirm the pilot approval date", recorded=sent, deal_owner="RG",
+                    id="proposal", kind="proposed")
+    waiting = wait(proposal.deal, 9, owner="NC", sent=sent, action=proposal.text, evidence=frozenset({proposal.id}))
+    recommendation = Note("Check the pilot approval date again", verified=True, evidence=waiting.evidence)
+    v = view(proposal.deal, 2, owner="RG", last=sent, recommendation=recommendation)
+
+    brief = build_section("RG", "Ramiro", "Ramiro", {v.deal: v}, [proposal], [], TODAY, DISPLAY,
+                          waiting_candidates=[waiting])
+
+    assert not brief.waiting and not brief.highlights and not brief.followups
 
 
 def test_same_wording_can_refer_to_two_actions_with_separate_evidence():
