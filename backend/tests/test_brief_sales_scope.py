@@ -5,7 +5,8 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from app import brief_api
+from app import brief_api, brief_v2
+from app.brief_verification import Verdict
 from app.main import app
 
 
@@ -254,3 +255,95 @@ def test_brief_excludes_working_clients_after_sheet_status_changes(brief_client,
     for text in (pilot_text, "Pilot scoping call", "Partner discussion"):
         assert text in after["html"] and text in after["text"]
     assert "3. Proposal" in after["html"]
+
+
+@pytest.mark.parametrize("verification", ["off", "shadow"])
+@pytest.mark.parametrize("customer_commitment", [False, True], ids=["original-ask", "customer-commitment"])
+def test_waiting_on_a_reply_excludes_the_same_action_across_founder_sections(
+        monkeypatch, brief_client, verification, customer_commitment):
+    company = {**deal("buyer"), "owner_code": "NC"}
+    quote = "I'll confirm approval." if customer_commitment else "Can you approve the proposal?"
+    waiting_action = "Customer to approve the proposal"
+    duplicate_move = "Ask again for proposal approval"
+    other_move = "Send the revised pricing sheet"
+    other_quote = "The pricing sheet needs to be revised."
+    original = email("original", "buyer", f"{quote} {other_quote}", days=11, outgoing=not customer_commitment,
+                     thread="proposal")
+    followup = "Thanks, I'll look out for it." if customer_commitment else "Checking in on this."
+    latest = email("latest", "buyer", followup, days=8, outgoing=True, thread="proposal")
+    latest["reply_expectation"].update(evidence_message_id=original["external_id"],
+                                       evidence_content_hash=original["content_hash"],
+                                       evidence_quote=quote, response=waiting_action)
+    insights = [
+        insight("approval", "buyer", waiting_action, SALES, type_="commitment" if customer_commitment else "next_step",
+                origin=original, quote=quote, owner_side="customer", dated=False),
+        insight("pricing", "buyer", other_move, SALES, type_="need", origin=original, quote=other_quote,
+                owner_side=None, dated=False),
+    ]
+    profiles = [{"opportunity_id": company["id"], "generated_at": NOW, "profile": {
+        "refs": {"I1": "approval", "I2": "pricing"},
+        "recommended_actions": [
+            {"action": duplicate_move, "evidence": ["I1"], "action_scope": SALES},
+            {"action": other_move, "evidence": ["I1", "I2"], "action_scope": SALES},
+        ],
+    }}]
+    checked = []
+
+    class Gate:
+        as_of = NOW
+        audit = {}
+
+        def __call__(self, actions):
+            checked.extend(actions)
+            return {a.key: Verdict("waiting" if a.kind == "waiting" else "still_owed", "fixture") for a in actions}
+
+        def ready_fields(self):
+            return {}
+
+        def finalize(self, conn, response):
+            pass
+
+    monkeypatch.setattr(brief_api, "create_gate", lambda *_: Gate())
+    client = brief_client(BriefData([company], [original, latest], insights, profiles))
+    response = client.post(f"/brief/build?dry_run=true&version=v2&verification={verification}",
+                           headers={"X-Ingest-Token": "test-token"})
+    assert response.status_code == 200
+    result = response.json()
+    sections = {s["owner"]: s for s in result["payload"]["sections"]}
+    assert [h["move"]["text"] for h in sections["NC"]["highlights"]] == [other_move]
+    assert [(w["thread_id"], w["action"]) for w in sections["RG"]["waiting"]] == [("proposal", waiting_action)]
+    for body in (result["html"], result["text"]):
+        assert body.count(waiting_action) == 1
+        assert duplicate_move not in body
+        assert other_move in body
+    if verification == "shadow":
+        assert {a.kind for a in checked} == {"waiting", "recommendation"}
+        assert all(a.text != duplicate_move for a in checked)
+
+
+def test_waiting_row_beyond_display_cap_does_not_exclude_its_move(monkeypatch, brief_client):
+    monkeypatch.setattr(brief_v2, "MAX_WAITING", 1)
+    deals, messages, insights, profiles = [], [], [], []
+    for name, age in (("visible", 7), ("capped", 8)):
+        company = deal(name)
+        quote = f"Can you approve the {name} proposal?"
+        action = f"Customer to approve the {name} proposal"
+        ask = email(f"{name}-ask", name, quote, days=age, outgoing=True)
+        ask["reply_expectation"].update(evidence_quote=quote, response=action)
+        deals.append(company)
+        messages.append(ask)
+        insights.append(insight(f"{name}-approval", name, action, SALES, type_="next_step", origin=ask, quote=quote,
+                                owner_side="customer", dated=False))
+        profiles.append({"opportunity_id": company["id"], "generated_at": NOW, "profile": {
+            "refs": {"I1": f"{name}-approval"},
+            "recommended_actions": [{"action": action, "evidence": ["I1"], "action_scope": SALES}],
+        }})
+    client = brief_client(BriefData(deals, messages, insights, profiles))
+    response = client.post("/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"})
+    assert response.status_code == 200
+    founder = response.json()["payload"]["sections"][0]
+    assert [w["deal"] for w in founder["waiting"]] == ["visible"]
+    assert founder["more_waiting"] == 1
+    assert [(h["deal"], h["move"]["text"]) for h in founder["highlights"]] == [
+        ("capped", "Customer to approve the capped proposal"),
+    ]

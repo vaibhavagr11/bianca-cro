@@ -8,7 +8,7 @@ quote-checked insights) and Nico de León's urgent items.
 
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 
 from app.brief import (
@@ -277,14 +277,15 @@ class Waiting:
     thread_id: str | None = None
     owner: str | None = None        # whose section it goes to: who sent it, else the deal owner
     rank: int | None = None
-    action: str | None = None      # the extracted sales ask we are waiting on
+    action: str | None = None      # the specific response we are waiting on
+    evidence: frozenset[str] = frozenset()  # insight IDs for the specific ask
 
 
 def waiting_on_them(thread: list[dict], internal: set[str], now: datetime) -> dict | None:
     """The latest real message is our 7–60 day old outbound with a verified open reply expectation.
 
     Each message: {"at": datetime, "from": [address], "to": [{"address", "name"}], "cc": [...], "automated": bool},
-    oldest first. Returns {"last", "to", "days", "nudges", "replied_before", "auto_reply"} or None.
+    oldest first. Returns the latest message, the message supporting the reply expectation, and waiting details.
     """
     dom = lambda a: (a or "").rsplit("@", 1)[-1].lower()
     ours = lambda m: bool(m["from"]) and all(dom(a) in internal for a in m["from"])
@@ -307,9 +308,11 @@ def waiting_on_them(thread: list[dict], internal: set[str], now: datetime) -> di
             or expectation.get("latest_content_hash") != last["content_hash"]):
         return None
     evidence_id, evidence_hash = expectation.get("evidence_message_id"), expectation.get("evidence_content_hash")
-    if not evidence_id or not evidence_hash or not any(
-        m.get("external_id") == evidence_id and m.get("content_hash") == evidence_hash for m in real
-    ):
+    if not evidence_id or not evidence_hash:
+        return None
+    evidence = next((m for m in real if m.get("external_id") == evidence_id
+                     and m.get("content_hash") == evidence_hash), None)
+    if evidence is None:
         return None
     nudges = 0
     for m in reversed(real):
@@ -318,7 +321,8 @@ def waiting_on_them(thread: list[dict], internal: set[str], now: datetime) -> di
         nudges += 1
     names = [(p.get("name") or "").strip() or p["address"] for p in people[:2]]
     to = ", ".join(names) + (f" +{len(people) - 2}" if len(people) > 2 else "")
-    return {"last": last, "to": to, "days": days, "nudges": nudges,
+    return {"last": last, "evidence": evidence, "evidence_outbound": ours(evidence),
+            "to": to, "days": days, "nudges": nudges,
             "replied_before": any(not ours(m) for m in real),
             "auto_reply": any(m["automated"] and m["at"] > last["at"] for m in thread)}
 
@@ -611,14 +615,42 @@ class Section:
     hidden: int = 0
     all_items: list[Item] = field(default_factory=list)   # everything routed here, for the payload
     audit: list[SelectionRecord] = field(default_factory=list)
-    waiting: list["Waiting"] = field(default_factory=list)  # we wrote last, no answer yet (set after selection)
+    waiting: list[Waiting] = field(default_factory=list)  # we wrote last, no answer yet
     more_waiting: int = 0
     verification: VerificationNotes | None = None
 
 
+def _without_waiting_action(view: DealView, waiting: Waiting) -> DealView:
+    action = norm(waiting.action).rstrip(".!?")
+
+    def same_action(text: str) -> bool:
+        return bool(action) and norm(text).rstrip(".!?") == action
+
+    def repeats_ask(note: Note) -> bool:
+        shared = note.evidence & waiting.evidence
+        if shared and note.evidence <= waiting.evidence:
+            return True
+        # Equal wording can describe different responsibilities when both sources are known.
+        return same_action(note.text) and (bool(shared) or not note.evidence or not waiting.evidence)
+
+    items = [item for item in view.items if item.id not in waiting.evidence
+             and not (not waiting.evidence and item.kind == "proposed" and waiting.link
+                      and item.link == waiting.link and same_action(item.text))]
+    recommendations = [note for note in view.recommendations if not repeats_ask(note)]
+    preferred = view.recommendation
+    if preferred and repeats_ask(preferred):
+        preferred = next(iter(recommendations), None)
+    return replace(view, items=items,
+                   blocker=None if view.blocker and repeats_ask(view.blocker) else view.blocker,
+                   summary=None if view.summary and repeats_ask(view.summary) else view.summary,
+                   recommendation=preferred, recommendations=recommendations)
+
+
 def build_section(code: str, name: str, short: str, views: dict[str, DealView], items: list[Item],
                   meetings: list[tuple[Meeting, str]], today: date, display: dict[str, str],
-                  hidden: int = 0, critical_ahead: int = 3, in_talks_target: int = 2) -> Section:
+                  hidden: int = 0, critical_ahead: int = 3, in_talks_target: int = 2, *,
+                  waiting: list[Waiting] | None = None, more_waiting: int = 0,
+                  displayed_waits: list[Waiting] | None = None) -> Section:
     mine: dict[str, DealView] = {}
 
     def view(deal: str) -> DealView:
@@ -667,9 +699,25 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
     owned = [v for v in mine.values() if v.owner == code]
     eligible = [v for v in owned if v.rank in PROSPECT_RANKS and
                 (deal_status(v, today) == "active" or (v.rank != 1 and pressing(v)) or (v.rank == 1 and v.deal in in_today))]
-    selected, audit = select_deals(eligible, today, in_today, critical_ahead, in_talks_target)
+    waiting = waiting or []
+    by_deal = {w.deal: w for w in (waiting if displayed_waits is None else displayed_waits)}
+    highlight_views = []
+    waiting_only = set()
+    for v in eligible:
+        if v.deal in by_deal:
+            v = _without_waiting_action(v, by_deal[v.deal])
+            # A generic status check would take a slot without giving the founder a separate action.
+            if primary_move(v, today, used).tag == "Confirm status":
+                waiting_only.add(v.deal)
+                continue
+        highlight_views.append(v)
+
+    selected, audit = select_deals(highlight_views, today, in_today, critical_ahead, in_talks_target)
     for v in sorted(owned, key=lambda v: v.deal):  # the audit also explains prospects that were not eligible at all
-        if v.rank in PROSPECT_RANKS and v not in eligible:
+        if v.deal in waiting_only:
+            audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
+                                         "not eligible: waiting on their reply with no separate next move"))
+        elif v.rank in PROSPECT_RANKS and v not in eligible:
             status = deal_status(v, today)
             audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
                                          f"not eligible: status {status}" + (f", last record {_date(v.last_contact)}"
@@ -726,7 +774,7 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
     return Section(code, name, short, today_rows, highlights, [r.deal for r in audit if r.position is None
                                                                 and not r.reason.startswith("not eligible")],
                    meetings, follow_shown, [], len(follow) - len(follow_shown), unclear, dormant, b,
-                   hidden, routed, audit)
+                   hidden, routed, audit, waiting=waiting, more_waiting=more_waiting)
 
 
 # ---------------------------------------------------------------- rendering
