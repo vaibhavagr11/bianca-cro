@@ -593,6 +593,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                 latest = last_reply if from_customer(m) else last_ours
                 if d["name"] not in latest or m["at"] > latest[d["name"]]:
                     latest[d["name"]] = m["at"]
+        waiting_candidates: list[brief_v2.Waiting] = []
         waiting: dict[str, brief_v2.Waiting] = {}
         for thread_id, msgs in threads.items():
             real = [m for m in msgs if not m["automated"]]
@@ -615,14 +616,16 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                 sent = t["occurred_at"].astimezone(tz)
                 replied = last_reply.get(d["name"])
                 nudges = sum(1 for at in ours_sent.get(d["name"], []) if not replied or at > replied)  # every thread
+                action, evidence = _waiting_action(email_asks, w)
+                candidate = brief_v2.Waiting(
+                    d["name"], d["stage"], w["to"], sent.date(), w["days"], max(nudges, w["nudges"]), replied is not None,
+                    w["auto_reply"] or last_auto.get(d["name"], t["occurred_at"]) > t["occurred_at"],
+                    timeline.GMAIL_THREAD_URL.format(thread_id), f"Email · {sent:%b} {sent.day}",
+                    thread_id, sender if sender in FOUNDER_ORDER else d["owner_code"], d["stage_rank"],
+                    action=action, evidence=evidence)
+                waiting_candidates.append(candidate)
                 if d["name"] not in waiting or sent.date() > waiting[d["name"]].sent:
-                    action, evidence = _waiting_action(email_asks, w)
-                    waiting[d["name"]] = brief_v2.Waiting(
-                        d["name"], d["stage"], w["to"], sent.date(), w["days"], max(nudges, w["nudges"]), replied is not None,
-                        w["auto_reply"] or last_auto.get(d["name"], t["occurred_at"]) > t["occurred_at"],
-                        timeline.GMAIL_THREAD_URL.format(thread_id), f"Email · {sent:%b} {sent.day}",
-                        thread_id, sender if sender in FOUNDER_ORDER else d["owner_code"], d["stage_rank"],
-                        action=action, evidence=evidence)
+                    waiting[d["name"]] = candidate
                     if gate:
                         sources[f"wait:{thread_id}"] = ActionSource("waiting", str(t["id"]), t["occurred_at"])
                 continue
@@ -681,7 +684,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         if gate and with_why:
             sources[f"rec:{ref}"] = brief_review.profile_source(prof, entry, ins_by_id)
         return brief_v2.Note(text, entry.get("why") if with_why else None, verified, entry.get("basis"),
-                             link if verified else None, frozenset(str(x["id"]) for x in resolved), source, ref)
+                             link if verified else None, frozenset(str(x["id"]) for x in resolved), source, ref,
+                             followup_only=with_why and entry.get("followup_only") is True)
 
     views: dict[str, brief_v2.DealView] = {}
     for company_id, d in deals.items():
@@ -751,7 +755,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         when = timestamp.astimezone(tz) if timestamp else None
         kind = brief_v2.item_kind(r["type"], r["due_date"], speaker(r), r["quote"], side_for(r))
         if gate:
-            sources[f"insight:{r['id']}"] = ActionSource.insight("waiting" if kind == "proposed" else "commitment", r)
+            sources[f"insight:{r['id']}"] = ActionSource.insight("recommendation" if kind == "proposed" else "commitment", r)
         items.append(brief_v2.Item(
             str(r["id"]), d["name"], r["text"], r["due_date"], recorded, r["owner_name"], route, basis, delegated,
             f"{SOURCE_LABEL.get(r['source'], r['source'])} · {when:%b} {when.day}" if when else r["source"],
@@ -779,7 +783,6 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
     names = {t["owner_code"]: t["full_name"] for t in team}
     waits = list(waiting.values())
     picked_waits = {code: brief_v2.pick_waiting(waits, code) for code in FOUNDER_ORDER}
-    displayed_waits = [w for shown, _ in picked_waits.values() for w in shown]
     sections = []
     for code in FOUNDER_ORDER:
         short, full = DISPLAY.get(code, (code, names.get(code, code)))
@@ -787,7 +790,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         sections.append(brief_v2.build_section(
             code, full, short, views, items, [(m, m.context) for m in meetings if code in m.attendees], today, display,
             0 if gate else hidden.get(code, 0), settings.brief_critical_ahead_days, settings.brief_in_talks_target,
-            waiting=shown, more_waiting=more, displayed_waits=displayed_waits))
+            waiting=shown, more_waiting=more, waiting_candidates=waiting_candidates))
 
     ndl = [brief_v2.TodayRow(i.deal, views[i.deal].stage, "Due now", i.text, f"due {i.due:%b} {i.due.day}", "Nico DL",
                              i.link, i.id, i.source, f"insight:{i.id}")

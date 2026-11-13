@@ -15,6 +15,7 @@ from app.brief import (
     AMBER, BLUE, FONT, INK, MUTED, RED, Meeting, VerificationNotes, _e, _empty, _h, _link, _td, _th,
     meeting_text_fields, meeting_text_rows, meetings_table, stage_short, verification_html, verification_text,
 )
+from app.brief_followups import is_followup_only
 from app.brief_text import TableText, read_table_text
 
 ACTIVE_DAYS = 14            # last recorded interaction within this = active
@@ -22,7 +23,7 @@ UNCLEAR_DAYS = 45           # 15..45 days = status unclear (confirm); older = do
 REPLY_DAYS = 7              # customer email this recent with an extracted sales ask = reply needed
 PROPOSAL_FOLLOWUP_DAYS = (7, 30)   # our proposal with no reply after this many days = follow-up may be needed
 UNDATED_WINDOW_DAYS = 45
-MAX_HIGHLIGHTS, MAX_FOLLOWUPS, MAX_EXCEPTIONS, MAX_NAMES = 4, 3, 1, 3
+MAX_HIGHLIGHTS, MAX_FOLLOWUPS, MAX_EXCEPTIONS, MAX_NAMES = 6, 3, 1, 3
 MAX_WAITING = 6
 IN_TALKS_RANK = 2
 REQUEST_FRESH_DAYS = 21       # a customer request this recent still counts as outstanding
@@ -67,6 +68,7 @@ class Note:
     evidence: frozenset = frozenset()  # ids of the insights it cites (resolved)
     source: str = ""                # newest cited evidence, e.g. "Notes · Oct 20"
     ref: str | None = None          # stable id of a suggestion, so a founder can dismiss it
+    followup_only: bool = False
 
 
 @dataclass
@@ -372,8 +374,8 @@ def email_move(tag: str, text: str, when: str, u: Unanswered, deal: str | None =
     return Move(tag, text, when, u.link, u.item_id, u.source, u.completion_ref, deal)
 
 
-def note_move(tag: str, text: str, when: str, n: Note, link: str | None) -> Move:
-    return Move(tag, text, when, link, None, n.source, f"rec:{n.ref}" if n.ref else None)
+def note_move(tag: str, text: str, when: str, n: Note, link: str | None, deal: str | None = None) -> Move:
+    return Move(tag, text, when, link, None, n.source, f"rec:{n.ref}" if n.ref else None, deal)
 
 
 def recorded_move(i: Item, text: str) -> Move:
@@ -413,15 +415,9 @@ def primary_move(d: DealView, today: date, used: set[str]) -> Move:
         for i in sorted((i for i in open_items if i.kind == kind and i.bucket not in ("stale", "old_undated")),
                         key=lambda i: (i.due or date.max, -i.recorded.toordinal())):
             return recorded_move(i, i.text)
-    if d.unanswered and d.unanswered.item_id not in used and reply_label(d.unanswered) == "follow_up":
-        return email_move("Follow up", reply_text(d.unanswered), f"email {d.unanswered.days}d ago", d.unanswered, d.deal)
     if d.recommendation and d.recommendation.verified:
         return note_move("AI recommendation", d.recommendation.text, _last(d, today), d.recommendation,
                          d.recommendation.link)
-    for i in sorted((i for i in open_items if i.kind == "proposed"), key=lambda i: -i.recorded.toordinal()):
-        age = (today - i.recorded).days
-        if PROPOSAL_FOLLOWUP_DAYS[0] <= age <= PROPOSAL_FOLLOWUP_DAYS[1] and (d.last_contact or i.recorded) <= i.recorded:
-            return item_move("Follow up", f"No reply since we proposed: {i.text}", f"proposed {_date(i.recorded)}", i)
     return Move("Confirm status", "Check where this deal stands", _last(d, today), None)
 
 
@@ -482,13 +478,10 @@ def deal_signals(v: DealView, today: date, in_today: set[str], critical_ahead: i
         signals.append("verified blocker")
     if v.developments:
         signals.append(f"{v.developments} new or late-recorded development(s)")
-    if v.unanswered and v.unanswered.action:
+    if v.unanswered and reply_label(v.unanswered) == "reply_needed":
         signals.append(f"customer email waiting {v.unanswered.days}d")
     if v.recommendation and v.recommendation.verified:
         signals.append("next milestone: verified recommendation")
-    elif any(i.kind == "proposed" and PROPOSAL_FOLLOWUP_DAYS[0] <= (today - i.recorded).days <= PROPOSAL_FOLLOWUP_DAYS[1]
-             for i in v.items):
-        signals.append("next milestone: our proposal awaiting reply")
     return critical, signals
 
 
@@ -646,11 +639,63 @@ def _without_waiting_action(view: DealView, waiting: Waiting) -> DealView:
                    recommendation=preferred, recommendations=recommendations)
 
 
+def _split_followups(view: DealView, today: date, used: set[str]) -> tuple[DealView, list[Move]]:
+    """Collect reminder actions and leave independent next moves available for deal selection."""
+    followups: list[Move] = []
+    followup_items: set[str] = set()
+    unanswered = view.unanswered
+    if unanswered and reply_label(unanswered) == "follow_up":
+        if unanswered.item_id not in used:
+            followups.append(email_move("Follow up", f"{view.deal}: {reply_text(unanswered)}",
+                                        f"email {unanswered.days}d ago", unanswered, view.deal))
+        if unanswered.item_id:
+            followup_items.add(unanswered.item_id)
+        unanswered = None
+
+    proposals = [i for i in view.items if i.kind == "proposed" and i.id not in used
+                 and PROPOSAL_FOLLOWUP_DAYS[0] <= (today - i.recorded).days <= PROPOSAL_FOLLOWUP_DAYS[1]
+                 and (view.last_contact or i.recorded) <= i.recorded]
+    if proposals:
+        proposal = max(proposals, key=lambda i: i.recorded)
+        followups.append(item_move("Follow up", f"{view.deal}: Check whether to follow up on our proposal. {proposal.text}",
+                                   f"proposed {_date(proposal.recorded)}", proposal))
+        followup_items.update(i.id for i in proposals)
+
+    for i in view.items:
+        if (i.kind not in ("owed", "customer_request", "next_step") or i.id in followup_items
+                or not is_followup_only(i.text)):
+            continue
+        followup_items.add(i.id)
+        if i.id not in used and i.bucket not in ("stale", "old_undated"):
+            followups.append(item_move("Follow up", f"{view.deal}: {i.text}", f"recorded {_date(i.recorded)}", i))
+
+    recommendations = list(view.recommendations)
+    if view.recommendation and view.recommendation not in recommendations:
+        recommendations.insert(0, view.recommendation)
+    deal_moves = []
+    reminder_texts = {norm(i.text).rstrip(".!?") for i in view.items if i.id in followup_items}
+    if view.unanswered and unanswered is None:
+        reminder_texts.add(norm(reply_text(view.unanswered)).rstrip(".!?"))
+    for rec in recommendations:
+        if not rec.verified:
+            continue
+        repeats_reminder = bool(rec.evidence & followup_items) and norm(rec.text).rstrip(".!?") in reminder_texts
+        if rec.followup_only or is_followup_only(rec.text) or repeats_reminder:
+            if not (rec.evidence and rec.evidence <= followup_items):
+                followups.append(note_move("Follow up", f"{view.deal}: {rec.text}", _last(view, today),
+                                           rec, rec.link, view.deal))
+        else:
+            deal_moves.append(rec)
+
+    return replace(view, items=[i for i in view.items if i.id not in followup_items], unanswered=unanswered,
+                   recommendation=next(iter(deal_moves), None), recommendations=deal_moves), followups
+
+
 def build_section(code: str, name: str, short: str, views: dict[str, DealView], items: list[Item],
                   meetings: list[tuple[Meeting, str]], today: date, display: dict[str, str],
                   hidden: int = 0, critical_ahead: int = 3, in_talks_target: int = 2, *,
                   waiting: list[Waiting] | None = None, more_waiting: int = 0,
-                  displayed_waits: list[Waiting] | None = None) -> Section:
+                  waiting_candidates: list[Waiting] | None = None) -> Section:
     mine: dict[str, DealView] = {}
 
     def view(deal: str) -> DealView:
@@ -700,23 +745,37 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
     eligible = [v for v in owned if v.rank in PROSPECT_RANKS and
                 (deal_status(v, today) == "active" or (v.rank != 1 and pressing(v)) or (v.rank == 1 and v.deal in in_today))]
     waiting = waiting or []
-    by_deal = {w.deal: w for w in (waiting if displayed_waits is None else displayed_waits)}
+    waits_by_deal: dict[str, list[Waiting]] = {}
+    for w in waiting if waiting_candidates is None else waiting_candidates:
+        waits_by_deal.setdefault(w.deal, []).append(w)
+
+    action_views = {}
+    reminders = {}
+    for deal, v in mine.items():
+        for w in waits_by_deal.get(deal, []):
+            v = _without_waiting_action(v, w)
+        action_views[deal], reminders[deal] = _split_followups(v, today, used)
+
     highlight_views = []
-    waiting_only = set()
-    for v in eligible:
-        if v.deal in by_deal:
-            v = _without_waiting_action(v, by_deal[v.deal])
-            # A generic status check would take a slot without giving the founder a separate action.
-            if primary_move(v, today, used).tag == "Confirm status":
-                waiting_only.add(v.deal)
-                continue
+    followup_only = set()
+    primary_moves = {}
+    for original in eligible:
+        v = action_views[original.deal]
+        move = primary_move(v, today, used)
+        has_reminder = bool(waits_by_deal.get(v.deal) or reminders[v.deal])
+        proposal_only = move.tag == "Confirm status" and any(i.kind == "proposed" for i in original.items)
+        # A generic fallback would give a follow-up-only deal a highlight slot.
+        if proposal_only or (has_reminder and move.tag in ("Confirm status", "Clarify next action")):
+            followup_only.add(v.deal)
+            continue
+        primary_moves[v.deal] = move
         highlight_views.append(v)
 
     selected, audit = select_deals(highlight_views, today, in_today, critical_ahead, in_talks_target)
     for v in sorted(owned, key=lambda v: v.deal):  # the audit also explains prospects that were not eligible at all
-        if v.deal in waiting_only:
+        if v.deal in followup_only:
             audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
-                                         "not eligible: waiting on their reply with no separate next move"))
+                                         "not eligible: waiting or follow-up with no separate next move"))
         elif v.rank in PROSPECT_RANKS and v not in eligible:
             status = deal_status(v, today)
             audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
@@ -724,13 +783,13 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                                                                              if v.last_contact else "")))
     highlights = []
     for v in selected:
-        m = primary_move(v, today, used)
+        m = primary_moves[v.deal]
         if m.item_id:
             used.add(m.item_id)
         highlights.append((v, m, situation(v)))
     shown = {v.deal for v, _, _ in highlights}
 
-    # Older unanswered sales asks and recent actionable items on deals that have no highlighted move.
+    # Follow-ups stay here even when the deal also has a separate highlighted move.
     follow: list[Move] = []
     for v, m, _ in highlights:  # when the move addresses the blocker instead, the nearest promise stays visible
         dated = sorted((i for i in v.items if i.id not in used and i.kind == "owed" and i.bucket in ("overdue", "week")),
@@ -738,12 +797,10 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
         if m.tag != "We owe" and dated:
             i = dated[0]
             follow.append(item_move("We owe", f"{v.deal}: {i.text}", f"due {_date(i.due)}", i))
-    for v in mine.values():
+    for v in action_views.values():
+        follow.extend(reminders[v.deal])
         if v.deal in shown:
             continue
-        if v.unanswered and v.unanswered.item_id not in used and reply_label(v.unanswered) == "follow_up":
-            follow.append(email_move("Follow up", f"{v.deal}: {reply_text(v.unanswered)}",
-                                      f"email {v.unanswered.days}d ago", v.unanswered, v.deal))
         for i in v.items:
             if i.id in used:
                 continue
@@ -906,7 +963,7 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, 
                        + done_td(r.done) + "</tr>"
                        for r in s.today]) if s.today else _empty("Nothing due now or waiting on your reply."))
 
-    out.append(_h("Deals to move · prospects & pilots", PURPLE, len(s.highlights)))
+    out.append(_h("Deals to Move", PURPLE))
     if s.highlights:
         rows = []
         for v, m, sit in s.highlights:
@@ -1037,14 +1094,18 @@ def plain_text(sections: list[Section], today: date, ndl_review: VerificationNot
     for s in sections:
         lines.append(f"\n{s.name.upper()}\nNeeds you today ({len(s.today)})")
         lines += [f"• [{r.tag}] {r.deal} — {display(_what_text(r))} ({r.when})" for r in s.today]
-        lines.append(f"Deals to move ({len(s.highlights)})")
+        lines.append("Deals to Move")
         lines += [f"• {v.deal} ({stage_short(v.stage)}): [{m.tag}] {display(_move_text(m))} ({m.when})"
                   for v, m, _ in s.highlights]
-        lines += [f"• {m.at:%a %H:%M} {title} — {prep}" for m, title, prep in meeting_text_rows(s.meetings, display)]
-        lines += [f"• [{m.tag}] {display(_move_text(m))} ({m.when})" for m in s.followups]
         if s.waiting:
             lines.append(f"Waiting on their reply ({len(s.waiting) + s.more_waiting})")
             lines += [f"• {w.deal}: {display(_waiting_text(w))} ({w.days}d since {_date(w.sent)})" for w in s.waiting]
+        if s.meetings:
+            lines.append("Meetings today & tomorrow")
+            lines += [f"• {m.at:%a %H:%M} {title} — {prep}" for m, title, prep in meeting_text_rows(s.meetings, display)]
+        if s.followups:
+            lines.append(f"Follow-ups that may be needed ({len(s.followups) + s.more_followups})")
+            lines += [f"• [{m.tag}] {display(_move_text(m))} ({m.when})" for m in s.followups]
         lines.extend(verification_text(s.verification))
     if ndl_review and (ndl_review.waiting or ndl_review.unclear):
         lines += ["\nNICO DE LEÓN", *verification_text(ndl_review)]
