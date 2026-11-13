@@ -50,6 +50,16 @@ class Settings(BaseSettings):
     # Threads classified per /process/classify call.
     classify_batch_threads: int = 10
 
+    # Read-only Claude connector. Founder OAuth subject IDs are keys; values identify Gmail link aliases.
+    sales_mcp_enabled: bool = False
+    sales_mcp_url: str | None = None
+    sales_mcp_issuer: str | None = None
+    sales_mcp_jwks_url: str | None = None
+    sales_mcp_founders: dict[str, Literal["RG", "NC", "NDL"] | None] = Field(default_factory=dict)
+    sales_mcp_database_url: SecretStr | None = None
+    sales_mcp_include_pilots: bool = False
+    sales_mcp_stale_after_hours: int = Field(default=84, gt=0)
+
     # Founder review is opt-in and uses separate credentials from ingestion.
     review_enabled: bool = False
     review_tokens: dict[str, SecretStr] = {}
