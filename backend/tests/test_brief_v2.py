@@ -12,7 +12,7 @@ from app.brief_v2 import (
     ChangeRow, DealView, Item, Note, TodayRow, Unanswered, _stage_badge, bucket, build_section, classify_event, completable,
     deal_status, describe_change,
     reply_text, first_sentence, has_request,
-    is_new_insight, item_kind, norm, primary_move, render, reply_label, resolve_owner, select_changes, subject,
+    is_new_insight, item_kind, norm, plain_text, primary_move, render, reply_label, resolve_owner, select_changes, subject,
     to_payload,
 )
 from app.main import app
@@ -81,7 +81,7 @@ def test_followup_only_proposals_leave_slots_for_deals_with_concrete_moves():
     moves = [
         item(f"Prospect {n}", f"Send draft terms for pilot {n}", due=TODAY + timedelta(days=4),
              deal_owner="RG", id=f"pilot-{n}")
-        for n in range(4)
+        for n in range(6)
     ]
     views = [view(i.deal, 2, owner="RG", last=i.recorded) for i in proposals + moves]
 
@@ -172,14 +172,17 @@ def test_old_last_contact_means_confirm_status_not_active():
 
 # ---- density and stale noise (points 1 and 5)
 
-def test_one_move_per_deal_capped_and_no_commitment_lists():
+def test_deals_to_move_has_six_distinct_deals_and_the_same_heading_in_both_formats():
     views = [view(f"Deal {n}", 2) for n in range(8)]
     its = [item(f"Deal {n}", f"promise {n}-{k}", due=TODAY + timedelta(days=4), id=f"{n}-{k}")
            for n in range(8) for k in range(3)]
     s = section("NC", views, its)
-    assert len(s.highlights) == 4 and len(s.also_active) == 4
+    assert len(s.highlights) == len({v.deal for v, _, _ in s.highlights}) == 6
+    assert len(s.also_active) == 2
     assert all(m.tag == "We owe" for _, m, _ in s.highlights)
     html = render([s], [], [], TODAY, 8, "c", False)
+    assert "Deals to Move" in re.findall(r"<h3[^>]*>([^<]*)</h3>", html)
+    assert "Deals to Move" in plain_text([s], TODAY).splitlines()
     assert html.count("promise 0-") == 1                                   # one move shown, not the whole list
 
 
@@ -354,6 +357,8 @@ def ramiro_oct28():
 
 def test_in_talks_deals_get_considered_and_two_are_shown():
     views, items = ramiro_oct28()
+    views += [view(f"Pilot {n}", 4, owner="RG", developments=1,
+                   recommendation=Note("Send draft terms", verified=True)) for n in range(2)]
     s = section("RG", views, items)
     shown = [v.deal for v, _, _ in s.highlights]
     assert {"Pernod Ricard", "Campari"} <= set(shown)                       # time-critical first
@@ -361,15 +366,16 @@ def test_in_talks_deals_get_considered_and_two_are_shown():
     audit = {r.deal: r for r in s.audit}
     assert audit["Arca Peru"].signals and audit["Chifles"].signals          # both evaluated with evidence
     assert all(r.reason for r in s.audit)                                   # every eligible deal has a reason
-    assert not audit["Farmater"].selected and audit["Farmater"].reason.startswith("outranked")
+    assert not audit["Pilot 1"].selected and audit["Pilot 1"].reason.startswith("outranked")
 
 
 def test_time_critical_pilots_are_never_displaced_for_in_talks():
-    pilots = [view(f"Pilot {n}", 4, owner="RG") for n in range(4)]
+    pilots = [view(f"Pilot {n}", 4, owner="RG") for n in range(6)]
     talks = [view("Talks co", 2, owner="RG", blocker=Note("b", verified=True), recommendation=Note("r", verified=True))]
-    items = [item(f"Pilot {n}", "promise", due=TODAY + timedelta(days=2), deal_owner="RG", id=f"p{n}") for n in range(4)]
+    items = [item(v.deal, "promise", due=TODAY + timedelta(days=2), deal_owner="RG", id=f"p{n}")
+             for n, v in enumerate(pilots)]
     s = section("RG", pilots + talks, items)
-    assert sorted(v.deal for v, _, _ in s.highlights) == [f"Pilot {n}" for n in range(4)]
+    assert {v.deal for v, _, _ in s.highlights} == {v.deal for v in pilots}
     assert {r.deal: r for r in s.audit}["Talks co"].reason.startswith("outranked")
 
 
@@ -721,7 +727,7 @@ def test_waiting_proposal_leaves_its_highlight_slot_for_another_deal(has_evidenc
     sent = TODAY - timedelta(days=9)
     proposal = item("Andina Chile", "Confirm the pilot approval date", recorded=sent, deal_owner="RG",
                     id="proposal", kind="proposed")
-    other_deals = [view(f"Prospect {n}", 3, owner="RG") for n in range(4)]
+    other_deals = [view(f"Prospect {n}", 3, owner="RG") for n in range(6)]
     views = [view(proposal.deal, 4, owner="RG", last=sent), *other_deals]
     action = "Customer to confirm the pilot approval date" if has_evidence else proposal.text
     evidence = frozenset({proposal.id}) if has_evidence else frozenset()
