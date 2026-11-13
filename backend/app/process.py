@@ -454,8 +454,10 @@ def extract_insights(payload: ExtractRequest, x_ingest_token: str | None = Heade
             else:
                 render = classifier.render_note if unit["source"] == "notes" else classifier.render_event
                 text = f"Source record: M1\n{render(records[0])}"
+            new_source_refs = [ref for ref, record in refs.items() if record["extracted_version"] is None]
             try:
-                result = extractor.extract(client, settings.anthropic_model, system_prompt, deal, text)
+                result = extractor.extract(client, settings.anthropic_model, system_prompt, deal, text,
+                                           new_source_refs=new_source_refs)
             except (anthropic.APIStatusError, anthropic.APIConnectionError, ValueError) as exc:
                 log.warning("extract unit failed: %s", type(exc).__name__)
                 counts["failed"] += 1
@@ -504,7 +506,7 @@ def build_profiles(payload: ExtractRequest, x_ingest_token: str | None = Header(
         header = {k: deal_view[k] for k in ("counts", "last_activity_at", "next_meeting")}
         body = profiler.render_inputs(deal, header, deal_view["contacts"], insights, timeline.utcnow().date().isoformat())
         try:
-            profile = profiler.generate(client, settings.anthropic_model, body)
+            profile = profiler.generate(client, settings.anthropic_model, body, stage=deal["stage"])
         except (anthropic.APIStatusError, anthropic.APIConnectionError, ValueError) as exc:
             log.warning("profile failed: %s", type(exc).__name__)
             results.append({"opportunity_id": opportunity_id, "company": deal["company"], "failed": True})

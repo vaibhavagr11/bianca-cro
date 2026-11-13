@@ -52,6 +52,11 @@ def parse_stage(stage: str | None) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def is_pilot(stage: str | None) -> bool:
+    """Match the Pipeline's Pilot status, including its numbered label."""
+    return _STAGE_RE.sub("", stage or "", count=1).strip().casefold() == "pilot"
+
+
 def is_working_client(stage: str | None) -> bool:
     """Match the Pipeline's Working Client status, including its numbered label."""
     label = _STAGE_RE.sub("", stage or "", count=1)
