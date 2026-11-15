@@ -9,9 +9,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Iterable
 from datetime import date, datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 from typing import Any
+from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -21,7 +23,9 @@ from app import db
 from app.config import settings
 from app.pipeline import PipelineRow, TRACKED_FIELDS, is_working_client, normalize_name
 from app.review_sheets import SheetsClient, SheetConflict, SheetError, SheetWorkingClient, SheetWriteUncertain
-from app.review_content import Content, approved_lineage, proposal_content, source_version, validate_lineage
+from app.review_content import (
+    Content, approved_lineage, proposal_content, review_next_step_bullets, source_id, source_version, validate_lineage,
+)
 
 
 class ReviewConflict(ValueError):
@@ -95,8 +99,45 @@ def clean_bullets(bullets: list[str], *, allow_empty: bool = False) -> list[str]
     return clean
 
 
+def _review_next_steps(proposal: dict, dated_source_ids: frozenset[str]) -> list[str]:
+    original = proposal["next_step_bullets"]
+    formatted = review_next_step_bullets(proposal, dated_source_ids)
+    if formatted != original:
+        try:
+            clean_bullets(list(dict.fromkeys(formatted)), allow_empty=True)
+        except ValueError:
+            # The display format adds characters near the existing Sheet limits.
+            return original
+    return formatted
+
+
 def _source_key(version: dict) -> tuple:
     return version["source"], version["external_id"], version["version"]
+
+
+def _dated_source_ids(records: Iterable[dict]) -> frozenset[str]:
+    return frozenset(source_id(record) for record in records
+                     if record.get("occurred_at") and not (record.get("meta") or {}).get("date_inferred"))
+
+
+def _workspace_dated_source_ids(conn, workspace_id, proposals: list[dict]) -> frozenset[str]:
+    record_ids = set()
+    for proposal in proposals:
+        if (proposal["status"] != "pending" or proposal.get("lineage_version") != 1
+                or proposal.get("routing_version") != ROUTING_VERSION or not proposal.get("next_step_bullets")):
+            continue
+        for source in proposal.get("sources") or []:
+            record_id = source.get("recordId") if isinstance(source, dict) else None
+            if isinstance(record_id, str):
+                try:
+                    record_ids.add(UUID(record_id))
+                except ValueError:
+                    continue
+    if not record_ids:
+        return frozenset()
+    return _dated_source_ids(conn.execute(
+        "select source, external_id, content_hash, occurred_at, subject, meta from source_records"
+        " where workspace_id = %s and id = any(%s)", (workspace_id, list(record_ids))))
 
 
 def _instant(value: Any) -> datetime | None:
@@ -319,10 +360,13 @@ def workspace_view(conn, workspace_id) -> dict:
     eligible_ids = [r["id"] for r in eligible if r["normalized_name"] in live_sales]
     historical_ids = [r["id"] for r in eligible]
     proposals = []
-    for row in conn.execute(
-            "select p.* from review_proposals p join opportunities o on o.id = p.opportunity_id"
-            " where p.workspace_id = %s and p.opportunity_id = any(%s) and p.status in ('pending', 'applying')"
-            " and (o.removed_at is null or p.status = 'applying') order by p.company_name", (workspace_id, eligible_ids)):
+    proposal_rows = conn.execute(
+        "select p.* from review_proposals p join opportunities o on o.id = p.opportunity_id"
+        " where p.workspace_id = %s and p.opportunity_id = any(%s) and p.status in ('pending', 'applying')"
+        " and (o.removed_at is null or p.status = 'applying') order by p.company_name",
+        (workspace_id, eligible_ids)).fetchall()
+    dated_source_ids = _workspace_dated_source_ids(conn, workspace_id, proposal_rows)
+    for row in proposal_rows:
         item = _proposal_data(row)
         if row["status"] == "applying":
             intent = conn.execute(
@@ -345,8 +389,13 @@ def workspace_view(conn, workspace_id) -> dict:
                 item["error"] = "This approval predates column routing. An operator must reconcile its original Sheet write before it can be reviewed again."
         elif row.get("routing_version") != ROUTING_VERSION:
             item["error"] = "This proposal predates column routing. Rebuild the review queue before deciding."
-        if row["status"] == "pending" and row.get("lineage_version") != 1:
-            item["error"] = "This proposal predates source lineage. Rebuild the review queue before deciding."
+        if row["status"] == "pending":
+            if row.get("lineage_version") != 1:
+                item["error"] = "This proposal predates source lineage. Rebuild the review queue before deciding."
+            elif row.get("routing_version") == ROUTING_VERSION:
+                formatted = _review_next_steps(row, dated_source_ids)
+                if formatted != item["nextStepBullets"]:
+                    item["reviewNextStepBullets"] = formatted
         proposals.append(item)
     rows = [{"id": str(r["id"]), "company": r["name"], "owner": r["owner_code"] or "", "stage": r["stage"] or "",
              "lastProgress": _cell(r["last_progress"]), "nextStep": _cell(r["next_step"]),
@@ -445,7 +494,7 @@ def _result(intent: dict, proposal: dict, mirror_refreshed: bool | None = None) 
     return data
 
 
-def _require_current_content(conn, workspace_id, proposal: dict) -> None:
+def _require_current_content(conn, workspace_id, proposal: dict) -> list[dict]:
     # Extraction locks source rows before changing their insights. Keep the displayed evidence stable until
     # the new decision is durable. Revalidate the original card even when the founder supplies edited text.
     by_version = {_source_key(source_version(r)): r for r in conn.execute(
@@ -454,12 +503,13 @@ def _require_current_content(conn, workspace_id, proposal: dict) -> None:
     expected = [_source_key(v) for v in proposal.get("observed_source_versions", [])]
     if any(key not in by_version for key in expected):
         raise ReviewConflict("The source material changed since this card was generated. Refresh the review queue before deciding.")
-    next_steps, context, sources, lineage = _current_content(conn, workspace_id, proposal,
-                                                            [by_version[key] for key in expected])
+    records = [by_version[key] for key in expected]
+    next_steps, context, sources, lineage = _current_content(conn, workspace_id, proposal, records)
     if (not (next_steps or context) or next_steps != proposal["next_step_bullets"]
             or context != proposal["client_context_bullets"] or lineage != proposal["bullet_lineage"]
             or _content_versions(sources) != proposal["source_versions"]):
         raise ReviewConflict("The sales evidence changed since this card was generated. Refresh the review queue before deciding.")
+    return records
 
 
 def _require_live_sales_status(sheets: SheetsClient, company: str) -> None:
@@ -519,10 +569,12 @@ def _prepare(conn, workspace_id, proposal_id: str, actor: str, action: str, revi
     if not validate_lineage(proposal["next_step_bullets"], proposal["client_context_bullets"],
                             proposal["sources"], proposal["bullet_lineage"]):
         raise ReviewConflict("This proposal has invalid source lineage. Rebuild the review queue before deciding.")
-    _require_current_content(conn, workspace_id, proposal)
+    records = _require_current_content(conn, workspace_id, proposal)
     before = _cells(proposal["snapshot_last_progress"], proposal["snapshot_next_step"], proposal.get("snapshot_client_context"))
     after = dict(before)
     target = None
+    decision_lineage = {"nextStep": [], "clientContext": []}
+    edited = False
     if action == "approve":
         target = _sheet_target()
         if not _target_is_pinned(target):
@@ -542,10 +594,12 @@ def _prepare(conn, workspace_id, proposal_id: str, actor: str, action: str, revi
                                       else "\n".join("- " + b for b in context))
         if context and len(after["clientContext"]) > 50_000:
             raise ValueError("The resulting Client Context exceeds one Sheet cell. Shorten the context or update the existing cell first.")
+        review_next_steps = _review_next_steps(proposal, _dated_source_ids(records))
+        decision_lineage = approved_lineage(proposal, next_steps, context, review_next_steps=review_next_steps)
+        edited = (context != proposal["client_context_bullets"]
+                  or next_steps not in (proposal["next_step_bullets"], list(dict.fromkeys(review_next_steps))))
     else:
         _require_live_sales_status(sheets, proposal["current_company_name"])
-    decision_lineage = approved_lineage(proposal, next_steps, context) if action == "approve" else {"nextStep": [], "clientContext": []}
-    edited = action == "approve" and (next_steps != proposal["next_step_bullets"] or context != proposal["client_context_bullets"])
     intent = conn.execute(
         "insert into review_decisions (workspace_id, proposal_id, actor, action, revision, idempotency_key, request_hash,"
         " bullets, before_cells, after_cells, edited, status, next_step_bullets, client_context_bullets, routing_version, sheet_target, bullet_lineage, lineage_version)"

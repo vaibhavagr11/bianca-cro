@@ -186,6 +186,7 @@ function fakePage(connector,pathname='/artifact'){
   class Element {
     constructor(){this.textContent='';this.innerHTML='';this.value='';this.hidden=false;this.disabled=false;this.handlers={};}
     addEventListener(name,handler){this.handlers[name]=handler;}
+    dispatchEvent(event){this.handlers[event.type]?.(event);}
     replaceChildren(){this.textContent='';this.innerHTML='';}
     close(){this.open=false;}showModal(){this.open=true;}focus(){}removeAttribute(){}setAttribute(){}
     querySelectorAll(){return [];}querySelector(){return new Element();}
@@ -193,9 +194,12 @@ function fakePage(connector,pathname='/artifact'){
   const elements=new Map(),events={};
   const get=selector=>{if(!elements.has(selector))elements.set(selector,new Element());return elements.get(selector);};
   get('#owner-filter').value='all';
-  const fakeDocument={querySelector:get,querySelectorAll:()=>[],addEventListener:(name,handler)=>{events[name]=handler;}};
+  const fakeDocument={querySelector:get,querySelectorAll:()=>[],addEventListener:(name,handler)=>{
+    const previous=events[name];
+    events[name]=previous?event=>{previous(event);handler(event);}:handler;
+  }};
   const fakeWindow={biancaConnector:connector,addEventListener:(name,handler)=>{events['window:'+name]=handler;},scrollTo:()=>{}};
-  const page=vm.createContext({document:fakeDocument,window:fakeWindow,location:{pathname,protocol:'https:'},crypto:{randomUUID:()=> 'new-key'},setTimeout:()=>0,clearTimeout:()=>{},fetch:()=>{throw Error('Unexpected direct network call');}});
+  const page=vm.createContext({document:fakeDocument,window:fakeWindow,location:{pathname,protocol:'https:'},crypto:{randomUUID:()=> 'new-key'},setTimeout:()=>0,clearTimeout:()=>{},Event,fetch:()=>{throw Error('Unexpected direct network call');}});
   for(const script of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g))vm.runInContext(script[1],page);
   return {get,events};
 }
@@ -284,6 +288,77 @@ test('Edit context matches the dropdown current row, including an empty current 
     assert.equal(page.get('#edit-content').value,'- Confirm the scope.','The editor still edits proposed bullets, while the context reflects the current row.');
     assert.equal(page.get('#review-list').innerHTML.includes('Older proposal baseline'),false);
   }
+});
+
+test('The pending card, editor and approval use the same loaded deadline',async()=>{
+  const body='Next step: The coordinator should keep following up with Morgan, since the team is waiting for a response.';
+  const formatted=body+' (complete by Nov 21, 2026)';
+  for(const flow of ['card','editor','clear-date']){
+    const s=snapshot(),p=s.proposals[0];
+    p.nextStepBullets=['Next step: The coordinator should keep following up with Morgan by Nov 21, since the team is waiting for a response.'];
+    p.bulletLineage.nextStep[0].text=p.nextStepBullets[0];
+    p.reviewNextStepBullets=[formatted];
+    const writes=[];
+    const page=fakePage({callTool:async(name,args)=>{
+      if(name===core.TOOLS.workspace)return {structuredContent:s};
+      writes.push(json(args));
+      return {structuredContent:{status:'approved'}};
+    }});
+    await new Promise(resolve=>setImmediate(resolve));
+    const card=page.get('#review-list').innerHTML;
+    assert.ok(card.includes(`<li data-bullet-id="bullet-scope">${formatted}</li>`));
+    assert.equal(card.includes(p.nextStepBullets[0]),false);
+    assert.equal(writes.length,0);
+    const article={dataset:{id:p.id}},button={dataset:{action:flow==='card'?'approve':'edit'},closest:()=>article};
+    page.events.click({target:{closest:()=>button}});
+    if(flow!=='card'){
+      const editor=page.get('#ns-rows').innerHTML;
+      assert.ok(editor.includes('value="2026-11-21"'));
+      assert.ok(editor.includes(`>${body}</textarea>`));
+      assert.equal(editor.includes('(complete by'),false);
+      assert.ok(page.get('#ns-preview').innerHTML.includes(formatted));
+      if(flow==='clear-date'){
+        const row={dataset:{row:'0'}};
+        page.events.input({target:{closest:()=>row,classList:{contains:key=>key==='ns-date'},value:''}});
+      }
+      page.get('#edit-form').handlers.submit({preventDefault(){}});
+    }
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(writes.length,1);
+    assert.deepEqual(writes[0].next_step_bullets,[flow==='clear-date'?body:formatted]);
+  }
+});
+
+test('Appending keeps current Sheet bullets and writes one copy of matching normalized suggestions',async()=>{
+  const s=snapshot(),p=s.proposals[0],formatted='Confirm the scope. (complete by Nov 21, 2026)';
+  s.rows[0].nextStep='- Received the previous proposal on Nov 8.';
+  p.nextStepBullets=['Confirm the scope by Nov 21.','Confirm the scope on Nov 21.'];
+  p.reviewNextStepBullets=[formatted,formatted];
+  p.bulletLineage.nextStep=p.nextStepBullets.map((text,i)=>({bulletId:'scope-'+i,text,sourceIds:['email-scope']}));
+  const writes=[];
+  const page=fakePage({callTool:async(name,args)=>{
+    if(name===core.TOOLS.workspace)return {structuredContent:s};
+    writes.push(json(args));
+    return {structuredContent:{status:'approved'}};
+  }});
+  await new Promise(resolve=>setImmediate(resolve));
+  page.events.click({target:{closest:selector=>selector.includes('[data-mode-pick]')?{dataset:{modePick:'append',modeFor:p.id}}:null}});
+  const article={dataset:{id:p.id}},button={dataset:{action:'approve'},closest:()=>article};
+  page.events.click({target:{closest:()=>button}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(writes.length,1);
+  assert.deepEqual(writes[0].next_step_bullets,['Received the previous proposal on Nov 8.',formatted]);
+});
+
+test('An invalid completion date in an older suggestion does not prefill the field',async()=>{
+  const s=snapshot(),p=s.proposals[0];
+  p.nextStepBullets=['Confirm the scope. (complete by Feb 30, 2026)','Send the proposal. — due 2026-02-31'];
+  p.bulletLineage.nextStep=p.nextStepBullets.map((text,i)=>({bulletId:'scope-'+i,text,sourceIds:['email-scope']}));
+  const page=fakePage({callTool:async()=>({structuredContent:s})});
+  await new Promise(resolve=>setImmediate(resolve));
+  const article={dataset:{id:p.id}},button={dataset:{action:'edit'},closest:()=>article};
+  page.events.click({target:{closest:()=>button}});
+  assert.equal([...page.get('#ns-rows').innerHTML.matchAll(/type="date" class="ns-date" value=""/g)].length,2);
 });
 
 test('The hosted page offers in-memory sign-in without calling the service before sign-in',()=>{

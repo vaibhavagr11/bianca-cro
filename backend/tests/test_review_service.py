@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from app import review_service as review
+from app.review_content import bullet_id
 from app.review_sheets import SheetConflict, SheetWriteUncertain
 
 
@@ -305,6 +306,41 @@ def test_edited_approval_is_audited_and_duplicate_key_does_not_rotate_twice(serv
     assert len(sheets.calls) == 1
     with pytest.raises(review.ReviewConflict):
         approve(["A different decision using the old key."])
+
+
+@pytest.mark.parametrize("timing,deadline,edited", [
+    ("by Nov 21", " (complete by Nov 21, 2026)", False),
+    ("next Friday", " (complete by Nov 6, 2026)", False),
+    ("by Nov 21", " (complete by Nov 22, 2026)", True),
+    ("by Nov 21", "", True),
+])
+def test_approved_deadline_preserves_provenance_only_for_the_automatic_format(service, timing, deadline, edited):
+    store, sheets = service
+    action = f"The coordinator should following up with Morgan {timing}, since the team is waiting for a response."
+    store.source_record = record(body=action)
+    store.insights = [insight(type="next_step", text=action, quote=action, action_scope="deal_progression",
+                              owner_name=None, due_date=None, origin_record_id=RECORD)]
+    next_steps, context, sources, lineage = review.proposal_content([store.source_record], store.insights)
+    version = review.source_version(store.source_record)
+    store.data["proposal"].update(
+        bullets=next_steps + context, next_step_bullets=next_steps, client_context_bullets=context,
+        sources=sources, source_versions=[version], observed_source_versions=[version], bullet_lineage=lineage,
+    )
+    approved_bullet = (
+        "Next step: The coordinator should keep following up with Morgan, since the team is waiting for a response."
+        + deadline
+    )
+
+    result = approve([approved_bullet])
+
+    assert sheets.next_step == "- " + approved_bullet
+    assert result["activity"]["edited"] is edited
+    assert result["activity"]["bulletLineage"]["nextStep"][0] == {
+        "bulletId": bullet_id("nextStep", approved_bullet),
+        "text": approved_bullet,
+        "origin": "founder_edit" if edited else "source",
+        "sourceIds": [] if edited else lineage["nextStep"][0]["sourceIds"],
+    }
 
 
 def test_ignore_only_reads_live_status_and_consumes_source_versions(service):
@@ -857,14 +893,22 @@ def test_unpinned_sheet_target_blocks_new_approvals_before_google_or_intent(serv
 
 def test_workspace_recovery_exposes_exact_split_payload_and_not_legacy_or_redirected_retry(service):
     store, sheets = service
-    sheets.uncertain = True
-    with pytest.raises(review.ReviewUnavailable):
-        approve(["Edited action."], client_context_bullets=["Customer need: Updated context."])
+    action = "Send the checklist before next Friday."
+    store.source_record = record(body=action)
+    store.insights = [insight_for_record(store.source_record)]
+    next_steps, context, sources, lineage = review.proposal_content([store.source_record], store.insights)
+    store.data["proposal"].update(
+        bullets=next_steps + context, next_step_bullets=next_steps, client_context_bullets=context,
+        sources=sources, bullet_lineage=lineage,
+    )
 
     class WorkspaceConnection:
         def execute(self, sql, params=()):
             if sql.startswith("select p.*"):
                 return Result([copy.deepcopy(store.data["proposal"])] if OPPORTUNITY in params[1] else [])
+            if sql.startswith("select source, external_id, content_hash, occurred_at, subject, meta from source_records"):
+                assert params[0] == WORKSPACE and {str(identifier) for identifier in params[1]} == {RECORD}
+                return Result([store.source_record])
             if sql.startswith("select idempotency_key"):
                 return Result([copy.deepcopy(store.data["intents"][0])])
             if sql.startswith("select o.*"):
@@ -876,17 +920,38 @@ def test_workspace_recovery_exposes_exact_split_payload_and_not_legacy_or_redire
                                 "normalized_name": name, "owner_code": "NDL", "last_progress": "Done",
                                 "next_step": "Later", "removed_at": item["removed_at"], "approved": 0}])
             if sql.startswith("select d.*"):
-                return Result([{**copy.deepcopy(store.data["intents"][0]),
-                                "company_name": store.data["proposal"]["company_name"]}] if OPPORTUNITY in params[1] else [])
+                return Result([
+                    {**copy.deepcopy(intent), "company_name": store.data["proposal"]["company_name"]}
+                    for intent in store.data["intents"] if OPPORTUNITY in params[1]
+                ])
             raise AssertionError(sql)
+
+    pending = review.workspace_view(WorkspaceConnection(), WORKSPACE)["proposals"][0]
+    assert pending["nextStepBullets"] == store.data["proposal"]["next_step_bullets"]
+    assert pending["reviewNextStepBullets"] == [
+        "We owe: Send the checklist. (complete by Nov 6, 2026)"
+    ]
+    assert pending["bulletLineage"] == store.data["proposal"]["bullet_lineage"]
+    assert not sheets.calls
+
+    store.source_record["meta"]["date_inferred"] = True
+    estimated = review.workspace_view(WorkspaceConnection(), WORKSPACE)["proposals"][0]
+    assert "reviewNextStepBullets" not in estimated
+    store.source_record["meta"].clear()
+
+    edited_action = "Send the revised proposal by Nov 21, 2026."
+    sheets.uncertain = True
+    with pytest.raises(review.ReviewUnavailable):
+        approve([edited_action], client_context_bullets=["Customer need: Updated context."])
 
     view = review.workspace_view(WorkspaceConnection(), WORKSPACE)
     proposal_view = view["proposals"][0]
     assert proposal_view["retry"] == {"idempotency_key": "approval-key-1", "revision": 1,
-                                       "next_step_bullets": ["Edited action."],
+                                       "next_step_bullets": [edited_action],
                                        "client_context_bullets": ["Customer need: Updated context."]}
-    assert proposal_view["nextStepBullets"] == ["Edited action."]
+    assert proposal_view["nextStepBullets"] == [edited_action]
     assert proposal_view["clientContextBullets"] == ["Customer need: Updated context."]
+    assert "reviewNextStepBullets" not in proposal_view
     assert "bullets" not in proposal_view
     assert view["routingVersion"] == 1
     assert view["clientContextMode"] == "append"
