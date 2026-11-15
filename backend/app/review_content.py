@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import quote
 
 from app import extractor
+from app.review_deadlines import normalize_deadline
 
 
 SOURCE_NAMES = {"gmail": "Email", "notes": "Meeting notes", "calendar": "Calendar"}
@@ -240,16 +241,60 @@ def merge_content(existing: dict | None, new_content: Content) -> Content:
     return _checked((groups["nextStep"], groups["clientContext"], list(sources.values()), lineage))
 
 
-def approved_lineage(proposal: dict, next_steps: list[str], context: list[str]) -> dict[str, list[dict]]:
-    """Retain provenance only for unchanged text in the same approved destination."""
+def review_next_step_bullets(proposal: dict, dated_source_ids: frozenset[str] = frozenset()) -> list[str]:
+    """Format pending bullets using the dates captured with their proposal."""
+    bullets, _, sources, lineage = _parts(proposal)
+    edges = lineage.get("nextStep") if isinstance(lineage, dict) else None
+    if not isinstance(edges, list) or not isinstance(sources, list) or len(edges) != len(bullets):
+        return bullets
+
+    source_dates = {
+        source["id"]: extractor.parse_due(source.get("date"))
+        for source in sources if isinstance(source, dict) and isinstance(source.get("id"), str)
+        and isinstance(source.get("date"), str)
+    }
+    proposal_date = extractor.parse_due(_stamp(proposal.get("created_at"))[:10])
+    formatted = []
+    representatives = {}
+    for bullet, edge in zip(bullets, edges):
+        if not isinstance(bullet, str):
+            return bullets
+        source_ids = edge.get("sourceIds") if isinstance(edge, dict) else None
+        if not isinstance(source_ids, list):
+            source_ids = []
+        dates = {identifier: source_dates.get(identifier) for identifier in source_ids if isinstance(identifier, str)}
+        reference = max((day for day in dates.values() if day is not None), default=proposal_date)
+        text = normalize_deadline(bullet, reference, allow_relative=False)
+        if text == bullet:
+            # Repeated suggestions can have different source days. Only use a relative date they agree on.
+            anchors = {day for identifier, day in dates.items() if day is not None and identifier in dated_source_ids}
+            resolved = {normalize_deadline(bullet, anchor) for anchor in anchors}
+            if len(resolved) == 1:
+                text = resolved.pop()
+        # Keep the source indexes aligned when two phrasings become the same bullet.
+        formatted.append(representatives.setdefault(_squash(text), text))
+    return formatted
+
+
+def approved_lineage(proposal: dict, next_steps: list[str], context: list[str], *,
+                     review_next_steps: list[str] | None = None) -> dict[str, list[dict]]:
+    """Retain provenance for original text and its automatic deadline formatting."""
     has_lineage = proposal.get("lineage_version", proposal.get("lineageVersion", 0)) == LINEAGE_VERSION
     original = _checked(_parts(proposal)) if has_lineage else ([], [], [], {key: [] for key in DESTINATIONS})
     result = {destination: [] for destination in DESTINATIONS}
+    formatted_sources: dict[str, list[str]] = {}
+    if review_next_steps is not None:
+        for text, node in zip(review_next_steps, original[3]["nextStep"]):
+            formatted_sources[text] = _union(formatted_sources.get(text, []), node["sourceIds"])
+
     for index, (destination, approved) in enumerate(zip(DESTINATIONS, (next_steps, context))):
         known = {_squash(text): node for text, node in zip(original[index], original[3][destination])}
         for text in approved:
             previous = known.get(_squash(text))
+            source_ids = list(previous["sourceIds"]) if previous else []
+            if destination == "nextStep" and text in formatted_sources:
+                source_ids = _union(source_ids, formatted_sources[text])
             result[destination].append({"bulletId": bullet_id(destination, text), "text": text,
-                                        "sourceIds": list(previous["sourceIds"]) if previous else [],
-                                        "origin": "source" if previous else "founder_edit"})
+                                        "sourceIds": source_ids,
+                                        "origin": "source" if source_ids else "founder_edit"})
     return result
