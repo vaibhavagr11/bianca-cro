@@ -147,7 +147,7 @@ class ChangeRow:
 
 @dataclass
 class SelectionRecord:
-    """Why an eligible deal was or was not shown in "Deals to move" (dry-run audit, not the email)."""
+    """Rationale for each deal's place in the initial Deals to Move rows."""
     deal: str
     stage: str | None
     selected: bool
@@ -329,10 +329,9 @@ def waiting_on_them(thread: list[dict], internal: set[str], now: datetime) -> di
             "auto_reply": any(m["automated"] and m["at"] > last["at"] for m in thread)}
 
 
-def pick_waiting(waiting: list[Waiting], code: str) -> tuple[list[Waiting], int]:
+def rank_waiting(waiting: list[Waiting], code: str) -> list[Waiting]:
     """This founder's waits: prospects and pilots first, then the most recent silence (still worth a nudge)."""
-    mine = sorted((w for w in waiting if w.owner == code), key=lambda w: (w.rank not in PROSPECT_RANKS, w.days, w.deal))
-    return mine[:MAX_WAITING], max(0, len(mine) - MAX_WAITING)
+    return sorted((w for w in waiting if w.owner == code), key=lambda w: (w.rank not in PROSPECT_RANKS, w.days, w.deal))
 
 
 def waiting_text(w: Waiting) -> str:
@@ -487,11 +486,12 @@ def deal_signals(v: DealView, today: date, in_today: set[str], critical_ahead: i
 
 def select_deals(eligible: list[DealView], today: date, in_today: set[str], critical_ahead: int,
                  in_talks_target: int, slots: int = MAX_HIGHLIGHTS) -> tuple[list[DealView], list[SelectionRecord]]:
-    """Choose the displayed deals deterministically.
+    """Choose the first rows deterministically, then append the remaining eligible deals.
 
     1. Time-critical deals first; they are never displaced. 2. Then active In Talks deals with at least one
     evidence-backed signal, up to in_talks_target (a preference, not a quota). 3. Then the rest by signal count.
     Ties: more signals, later stage, more recent contact, then name, so identical inputs always give identical output.
+    The audit describes selection for the first rows.
     """
     info = {v.deal: deal_signals(v, today, in_today, critical_ahead) for v in eligible}
     recency = lambda v: -(v.last_contact.toordinal()) if v.last_contact else 0
@@ -518,17 +518,19 @@ def select_deals(eligible: list[DealView], today: date, in_today: set[str], crit
 
     selected = [v for v in ranked if v.deal in chosen]
     order = {v.deal: n for n, v in enumerate(selected, start=1)}
+    overflow = []
     records = []
     for v in ranked:
         crit, sig = info[v.deal]
         if v.deal in chosen:
             reason = chosen[v.deal]
-        elif not sig and not crit:
+        elif not sig and not crit and v.rank == 1:
             reason = "no evidence-backed signal (recent activity alone is not enough)"
         else:
+            overflow.append(v)
             reason = f"outranked: all {slots} slots taken by deals with time-critical items or more signals"
         records.append(SelectionRecord(v.deal, v.stage, v.deal in chosen, order.get(v.deal), crit, sig, reason))
-    return selected, records
+    return selected + overflow, records
 
 
 CHANGE_LABELS = {"buying_signal": "Buying signal", "blocker": "New blocker", "objection": "Objection",
@@ -609,8 +611,11 @@ class Section:
     all_items: list[Item] = field(default_factory=list)   # everything routed here, for the payload
     audit: list[SelectionRecord] = field(default_factory=list)
     waiting: list[Waiting] = field(default_factory=list)  # we wrote last, no answer yet
-    more_waiting: int = 0
     verification: VerificationNotes | None = None
+
+    @property
+    def more_waiting(self) -> int:
+        return max(0, len(self.waiting) - MAX_WAITING)
 
 
 def _without_waiting_action(view: DealView, waiting: Waiting) -> DealView:
@@ -694,7 +699,7 @@ def _split_followups(view: DealView, today: date, used: set[str]) -> tuple[DealV
 def build_section(code: str, name: str, short: str, views: dict[str, DealView], items: list[Item],
                   meetings: list[tuple[Meeting, str]], today: date, display: dict[str, str],
                   hidden: int = 0, critical_ahead: int = 3, in_talks_target: int = 2, *,
-                  waiting: list[Waiting] | None = None, more_waiting: int = 0,
+                  waiting: list[Waiting] | None = None,
                   waiting_candidates: list[Waiting] | None = None) -> Section:
     mine: dict[str, DealView] = {}
 
@@ -771,7 +776,7 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
         primary_moves[v.deal] = move
         highlight_views.append(v)
 
-    selected, audit = select_deals(highlight_views, today, in_today, critical_ahead, in_talks_target)
+    ranked_highlights, audit = select_deals(highlight_views, today, in_today, critical_ahead, in_talks_target)
     for v in sorted(owned, key=lambda v: v.deal):  # the audit also explains prospects that were not eligible at all
         if v.deal in followup_only:
             audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
@@ -782,16 +787,18 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                                          f"not eligible: status {status}" + (f", last record {_date(v.last_contact)}"
                                                                              if v.last_contact else "")))
     highlights = []
-    for v in selected:
+    for v in ranked_highlights:
         m = primary_moves[v.deal]
         if m.item_id:
             used.add(m.item_id)
         highlights.append((v, m, situation(v)))
     shown = {v.deal for v, _, _ in highlights}
+    first_highlights = highlights[:MAX_HIGHLIGHTS]
+    first_deals = {v.deal for v, _, _ in first_highlights}
 
     # Follow-ups stay here even when the deal also has a separate highlighted move.
     follow: list[Move] = []
-    for v, m, _ in highlights:  # when the move addresses the blocker instead, the nearest promise stays visible
+    for v, m, _ in first_highlights:  # when the move addresses the blocker instead, the nearest promise stays visible
         dated = sorted((i for i in v.items if i.id not in used and i.kind == "owed" and i.bucket in ("overdue", "week")),
                        key=lambda i: i.due)
         if m.tag != "We owe" and dated:
@@ -799,7 +806,7 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
             follow.append(item_move("We owe", f"{v.deal}: {i.text}", f"due {_date(i.due)}", i))
     for v in action_views.values():
         follow.extend(reminders[v.deal])
-        if v.deal in shown:
+        if v.deal in first_deals:
             continue
         for i in v.items:
             if i.id in used:
@@ -828,10 +835,9 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
         b.exceptions = [i for i in sorted(rest, key=lambda i: i.due or date.max)
                         if i.kind == "owed" and i.due and views[i.deal].rank in (2, 3, 4)][:MAX_EXCEPTIONS]
 
-    return Section(code, name, short, today_rows, highlights, [r.deal for r in audit if r.position is None
-                                                                and not r.reason.startswith("not eligible")],
+    return Section(code, name, short, today_rows, highlights, [v.deal for v, _, _ in highlights[MAX_HIGHLIGHTS:]],
                    meetings, follow_shown, [], len(follow) - len(follow_shown), unclear, dormant, b,
-                   hidden, routed, audit, waiting=waiting, more_waiting=more_waiting)
+                   hidden, routed, audit, waiting=waiting)
 
 
 # ---------------------------------------------------------------- rendering
@@ -900,6 +906,27 @@ def _table(head: str, rows: list[str]) -> str:
             f"<tr>{head}</tr>{''.join(rows)}</table>")
 
 
+def _section_table(head: str, rows: list[str], limit: int, columns: int, state: str | None) -> str:
+    if state is None or len(rows) <= limit:
+        return _table(head, rows)
+
+    label = f"Show {len(rows) - limit} more"
+    row_group = f"{state}-rows"
+    return (
+        '<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%">'
+        f"<thead><tr>{head}</tr></thead><tbody>{''.join(rows[:limit])}"
+        f'<tr><td colspan="{columns}" style="padding:6px 8px">'
+        f'<button type="button" on="tap:AMP.setState({{{state}: !{state}}})" '
+        f'aria-controls="{row_group}" aria-expanded="false" '
+        f'[aria-expanded]="{state} ? \'true\' : \'false\'" '
+        f'style="padding:4px 8px;border:1px solid #d0d5dd;border-radius:4px;'
+        f'font:600 12px {FONT};color:{BLUE};background:#fff">'
+        f'<span [text]="{state} ? \'Show fewer\' : \'{label}\'">{label}</span>'
+        '</button></td></tr></tbody>'
+        f'<tbody id="{row_group}" hidden [hidden]="!{state}">{"".join(rows[limit:])}</tbody></table>'
+    )
+
+
 def _src(source: str | None) -> str:
     """Where a row comes from and when, as plain text: "Email · Oct 6", "Notes · Sep 28"."""
     return f'<span style="white-space:nowrap">{_muted(_e(source))}</span>' if source else _muted("—")
@@ -951,9 +978,11 @@ def table_text_fields(sections: list[Section], ndl_rows: list[TodayRow], changes
     yield from map(_change_text, changes)
 
 
-def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, display=read_table_text) -> str:
+def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, display=read_table_text,
+                   amp_index: int | None = None) -> str:
     done_th = _th("", "9%") if action_url else ""
     done_td = (lambda ref: _td(_done(ref, action_url))) if action_url else (lambda ref: "")
+    columns = 5 if action_url else 4
     out = [f'<p style="margin:24px 0 0;padding:6px 10px;background:#f2f4f7;border-left:3px solid {BLUE};'
            f'font:600 14px {FONT};color:{INK}">{_e(s.name)}</p>']
     out.append(_h("Needs you today", RED, len(s.today)))
@@ -973,20 +1002,20 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, 
                         + _td(sit_html, "width:30%")
                         + _td(f"{_tag(m.tag)} {_e(display(_move_text(m)))}<br>{_muted(_e(m.when + gap))}")
                         + _td(_src(m.source), "width:12%") + done_td(m.done) + "</tr>")
-        out.append(_table(_th("Deal") + _th("Situation") + _th("Next move") + _th("Source") + done_th, rows))
+        head = _th("Deal") + _th("Situation") + _th("Next move") + _th("Source") + done_th
+        state = f"deals{amp_index}" if amp_index is not None else None
+        out.append(_section_table(head, rows, MAX_HIGHLIGHTS, columns, state))
     else:
         out.append(_empty("No active prospect or pilot needs attention."))
-    if s.also_active:
-        out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">Also active: {_e(", ".join(s.also_active))}</p>')
 
     if s.waiting:
-        out.append(_h("Waiting on their reply", AMBER, len(s.waiting) + s.more_waiting))
-        out.append(_table(_th("Deal", "20%") + _th("Who · status") + _th("Waiting", "13%") + _th("Source", "12%") + done_th,
-                          ["<tr>" + _td(_deal_cell(w.deal, w.stage)) + _td(_e(display(_waiting_text(w))))
-                           + _td(_muted(_e(f"{w.days}d since {_date(w.sent)}"))) + _td(_src(w.source))
-                           + done_td(f"thread:{w.thread_id}" if w.thread_id else None) + "</tr>" for w in s.waiting]))
-        if s.more_waiting:
-            out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">+ {s.more_waiting} more on record</p>')
+        out.append(_h("Waiting on their reply", AMBER, len(s.waiting)))
+        head = _th("Deal", "20%") + _th("Who · status") + _th("Waiting", "13%") + _th("Source", "12%") + done_th
+        rows = ["<tr>" + _td(_deal_cell(w.deal, w.stage)) + _td(_e(display(_waiting_text(w))))
+                + _td(_muted(_e(f"{w.days}d since {_date(w.sent)}"))) + _td(_src(w.source))
+                + done_td(f"thread:{w.thread_id}" if w.thread_id else None) + "</tr>" for w in s.waiting]
+        state = f"waiting{amp_index}" if amp_index is not None else None
+        out.append(_section_table(head, rows, MAX_WAITING, columns, state))
 
     out.append(_h("Meetings today & tomorrow", BLUE, len(s.meetings)))
     out.append(meetings_table(s.meetings, display=display) if s.meetings else _empty("No customer meetings today or tomorrow."))
@@ -1053,13 +1082,23 @@ def completable(sections: list[Section], ndl_rows: list[TodayRow]) -> dict[str, 
 
 def render(sections: list[Section], ndl_rows: list[TodayRow], changes: list[ChangeRow], today: date,
            active_deals: int, coverage: str, nico_gap: bool, backfill: str | None = None, action_url=None,
-           ndl_review: VerificationNotes | None = None, *, display=read_table_text) -> str:
-    """action_url(ref) -> link for a row's "Mark as complete" button; None leaves the buttons out."""
+           ndl_review: VerificationNotes | None = None, *, display=read_table_text, amp: bool = False) -> str:
+    """Render a standard HTML fragment or a complete AMP email with expandable tables."""
     counts = " · ".join(f"{s.short}: {len(s.today)} today, {len(s.highlights)} deals" for s in sections)
-    out = [_stage_css(), f'<div class="bianca-brief" style="max-width:760px;margin:0 auto;padding:8px 4px">',
+    if amp:
+        out = ['<!doctype html><html amp4email lang="en" data-css-strict><head><meta charset="utf-8">',
+               '<script async src="https://cdn.ampproject.org/v0.js"></script>',
+               '<style amp4email-boilerplate>body{visibility:hidden}</style>']
+        if any(len(s.highlights) > MAX_HIGHLIGHTS or len(s.waiting) > MAX_WAITING for s in sections):
+            out.append('<script async custom-element="amp-bind" src="https://cdn.ampproject.org/v0/amp-bind-0.1.js"></script>')
+        out.append("</head><body>")
+    else:
+        out = [_stage_css()]
+    out += [f'<div class="bianca-brief" style="max-width:760px;margin:0 auto;padding:8px 4px">',
            f'<p style="font:600 18px {FONT};margin:0 0 2px;color:{INK}">Pipeline brief · {_e(f"{today:%a}, {today:%b} {today.day}")}</p>',
            f'<p style="font:13px {FONT};margin:0;color:{MUTED}">{_e(counts)} · {active_deals} deals in the Sheet</p>']
-    out += [render_section(s, today, nico_gap, action_url, display=display) for s in sections]
+    out += [render_section(s, today, nico_gap, action_url, display=display, amp_index=index if amp else None)
+            for index, s in enumerate(sections)]
     if ndl_rows or (ndl_review and (ndl_review.waiting or ndl_review.unclear)):
         out.append(f'<p style="margin:24px 0 0;padding:6px 10px;background:#f2f4f7;border-left:3px solid {MUTED};'
                    f'font:600 14px {FONT};color:{INK}">Nico de León · urgent only</p>')
@@ -1080,6 +1119,8 @@ def render(sections: list[Section], ndl_rows: list[TodayRow], changes: list[Chan
         out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">{_e(backfill)}</p>')
     out.append(f'<p style="font:11px {FONT};color:#98a2b3;margin-top:28px">{_e(coverage)} <b>We owe</b> = recorded '
                f"agreement · <b>AI recommendation</b> = suggested next move.</p></div>")
+    if amp:
+        out.append("</body></html>")
     return "".join(out)
 
 
@@ -1098,7 +1139,7 @@ def plain_text(sections: list[Section], today: date, ndl_review: VerificationNot
         lines += [f"• {v.deal} ({stage_short(v.stage)}): [{m.tag}] {display(_move_text(m))} ({m.when})"
                   for v, m, _ in s.highlights]
         if s.waiting:
-            lines.append(f"Waiting on their reply ({len(s.waiting) + s.more_waiting})")
+            lines.append(f"Waiting on their reply ({len(s.waiting)})")
             lines += [f"• {w.deal}: {display(_waiting_text(w))} ({w.days}d since {_date(w.sent)})" for w in s.waiting]
         if s.meetings:
             lines.append("Meetings today & tomorrow")
@@ -1120,20 +1161,28 @@ def to_payload(sections: list[Section], ndl_rows: list[TodayRow], changes: list[
 
     def move(m: Move) -> dict:
         return {"tag": m.tag, "text": m.text, "when": m.when, "item_id": m.item_id}
+
+    def highlights(rows: list[tuple[DealView, Move, Note | None]]) -> list[dict]:
+        return [{"deal": v.deal, "stage": v.stage, "situation": sit.text if sit else None, "move": move(m)}
+                for v, m, sit in rows]
+
+    def waits(rows: list[Waiting]) -> list[dict]:
+        return [{"deal": w.deal, "to": w.to, "sent": w.sent, "days": w.days, "nudges": w.nudges,
+                 "replied_before": w.replied_before, "auto_reply": w.auto_reply, "thread_id": w.thread_id,
+                 "action": w.action} for w in rows]
+
     return {"version": "v2", "sections": [{
         "owner": s.code,
         "today": [{"deal": r.deal, "tag": r.tag, "text": r.text, "when": r.when, "item_id": r.item_id} for r in s.today],
-        "highlights": [{"deal": v.deal, "stage": v.stage, "situation": sit.text if sit else None, "move": move(m)}
-                       for v, m, sit in s.highlights],
+        "highlights": highlights(s.highlights[:MAX_HIGHLIGHTS]),
+        "overflow_highlights": highlights(s.highlights[MAX_HIGHLIGHTS:]),
         "selection_audit": [{"deal": r.deal, "stage": r.stage, "selected": r.selected, "position": r.position,
                              "time_critical": r.critical, "signals": r.signals, "reason": r.reason} for r in s.audit],
         "also_active": s.also_active,
         "customers": [],  # retain the response key for callers of v2
         "followups": [move(m) for m in s.followups], "more_followups": s.more_followups,
-        "waiting": [{"deal": w.deal, "to": w.to, "sent": w.sent, "days": w.days, "nudges": w.nudges,
-                     "replied_before": w.replied_before, "auto_reply": w.auto_reply, "thread_id": w.thread_id,
-                     "action": w.action}
-                    for w in s.waiting], "more_waiting": s.more_waiting,
+        "waiting": waits(s.waiting[:MAX_WAITING]), "overflow_waiting": waits(s.waiting[MAX_WAITING:]),
+        "more_waiting": s.more_waiting,
         "unclear": [v.deal for v in s.unclear], "dormant": s.dormant,
         "backlog": {"count": s.backlog.count, "deals": s.backlog.deals, "oldest": s.backlog.oldest,
                     "exceptions": [item(i) for i in s.backlog.exceptions]},

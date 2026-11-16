@@ -146,6 +146,7 @@ def verify_v2(sections: list[brief_v2.Section], ndl: list[brief_v2.TodayRow], co
     inventory.add(ndl, describe, ndl_notes)
     open_refs = inventory.apply(gate)
     for section in sections:
-        section.more_followups = section.more_waiting = 0
+        section.more_followups = 0
+        section.also_active = [view.deal for view, _, _ in section.highlights[brief_v2.MAX_HIGHLIGHTS:]]
         section.all_items = [i for i in section.all_items if f"insight:{i.id}" in open_refs]
     return ndl_notes

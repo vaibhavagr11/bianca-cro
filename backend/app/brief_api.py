@@ -33,6 +33,7 @@ def _dumps(obj) -> str:
 router = APIRouter(prefix="/brief")
 
 FOUNDER_ORDER = ["RG", "NC"]  # sections in this order; NDL gets the small shared table
+AMP_EMAIL_MAX_BYTES = 200_000
 # Two founders are named Nicolás, so the brief uses these names, not first names.
 DISPLAY = {"RG": ("Ramiro", "Ramiro Godfrid"), "NC": ("Nico", "Nico Casaux"), "NDL": ("Nico DL", "Nico de León")}
 
@@ -782,15 +783,13 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
 
     names = {t["owner_code"]: t["full_name"] for t in team}
     waits = list(waiting.values())
-    picked_waits = {code: brief_v2.pick_waiting(waits, code) for code in FOUNDER_ORDER}
     sections = []
     for code in FOUNDER_ORDER:
         short, full = DISPLAY.get(code, (code, names.get(code, code)))
-        shown, more = picked_waits[code]
         sections.append(brief_v2.build_section(
             code, full, short, views, items, [(m, m.context) for m in meetings if code in m.attendees], today, display,
             0 if gate else hidden.get(code, 0), settings.brief_critical_ahead_days, settings.brief_in_talks_target,
-            waiting=shown, more_waiting=more, waiting_candidates=waiting_candidates))
+            waiting=brief_v2.rank_waiting(waits, code), waiting_candidates=waiting_candidates))
 
     ndl = [brief_v2.TodayRow(i.deal, views[i.deal].stage, "Due now", i.text, f"due {i.due:%b} {i.due.day}", "Nico DL",
                              i.link, i.id, i.source, f"insight:{i.id}")
@@ -898,4 +897,9 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
     log.info("brief v2 built for %s: items=%s changes=%s dry_run=%s", today, len(items), len(changes), dry_run)
     response = {"subject": subj, "html": html_body, "text": text_body, "to": ",".join(to), "for_date": today.isoformat(),
                 "candidates": len(items), "dry_run": dry_run, "version": "v2", "payload": json.loads(_dumps(payload))}
+    if any(len(s.highlights) > brief_v2.MAX_HIGHLIGHTS or s.more_waiting for s in sections):
+        amp_html = brief_v2.render(sections, ndl, changes, today, len(deals), coverage, not NICO_INBOX_CONNECTED,
+                                   backfill, action_url, ndl_review, display=display, amp=True)
+        if len(amp_html.encode("utf-8")) <= AMP_EMAIL_MAX_BYTES:
+            response["amp_html"] = amp_html
     return _finish(workspace_id, today, payload, to, response, dry_run, gate, pipeline_sync_run_id)
