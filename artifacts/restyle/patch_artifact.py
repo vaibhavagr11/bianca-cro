@@ -204,18 +204,45 @@ const BiancaWarRoom = (() => {
   // Still presentation only: the page's own approve / decide path sends the bullets; nothing here calls the connector.
   const modes = new Map();
   const mode = id => modes.get(id) === 'append' ? 'append' : 'replace';
+  function suggestedNextSteps(proposal){
+    const original = proposal.nextStepBullets || [];
+    const formatted = proposal.reviewNextStepBullets;
+    // Formatted bullets keep the original order so source links stay attached to the right rows.
+    if(proposal.status === 'pending' && Array.isArray(formatted) && formatted.length === original.length &&
+       formatted.every(bullet => typeof bullet === 'string' && bullet.trim())) return formatted;
+    return original;
+  }
   const cellBullets = v => String(v || '').split(/\r?\n/).map(l => l.trim().replace(/^(?:[-*•]\s*)/, '').trim()).filter(Boolean);
-  // Keep + add: the bullets already in the Sheet cell, then the new ones (identical lines not repeated).
-  function merged(id, bullets, currentCell){ if(mode(id) !== 'append' || !bullets || !bullets.length) return bullets; const cur = cellBullets(currentCell), seen = new Set(cur); return [...cur, ...bullets.filter(x => !seen.has(x))]; }
+  function merged(id, bullets, currentCell){
+    const proposed = [...new Set(bullets)];
+    if(mode(id) !== 'append' || !proposed.length) return proposed;
+    const current = cellBullets(currentCell), seen = new Set(current);
+    return [...current, ...proposed.filter(bullet => !seen.has(bullet))];
+  }
   function modeControl(id){ const m = mode(id); return `<div class="mode-row"><div class="mode" role="group" aria-label="Next Step write mode"><button type="button" class="${m==='replace'?'on':''}" data-mode-pick="replace" data-mode-for="${esc(id)}" aria-pressed="${m==='replace'}">Replace Next Step</button><button type="button" class="${m==='append'?'on':''}" data-mode-pick="append" data-mode-for="${esc(id)}" aria-pressed="${m==='append'}">Keep current bullets + add these</button></div><span class="mode-hint">${m==='append'?'Bullets already in the Sheet stay; these are added below.':'These replace what is in Next Step now.'}</span></div>`; }
   function paintDialogMode(id){ const m = mode(id); document.querySelectorAll('#edit-mode [data-mode-pick]').forEach(x => { const on = x.dataset.modePick === m; x.classList.toggle('on', on); x.setAttribute('aria-pressed', String(on)); }); }
-  const fmtDate = iso => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || ''); return m ? new Date(Date.UTC(+m[1], +m[2]-1, +m[3])).toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric', timeZone:'UTC'}) : ''; };
-  const toISO = text => { if(!/\b\d{4}\b/.test(text)) return ''; const t = Date.parse(text + ' UTC'); return Number.isFinite(t) ? new Date(t).toISOString().slice(0, 10) : ''; };
+  function fmtDate(iso){
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(iso || '')) return '';
+    const day = new Date(iso + 'T00:00:00Z');
+    if(!Number.isFinite(day.getTime()) || day.toISOString().slice(0, 10) !== iso) return '';
+    return day.toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric', timeZone:'UTC'});
+  }
+  function toISO(text){
+    const clean = text.trim();
+    if(fmtDate(clean)) return clean;
+    const date = /^([a-z]+)\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})$/i.exec(clean);
+    if(!date) return '';
+    const day = new Date(date[1] + ' ' + date[2] + ', ' + date[3] + ' UTC');
+    if(!Number.isFinite(day.getTime())) return '';
+    const iso = day.toISOString().slice(0, 10);
+    const expected = date[1].slice(0, 3) + ' ' + Number(date[2]) + ', ' + Number(date[3]);
+    return fmtDate(iso).toLowerCase() === expected.toLowerCase() ? iso : '';
+  }
   function splitBullet(bullet){
     let m = /\s*\(complete by ([^)]+)\)\s*$/i.exec(bullet);
     if(m){ const iso = toISO(m[1]); if(iso) return {text: bullet.slice(0, m.index).trim(), date: iso}; }
     m = /\s*[—–-]\s*due (\d{4}-\d{2}-\d{2})\s*$/i.exec(bullet);
-    if(m) return {text: bullet.slice(0, m.index).trim(), date: m[1]};
+    if(m && fmtDate(m[1])) return {text: bullet.slice(0, m.index).trim(), date: m[1]};
     return {text: bullet, date: ''};
   }
   const joinBullet = (text, date) => { const t = String(text || '').replace(/[\r\n]+/g, ' ').trim(); if(!t) return ''; const d = fmtDate(date); return d ? `${t} (complete by ${d})` : t; };
@@ -230,7 +257,7 @@ const BiancaWarRoom = (() => {
   function openRows(id){ try{ const ta = $('#edit-content'), box = $('#ns-rows'); if(!ta || !box) return; editingRows = id; rows = cellBullets(ta.value).map(x => { const p = splitBullet(x); return {orig:x, text:p.text, date:p.date, t0:p.text, d0:p.date}; }); if(!rows.length) rows = [blankRow()]; paintDialogMode(id); drawRows(0); }catch(_){ } }
   document.addEventListener('input', e => { const row = e.target.closest?.('.ns-row'); if(!row) return; const r = rows[Number(row.dataset.row)]; if(!r) return; if(e.target.classList.contains('ns-text')) r.text = e.target.value; else if(e.target.classList.contains('ns-date')) r.date = e.target.value; syncRows(); });
   document.addEventListener('keydown', e => { if(e.key === 'Enter' && !e.shiftKey && e.target.closest?.('.ns-row') && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')){ e.preventDefault(); rows.push(blankRow()); drawRows(rows.length - 1); } });
-  return {shell, avatar, ownerName, stageClass, shortDate, esc, mode, merged, modeControl, openRows, get selected(){ return selected; }};
+  return {shell, avatar, ownerName, stageClass, shortDate, esc, mode, merged, modeControl, openRows, suggestedNextSteps, get selected(){ return selected; }};
 })();
 """
 
@@ -239,7 +266,7 @@ CARD_JS = r"""function card(p){
     const WR=BiancaWarRoom;
     const cellOf=(field)=>{const row=state.rows.find(r=>r.id===p.id)||state.rows.find(r=>r.company===p.company);return row?row[field]:p[field];};
     const applying=p.status==='applying',legacy=p.routingVersion!==undefined&&p.routingVersion!==1,data=displayTrace(p),lineageBlocked=!applying&&!legacy&&!data.available;
-    const nextBullets=applying&&p.retry?p.retry.next_step_bullets:(p.nextStepBullets||[]),contextBullets=applying&&p.retry?p.retry.client_context_bullets:(p.clientContextBullets||[]);
+    const nextBullets=applying&&p.retry?p.retry.next_step_bullets:WR.suggestedNextSteps(p),contextBullets=applying&&p.retry?p.retry.client_context_bullets:(p.clientContextBullets||[]);
     const srcs=(p.sources||[]).slice(0,3);
     const traceNote=(!data.available||![...data.lineage.nextStep,...data.lineage.clientContext].some(edge=>edge.sourceIds.length))?traceMessage(p,data):'';
     const whatsNew=srcs.length?`<ul class="whats-new">${srcs.map(s=>{const line=s.summary||s.subject||'';const ctx=s.quote||s.subject||'';return `<li><details><summary><span>${esc(line)}</span><span class="src">Source: ${esc(sourceType(s.type))}, ${esc(WR.shortDate(s.date))}</span></summary><div class="ctx">${esc(ctx)}</div></details></li>`;}).join('')}</ul>`:'<p class="empty-group">No new information recorded.</p>';
@@ -285,16 +312,19 @@ def patch(src_html: str, demo: bool) -> str:
     assert 'id="ns-rows"' in s, "edit-help anchor not found"
     assert s.count("$('#edit-dialog').showModal();$('#edit-content').focus();}") == 1
     s = s.replace("$('#edit-dialog').showModal();$('#edit-content').focus();}", "$('#edit-dialog').showModal();$('#edit-content').focus();BiancaWarRoom.openRows(id);}", 1)
+    assert s.count("$('#edit-content').value=p.nextStepBullets.map") == 1
+    s = s.replace("$('#edit-content').value=p.nextStepBullets.map",
+                  "$('#edit-content').value=BiancaWarRoom.suggestedNextSteps(p).map", 1)
     # 5c. Replace / Keep + add: applied where the page builds the bullets it approves (card Approve and the editor submit)
     if demo:
         cur = "state.rows.find(r=>r.id===ID)?.nextStep"
         a_old = "if(action==='approve')approve(id,state.proposals.find(p=>p.id===id));"
-        a_new = "if(action==='approve'){const p=state.proposals.find(p=>p.id===id);if(BiancaWarRoom.mode(id)==='append'&&p.nextStepBullets.length)approve(id,{nextStepBullets:BiancaWarRoom.merged(id,p.nextStepBullets," + cur.replace('ID','id') + "),clientContextBullets:p.clientContextBullets},true);else approve(id,p);}"
+        a_new = "if(action==='approve'){const p=state.proposals.find(p=>p.id===id);if(p?.status==='pending')approve(id,{nextStepBullets:BiancaWarRoom.merged(id,BiancaWarRoom.suggestedNextSteps(p)," + cur.replace('ID','id') + "),clientContextBullets:p.clientContextBullets});}"
         s_old = "nextStepBullets:BiancaCore.parseBullets($('#edit-content').value)"
         s_new = "nextStepBullets:BiancaWarRoom.merged(editingId,BiancaCore.parseBullets($('#edit-content').value)," + cur.replace('ID','editingId') + ")"
     else:
         a_old = "if(action==='approve')decide(id,'approve',state.proposals.find(p=>p.id===id));"
-        a_new = "if(action==='approve'){const p=state.proposals.find(p=>p.id===id);if(p&&BiancaWarRoom.mode(id)==='append'&&p.nextStepBullets?.length)decide(id,'approve',{nextStepBullets:BiancaWarRoom.merged(id,p.nextStepBullets,currentNextStep(p)),clientContextBullets:p.clientContextBullets},true);else decide(id,'approve',p);}"
+        a_new = "if(action==='approve'){const p=state.proposals.find(p=>p.id===id);if(p?.status==='pending')decide(id,'approve',{nextStepBullets:BiancaWarRoom.merged(id,BiancaWarRoom.suggestedNextSteps(p),currentNextStep(p)),clientContextBullets:p.clientContextBullets});}"
         s_old = "nextStepBullets:BiancaLive.parseBullets($('#edit-content').value)"
         s_new = "nextStepBullets:BiancaWarRoom.merged(editingId,BiancaLive.parseBullets($('#edit-content').value),currentNextStep(state.proposals.find(p=>p.id===editingId)||{}))"
     assert s.count(a_old) == 1 and s.count(s_old) == 1, "approve / submit anchors not found"

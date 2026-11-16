@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import pytest
 
 from app.review_content import (approved_lineage, bullet_id, merge_content, proposal_content,
-                                source_id, source_version, validate_lineage)
+                                review_next_step_bullets, source_id, source_version, validate_lineage)
 
 
 NOW = datetime(2026, 11, 4, 15, tzinfo=timezone.utc)
@@ -244,6 +244,43 @@ def test_reordering_approved_bullets_uses_text_identity_not_the_old_array_positi
     assert [node["bulletId"] for node in lineage["nextStep"]] == [bullet_id("nextStep", text) for text in approved]
     assert all(node["sourceIds"] == [source_id(record())] and node["origin"] == "source"
                for node in lineage["nextStep"])
+
+
+def test_matching_formatted_deadlines_keep_both_sources_when_approved_once():
+    first_text = "Send the checklist by Nov 21."
+    second_text = "Send the Checklist on November 21."
+    first = record(body=first_text)
+    second = record(2, body=second_text)
+    content = proposal_content([first, second], [
+        insight(text=first_text, quote=first_text, source_record_ids=[first["id"]]),
+        insight(text=second_text, quote=second_text, source_record_ids=[second["id"]]),
+    ])
+    proposal = stored(content)
+
+    formatted = review_next_step_bullets(proposal)
+
+    assert len(content[0]) == 2
+    assert formatted == [formatted[0], formatted[0]]
+    assert formatted[0].endswith("(complete by Nov 21, 2026)")
+    lineage = approved_lineage(proposal, formatted[:1], [], review_next_steps=formatted)
+    assert lineage["nextStep"][0]["sourceIds"] == sorted([source_id(first), source_id(second)])
+
+
+def test_relative_deadlines_require_supporting_source_dates_that_agree():
+    action = "Send the checklist next Friday."
+    first = record(body=action)
+    second = record(2, body=action, occurred_at=NOW.replace(day=7))
+    content = proposal_content([first, second], [
+        insight(text=action, quote=action, source_record_ids=[first["id"]]),
+        insight(text=action, quote=action, source_record_ids=[second["id"]]),
+    ])
+    proposal = stored(content, created_at=NOW.replace(day=15))
+
+    assert review_next_step_bullets(proposal) == content[0]
+    assert review_next_step_bullets(proposal, frozenset((source_id(first), source_id(second)))) == content[0]
+    assert review_next_step_bullets(proposal, frozenset((source_id(first),))) == [
+        "Next step: Send the checklist. (complete by Nov 6, 2026)"
+    ]
 
 
 def test_manual_edits_and_destination_moves_do_not_inherit_source_attribution():
