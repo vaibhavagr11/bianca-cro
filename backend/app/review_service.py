@@ -24,7 +24,7 @@ from app.config import settings
 from app.pipeline import PipelineRow, TRACKED_FIELDS, is_working_client, normalize_name
 from app.review_sheets import SheetsClient, SheetConflict, SheetError, SheetWorkingClient, SheetWriteUncertain
 from app.review_content import (
-    Content, approved_lineage, proposal_content, review_next_step_bullets, source_id, source_version, validate_lineage,
+    Content, approved_lineage, proposal_content, reviewed_content, review_next_step_bullets, source_id, source_version, validate_lineage,
 )
 
 
@@ -220,13 +220,24 @@ def _proposal_data(row: dict) -> dict:
             "revision": row["revision"], "status": row["status"]}
 
 
-def _current_content(conn, workspace_id, deal: dict, records: list[dict]) -> Content:
+def _card_limit(name: str) -> int | None:
+    value = getattr(settings, name, None)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _current_content(conn, workspace_id, deal: dict, records: list[dict]) -> tuple[Content, list[dict]]:
+    """Current card content, plus the versions of every source the card accounts for.
+
+    The versions include sources whose only bullets fell outside the card limits, so a decision retires them too.
+    """
     insights = conn.execute(
         "select * from insights where workspace_id = %s and company_id = %s and opportunity_id = %s"
         " and source_record_ids && %s::uuid[] order by id",
         (workspace_id, deal["company_id"], deal["opportunity_id"], [r["id"] for r in records]),
     ).fetchall() if records else []
-    return proposal_content(records, insights)
+    content, retired = reviewed_content(records, insights, max_next_steps=_card_limit("review_max_next_steps"),
+                                        max_context=_card_limit("review_max_context"))
+    return content, sorted(_content_versions(content[2]) + retired, key=_source_key)
 
 
 def _content_versions(sources: list[dict]) -> list[dict]:
@@ -276,11 +287,10 @@ def build_proposals(conn, workspace_id, *, force: bool = False) -> dict:
                    and _source_key(source_version(r)) + (str(deal["company_id"]),) not in receipts
                    and (state["bootstrap_completed"] or _in_bootstrap_window(r, state))]
         # Re-extraction can change an insight's scope without changing its source version.
-        next_steps, context, sources, lineage = _current_content(conn, workspace_id, deal, records)
+        (next_steps, context, sources, lineage), versions = _current_content(conn, workspace_id, deal, records)
         if not existing and not (next_steps or context):
             counts["unchanged"] += 1
             continue
-        versions = _content_versions(sources)
         baseline = _cells(deal["last_progress"], deal["next_step"], deal.get("client_context"))
         data = {"company_name": deal["company_name"], "owner_code": deal["owner_code"], "stage": deal["stage"],
                 "country": deal["country"], "bullets": next_steps + context, "sources": sources, "source_versions": versions,
@@ -412,7 +422,61 @@ def workspace_view(conn, workspace_id) -> dict:
                      f"?gid={target['sheet_id']}#gid={target['sheet_id']}")
     return {"proposals": proposals, "rows": rows, "activity": activity, "sheetUrl": sheet_url,
             "routingVersion": ROUTING_VERSION, "clientContextMode": settings.review_client_context_mode,
+            "statusOptions": status_options(statuses),
             "owners": [{"code": "RG", "name": "Ramiro"}, {"code": "NC", "name": "Nico"}, {"code": "NDL", "name": "Nico"}]}
+
+
+def status_options(statuses: dict[str, str | None]) -> list[str]:
+    """The statuses a founder may choose: exactly the labels already used in the Sheet's Status column."""
+    return sorted({status.strip() for status in statuses.values() if isinstance(status, str) and status.strip()})
+
+
+def change_status(workspace_id, row_id: str, actor: str, expected_status: str, new_status: str) -> dict:
+    """A founder's explicit Status change for one pipeline company. Writes that one Sheet cell and nothing else."""
+    if actor not in ("RG", "NC", "NDL"):
+        raise ValueError("A valid founder is required.")
+    if not isinstance(expected_status, str) or not isinstance(new_status, str) or not new_status.strip():
+        raise ValueError("Choose a status.")
+    new_status = new_status.strip()
+    with db.connect() as conn:
+        conn.row_factory = dict_row
+        row = conn.execute(
+            "select o.*, c.name, c.country from opportunities o join companies c on c.id = o.company_id"
+            " where o.workspace_id = %s and o.id::text = %s for update of o", (workspace_id, row_id)).fetchone()
+        if not row or row["removed_at"] is not None:
+            raise ReviewNotFound("This company is not in the active Pipeline sheet.")
+        try:
+            sheets = SheetsClient()
+            options = status_options(sheets.read_company_statuses())
+            if new_status not in options:
+                raise ValueError("Choose one of the statuses already used in the Pipeline sheet.")
+            live = sheets.set_status(row["name"], expected_status, new_status)
+        except SheetConflict as exc:
+            raise ReviewConflict(str(exc)) from exc
+        except SheetWriteUncertain as exc:
+            raise ReviewUnavailable(str(exc)) from exc
+        except SheetError as exc:
+            raise ReviewUnavailable("The Sheet could not be reached. Refresh to check the Status before trying again.") from exc
+        previous = _cell(row.get("stage"))
+        mirror_refreshed = previous.strip() in (expected_status.strip(), new_status)
+        if mirror_refreshed and previous.strip() != new_status:
+            # Keep the pipeline cache and its history in step, exactly as the next full sync would record it.
+            fields = {k: (str(row[k]).strip() or None) if row.get(k) is not None else None for k in TRACKED_FIELDS}
+            fields["stage"] = new_status
+            pipeline_row = PipelineRow(row["name"], normalize_name(row["name"]), fields)
+            conn.execute("update opportunities set stage = %s, row_hash = %s where id = %s",
+                         (new_status, pipeline_row.row_hash, row["id"]))
+            run = conn.execute(
+                "insert into sync_runs (workspace_id, source, status, rows_received, rows_updated, finished_at)"
+                " values (%s, %s, 'succeeded', 1, 1, now()) returning id",
+                (workspace_id, f"sheet_review_status:{actor}")).fetchone()
+            conn.execute(
+                "insert into opportunity_changes (workspace_id, opportunity_id, sync_run_id, field, old_value, new_value)"
+                " values (%s, %s, %s, 'stage', %s, %s)", (workspace_id, row["id"], run["id"], row.get("stage"), new_status))
+        conn.commit()
+        return {"rowId": str(row["id"]), "company": row["name"], "previous": expected_status.strip(),
+                "status": live.status, "actor": actor, "mirror_refreshed": mirror_refreshed,
+                "inSalesPipeline": not is_working_client(live.status)}
 
 
 def _sheet_target() -> dict:
@@ -509,10 +573,10 @@ def _require_current_content(conn, workspace_id, proposal: dict) -> list[dict]:
     if any(key not in by_version for key in expected):
         raise ReviewConflict("The source material changed since this card was generated. Refresh the review queue before deciding.")
     records = [by_version[key] for key in expected]
-    next_steps, context, sources, lineage = _current_content(conn, workspace_id, proposal, records)
+    (next_steps, context, sources, lineage), versions = _current_content(conn, workspace_id, proposal, records)
     if (not (next_steps or context) or next_steps != proposal["next_step_bullets"]
             or context != proposal["client_context_bullets"] or lineage != proposal["bullet_lineage"]
-            or _content_versions(sources) != proposal["source_versions"]):
+            or versions != proposal["source_versions"]):
         raise ReviewConflict("The sales evidence changed since this card was generated. Refresh the review queue before deciding.")
     return records
 

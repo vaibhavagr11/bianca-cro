@@ -104,6 +104,8 @@ dialog{border:1px solid #D8E0EF;border-radius:14px;box-shadow:0 22px 90px #182D5
 .ns-add{margin-top:8px}
 .ns-preview{margin-top:10px;padding:8px 10px;border:1px dashed var(--line);border-radius:8px;font-size:12px;line-height:1.6;color:#55617C;white-space:pre-wrap}
 .ns-preview b{display:block;font-size:11px;letter-spacing:.4px;text-transform:uppercase;color:#6B7690;margin-bottom:2px}
+.ns-row input[aria-invalid=true]{border-color:var(--red);background:#FFF7F8}.ns-date-err{grid-column:1/-1;margin:-2px 0 2px;font-size:12px;line-height:1.5;color:var(--red)}
+.status-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px;font-size:12px;color:var(--muted)}.status-row .k{font-weight:600;color:#8792A8}.status-pick{height:32px;border:1px solid #CBD3E3;border-radius:7px;padding:0 8px;font-size:12.5px;color:var(--ink);background:#fff;max-width:220px}.status-row .status-save{min-height:32px;padding:0 11px;font-size:12px}
 @media (max-width:560px){.ns-row,.ns-head{grid-template-columns:minmax(0,1fr) 132px 32px}}
 .due{display:flex;gap:10px;align-items:center;margin-top:12px;font-size:12.5px;flex-wrap:wrap}.due input{height:32px;border:1px solid var(--line);border-radius:7px;padding:0 10px;font-size:12.5px;width:150px}
 .rotation-preview{margin-top:16px;border:1px solid #E2E8F4;border-radius:8px;overflow:hidden}.rotation-preview h3{font-size:11px;font-weight:650;padding:9px 12px;background:#F4F7FC;color:#526786;border-bottom:1px solid #E2E8F4}.rotation-row{padding:9px 12px;display:grid;grid-template-columns:110px 1fr;gap:10px;font-size:12px;line-height:1.6}.rotation-row+.rotation-row{border-top:1px solid #EDF1F8}.rotation-name{font-weight:650;color:#697B9A}.rotation-content{color:#7A879E;white-space:pre-line;overflow-wrap:anywhere}.rotation-explain{font-size:10.5px;color:#98A3B6;margin-top:8px;line-height:1.7}
@@ -130,8 +132,8 @@ TOOLBAR = '''<div class="toolbar"><div class="seg" id="owner-seg" role="group" a
 LAYOUT_TOGGLE = '<div class="layout-toggle" role="group" aria-label="Layout"><button type="button" class="on" data-theme-pick="war-room">War room</button><button type="button" data-theme-pick="focus">Focus</button></div>'
 
 DIALOG_EXTRA = '''<div class="mode-row"><div class="mode" id="edit-mode" role="group" aria-label="Next Step write mode"><button type="button" class="on" data-mode-pick="replace" aria-pressed="true">Replace Next Step</button><button type="button" data-mode-pick="append" aria-pressed="false">Keep current bullets + add these</button></div></div><p class="field-help">Replace writes only these steps to Next Step. Keep + add leaves the bullets already in the Sheet and adds these below them. Either way the previous Next Step is copied to Last progress. The same switch is on the card.</p>'''
-ROWS_EDITOR = '''<div class="ns-head" aria-hidden="true"><span>Next step</span><span>Complete by</span><span></span></div><div class="ns-rows" id="ns-rows"></div><button type="button" class="pill ns-add" data-action="ns-add">+ Add next step</button><div class="ns-preview" id="ns-preview" aria-live="polite"></div>'''
-ROWS_HELP = 'One row per next step, with an optional date. The date is written into the Next Step cell after the step as "(complete by Nov 4, 2026)" - no new Sheet column. Leave every row empty to keep Next Step and Last progress unchanged.'
+ROWS_EDITOR = '''<div class="ns-head" aria-hidden="true"><span>Next step</span><span>Complete by (d/m/y)</span><span></span></div><div class="ns-rows" id="ns-rows"></div><button type="button" class="pill ns-add" data-action="ns-add">+ Add next step</button><div class="ns-preview" id="ns-preview" aria-live="polite"></div>'''
+ROWS_HELP = 'One row per next step, with an optional date typed day first (16/11/2026 or 16 Nov). The date is written into the Next Step cell after the step as "(complete by Nov 4, 2026)" - no new Sheet column. Leave every row empty to keep Next Step and Last progress unchanged.'
 
 # ------------------------------------------------------------------------------------------------ presentation module (shared)
 WR_JS = r"""
@@ -190,7 +192,7 @@ const BiancaWarRoom = (() => {
     else if(a !== 'ignore') closeMenus();
   }, true);
   document.addEventListener('keydown', e => {
-    if(e.metaKey || e.ctrlKey || e.altKey) return; const t = e.target; if(t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return; if(document.querySelector('dialog[open]')) return;
+    if(e.metaKey || e.ctrlKey || e.altKey) return; const t = e.target; if(t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return; if(document.querySelector('dialog[open]')) return;
     if(theme() !== 'war-room') return;
     const card = document.querySelector('.wr-main .review-card'); const k = e.key.toLowerCase();
     if(k === 'j') move(1); else if(k === 'k') move(-1);
@@ -245,19 +247,60 @@ const BiancaWarRoom = (() => {
     if(m && fmtDate(m[1])) return {text: bullet.slice(0, m.index).trim(), date: m[1]};
     return {text: bullet, date: ''};
   }
+  // ---- Complete-by field (11/16/2026, Kellogg team): always day / month / year, whatever the browser's language,
+  // and an impossible date (31/11) says why instead of silently refusing to save.
+  const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const MONTH_KEYS = {jan:1,ene:1,feb:2,mar:3,apr:4,abr:4,may:5,jun:6,jul:7,aug:8,ago:8,sep:9,set:9,oct:10,nov:11,dec:12,dic:12};
+  const monthNumber = name => MONTH_KEYS[String(name || '').toLowerCase().slice(0, 3)] || 0;
+  const DATE_HINT = 'Use day/month/year, for example 16/11/2026.';
+  const dmy = iso => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || ''); return m && fmtDate(iso) ? `${m[3]}/${m[2]}/${m[1]}` : ''; };
+  function parseDay(text, today){
+    const raw = String(text || '').trim();
+    if(!raw) return {iso:''};
+    let d, mo, y, m;
+    if((m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(raw))){ y = m[1]; mo = +m[2]; d = +m[3]; }
+    else if((m = /^(\d{1,2})\s*[\/.-]\s*(\d{1,2})(?:\s*[\/.-]\s*(\d{4}|\d{2}))?$/.exec(raw))){ d = +m[1]; mo = +m[2]; y = m[3]; }
+    else if((m = /^(\d{1,2})(?:st|nd|rd|th)?\s+(?:de\s+)?([a-z]{3,})\.?,?(?:\s+(?:de\s+)?(\d{4}))?$/i.exec(raw))){ d = +m[1]; mo = monthNumber(m[2]); y = m[3]; if(!mo) return {iso:'', error:`"${m[2]}" is not a month. ${DATE_HINT}`}; }
+    else if((m = /^([a-z]{3,})\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{4}))?$/i.exec(raw))){ mo = monthNumber(m[1]); d = +m[2]; y = m[3]; if(!mo) return {iso:'', error:`"${m[1]}" is not a month. ${DATE_HINT}`}; }
+    else return {iso:'', error:DATE_HINT};
+    if(mo < 1 || mo > 12) return {iso:'', error:`There is no month ${mo}. Dates here are day/month/year, for example 16/11/2026.`};
+    const now = today instanceof Date ? today : new Date();
+    let year = y === undefined ? now.getFullYear() : +y;
+    if(y !== undefined && String(y).length === 2) year += 2000;
+    // No year typed: the next time that day comes around.
+    if(y === undefined && Date.UTC(year, mo - 1, d) < Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) - 7 * 864e5) year += 1;
+    const days = new Date(Date.UTC(year, mo, 0)).getUTCDate();
+    if(d < 1 || d > days) return {iso:'', error:`${MONTH_NAMES[mo - 1]} ${year} has ${days} days, so ${d}/${mo} is not a date.`};
+    if(year < 2000 || year > 2100) return {iso:'', error:`Check the year. ${DATE_HINT}`};
+    return {iso:`${year}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`};
+  }
+  // ---- Status change on the card (11/16/2026, Kellogg team). Presentation only: the page's own handler sends it.
+  const DEMO_STATUSES = ['0. Paused','1. Opening','2. In Talks','3. Proposal','4. Pilot','5. Working client'];
+  function statusControl(p, options, current){
+    const list = Array.isArray(options) && options.length ? options : (typeof BiancaCore !== 'undefined' ? DEMO_STATUSES : []);
+    const now = String(current || '').trim();
+    if(!list.length || !now || p.status !== 'pending') return '';
+    const all = list.includes(now) ? list : [now, ...list];
+    return `<div class="status-row"><label class="k" for="status-${esc(p.id)}">Status in the Sheet</label><select class="status-pick" id="status-${esc(p.id)}" data-status-current="${esc(now)}">${all.map(o => `<option value="${esc(o)}"${o === now ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select><button type="button" class="secondary status-save" data-action="set-status" disabled>Update status<span class="sr-only"> of ${esc(p.company)}</span></button></div>`;
+  }
+  document.addEventListener('change', e => { const pick = e.target.closest?.('.status-pick'); if(!pick) return; const save = pick.parentElement?.querySelector('.status-save'); if(save) save.disabled = pick.value === pick.dataset.statusCurrent; });
   const joinBullet = (text, date) => { const t = String(text || '').replace(/[\r\n]+/g, ' ').trim(); if(!t) return ''; const d = fmtDate(date); return d ? `${t} (complete by ${d})` : t; };
   let rows = [], editingRows = null;
   const blankRow = () => ({text:'', date:'', t0:null, d0:null});
   // An untouched row goes back exactly as suggested, so its source link survives.
   const rowBullet = r => (r.orig !== undefined && r.text === r.t0 && r.date === r.d0) ? r.orig : joinBullet(r.text, r.date);
-  function drawRows(focusIndex){ const box = $('#ns-rows'); if(!box) return; box.innerHTML = rows.map((r, i) => `<div class="ns-row" data-row="${i}"><textarea class="ns-text" rows="2" maxlength="3900" placeholder="Next step" aria-label="Next step ${i+1}">${esc(r.text)}</textarea><input type="date" class="ns-date" value="${esc(r.date)}" aria-label="Complete by date for next step ${i+1}"><button type="button" class="ns-del" data-action="ns-del" aria-label="Remove next step ${i+1}">&times;</button></div>`).join(''); if(focusIndex !== undefined) box.querySelectorAll('.ns-text')[focusIndex]?.focus(); drawPreview(); }
+  function drawRows(focusIndex){ const box = $('#ns-rows'); if(!box) return; box.innerHTML = rows.map((r, i) => `<div class="ns-row" data-row="${i}"><textarea class="ns-text" rows="2" maxlength="3900" placeholder="Next step" aria-label="Next step ${i+1}">${esc(r.text)}</textarea><input type="text" class="ns-date" autocomplete="off" spellcheck="false" placeholder="dd/mm/yyyy" value="${esc(r.dateText ?? dmy(r.date))}" aria-label="Complete by date, day/month/year, for next step ${i+1}"${r.dateError ? ' aria-invalid="true"' : ''}><button type="button" class="ns-del" data-action="ns-del" aria-label="Remove next step ${i+1}">&times;</button><p class="ns-date-err" role="alert"${r.dateError ? '' : ' hidden'}>${esc(r.dateError || '')}</p></div>`).join(''); if(focusIndex !== undefined) box.querySelectorAll('.ns-text')[focusIndex]?.focus(); drawPreview(); }
   function drawPreview(){ const out = $('#ns-preview'); if(!out) return; const lines = rows.map(rowBullet).filter(Boolean); out.innerHTML = lines.length ? `<b>${mode(editingRows)==='append'?'Added to Next Step, below the current bullets':'Written to Next Step'}</b>${lines.map(l => esc('- ' + l)).join('\n')}` : '<b>Next Step</b>No rows - Next Step and Last progress stay as they are.'; }
   function syncRows(){ const ta = $('#edit-content'); if(!ta) return; ta.value = rows.map(rowBullet).filter(Boolean).map(x => '- ' + x).join('\n'); ta.dispatchEvent(new Event('input', {bubbles:true})); drawPreview(); }
   // Called by the page right after it fills the hidden #edit-content textarea and opens the dialog.
   function openRows(id){ try{ const ta = $('#edit-content'), box = $('#ns-rows'); if(!ta || !box) return; editingRows = id; rows = cellBullets(ta.value).map(x => { const p = splitBullet(x); return {orig:x, text:p.text, date:p.date, t0:p.text, d0:p.date}; }); if(!rows.length) rows = [blankRow()]; paintDialogMode(id); drawRows(0); }catch(_){ } }
-  document.addEventListener('input', e => { const row = e.target.closest?.('.ns-row'); if(!row) return; const r = rows[Number(row.dataset.row)]; if(!r) return; if(e.target.classList.contains('ns-text')) r.text = e.target.value; else if(e.target.classList.contains('ns-date')) r.date = e.target.value; syncRows(); });
+  document.addEventListener('input', e => { const row = e.target.closest?.('.ns-row'); if(!row) return; const r = rows[Number(row.dataset.row)]; if(!r) return; if(e.target.classList.contains('ns-text')) r.text = e.target.value; else if(e.target.classList.contains('ns-date')){ const day = parseDay(e.target.value); r.dateText = e.target.value; r.dateError = day.error || ''; r.date = day.iso; const note = row.querySelector?.('.ns-date-err'); if(note){ note.textContent = r.dateError; note.hidden = !r.dateError; } if(r.dateError) e.target.setAttribute?.('aria-invalid', 'true'); else e.target.removeAttribute?.('aria-invalid'); } syncRows(); });
+  // Leaving a valid date shows it back day-first, so 16 nov and 16/11 both read 16/11/2026.
+  document.addEventListener('change', e => { if(!e.target.classList?.contains('ns-date')) return; const r = rows[Number(e.target.closest?.('.ns-row')?.dataset.row)]; if(r && !r.dateError && r.date){ r.dateText = dmy(r.date); e.target.value = r.dateText; } });
+  // A row with an impossible date never reaches the page's own save handler.
+  document.addEventListener('submit', e => { if(e.target?.id !== 'edit-form') return; const bad = rows.findIndex(r => r.dateError); if(bad < 0) return; e.preventDefault(); e.stopImmediatePropagation(); const note = $('#edit-error'); if(note){ note.textContent = `Next step ${bad + 1}: ${rows[bad].dateError}`; note.hidden = false; } document.querySelectorAll('#ns-rows .ns-date')[bad]?.focus(); }, true);
   document.addEventListener('keydown', e => { if(e.key === 'Enter' && !e.shiftKey && e.target.closest?.('.ns-row') && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')){ e.preventDefault(); rows.push(blankRow()); drawRows(rows.length - 1); } });
-  return {shell, avatar, ownerName, stageClass, shortDate, esc, mode, merged, modeControl, openRows, suggestedNextSteps, get selected(){ return selected; }};
+  return {shell, avatar, ownerName, stageClass, shortDate, esc, mode, merged, modeControl, openRows, suggestedNextSteps, statusControl, parseDay, get selected(){ return selected; }};
 })();
 """
 
@@ -270,9 +313,9 @@ CARD_JS = r"""function card(p){
     const srcs=(p.sources||[]).slice(0,3);
     const traceNote=(!data.available||![...data.lineage.nextStep,...data.lineage.clientContext].some(edge=>edge.sourceIds.length))?traceMessage(p,data):'';
     const whatsNew=srcs.length?`<ul class="whats-new">${srcs.map(s=>{const line=s.summary||s.subject||'';const ctx=s.quote||s.subject||'';return `<li><details><summary><span>${esc(line)}</span><span class="src">Source: ${esc(sourceType(s.type))}, ${esc(WR.shortDate(s.date))}</span></summary><div class="ctx">${esc(ctx)}</div></details></li>`;}).join('')}</ul>`:'<p class="empty-group">No new information recorded.</p>';
-    const open=expandedNextSteps.has(p.id);
+    const open=expandedNextSteps.has(p.id),stageNow=cellOf('stage')||p.stage;
     return `<article class="review-card" data-id="${esc(p.id)}" aria-labelledby="title-${esc(p.id)}">
-<div class="card-top"><div><h2 class="company-title" id="title-${esc(p.id)}">${esc(p.company)}</h2><div class="meta-bar"><span><span class="k">Stage:</span><span class="${WR.stageClass(p.stage)}">${esc(p.stage||'-')}</span></span><span><span class="k">Owner:</span>${WR.avatar(p.owner)}${esc(WR.ownerName(p.owner))}</span><span><span class="k">Country:</span>${esc(p.country||'-')}</span></div></div></div>
+<div class="card-top"><div><h2 class="company-title" id="title-${esc(p.id)}">${esc(p.company)}</h2><div class="meta-bar"><span><span class="k">Stage:</span><span class="${WR.stageClass(stageNow)}">${esc(stageNow||'-')}</span></span><span><span class="k">Owner:</span>${WR.avatar(p.owner)}${esc(WR.ownerName(p.owner))}</span><span><span class="k">Country:</span>${esc(p.country||'-')}</span></div>${!applying&&!legacy?WR.statusControl(p,state.statusOptions,stageNow):''}</div></div>
 <div class="ns-box"><div class="sec-label ns-label">Suggested next steps</div>${bulletList(p,nextBullets,'nextStep',data)}${!applying&&!legacy&&!lineageBlocked&&nextBullets.length?WR.modeControl(p.id):''}</div>
 <div class="sec-label">What's new</div>${whatsNew}
 <div class="sec-label">Client context <span class="proposed">Column proposed</span></div>${bulletList(p,contextBullets,'clientContext',data)}

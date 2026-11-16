@@ -98,6 +98,31 @@ class IgnoreTool(IgnoreRequest):
     proposal_id: UUID
 
 
+class StatusRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_status: str = Field(max_length=100)
+    status: str = Field(min_length=1, max_length=100)
+
+
+class StatusTool(StatusRequest):
+    row_id: UUID
+
+
+def _status(row_id: str, actor: str, payload: StatusRequest) -> dict:
+    with db.connect() as conn:
+        workspace_id = _workspace_id(conn)
+    try:
+        return review_service.change_status(workspace_id, row_id, actor, payload.expected_status, payload.status)
+    except review_service.ReviewNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except review_service.ReviewConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except review_service.ReviewUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 def _workspace() -> dict:
     try:
         with db.connect() as conn:
@@ -181,6 +206,11 @@ def ignore(proposal_id: UUID, payload: IgnoreRequest, actor: str = Depends(revie
     return _decision(str(proposal_id), actor, "ignore", payload)
 
 
+@router.post("/rows/{row_id}/status")
+def set_status(row_id: UUID, payload: StatusRequest, actor: str = Depends(reviewer)) -> dict:
+    return _status(str(row_id), actor, payload)
+
+
 @router.get("/app", response_class=FileResponse)
 def application() -> FileResponse:
     enabled()
@@ -235,6 +265,9 @@ def _tools() -> list[dict]:
         {"name": "bianca_ignore_update", "description": "On the founder's Ignore action, dismiss this proposal without changing any Google Sheet cell.",
          "inputSchema": IgnoreTool.model_json_schema(),
          "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}},
+        {"name": "bianca_set_status", "description": "On the founder's explicit Status change, write that company's Status cell in the Pipeline sheet (for example to Paused). Use a row id and its current stage from the workspace rows, and one of the workspace statusOptions. No other cell changes.",
+         "inputSchema": StatusTool.model_json_schema(),
+         "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False}},
     ]
 
 
@@ -243,6 +276,9 @@ def _tool_call(name: str, arguments: dict, actor: str) -> dict:
         if arguments:
             raise ValueError("The workspace tool takes no arguments")
         return {**_workspace(), "viewer": actor}
+    if name == "bianca_set_status":
+        data = StatusTool.model_validate(arguments)
+        return _status(str(data.row_id), actor, data)
     model = {"bianca_approve_update": ApproveTool, "bianca_ignore_update": IgnoreTool}.get(name)
     if not model:
         raise KeyError(name)

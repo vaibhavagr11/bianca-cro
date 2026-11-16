@@ -201,7 +201,7 @@ function fakePage(connector,pathname='/artifact'){
   const fakeWindow={biancaConnector:connector,addEventListener:(name,handler)=>{events['window:'+name]=handler;},scrollTo:()=>{}};
   const page=vm.createContext({document:fakeDocument,window:fakeWindow,location:{pathname,protocol:'https:'},crypto:{randomUUID:()=> 'new-key'},setTimeout:()=>0,clearTimeout:()=>{},Event,fetch:()=>{throw Error('Unexpected direct network call');}});
   for(const script of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g))vm.runInContext(script[1],page);
-  return {get,events};
+  return {get,events,context:page};
 }
 
 test('The actual live UI starts empty and explains missing connector access',()=>{
@@ -341,7 +341,7 @@ test('The pending card, editor and approval use the same loaded deadline',async(
     page.events.click({target:{closest:()=>button}});
     if(flow!=='card'){
       const editor=page.get('#ns-rows').innerHTML;
-      assert.ok(editor.includes('value="2026-11-21"'));
+      assert.ok(editor.includes('placeholder="dd/mm/yyyy" value="21/11/2026"'));
       assert.ok(editor.includes(`>${body}</textarea>`));
       assert.equal(editor.includes('(complete by'),false);
       assert.ok(page.get('#ns-preview').innerHTML.includes(formatted));
@@ -386,7 +386,7 @@ test('An invalid completion date in an older suggestion does not prefill the fie
   await new Promise(resolve=>setImmediate(resolve));
   const article={dataset:{id:p.id}},button={dataset:{action:'edit'},closest:()=>article};
   page.events.click({target:{closest:()=>button}});
-  assert.equal([...page.get('#ns-rows').innerHTML.matchAll(/type="date" class="ns-date" value=""/g)].length,2);
+  assert.equal([...page.get('#ns-rows').innerHTML.matchAll(/type="text" class="ns-date"[^>]*placeholder="dd\/mm\/yyyy" value=""/g)].length,2);
 });
 
 test('The hosted page offers in-memory sign-in without calling the service before sign-in',()=>{
@@ -778,6 +778,87 @@ test('An entirely founder-edited saved approval explains its missing attribution
   assert.ok(card.includes('These founder-edited bullets have no source attribution.'));
   assert.equal(card.includes('class="source-highlight"'),false);
   assert.ok(card.includes('data-action="retry"'));
+});
+
+test('The complete-by field reads dates day first and explains an impossible date',()=>{
+  const page=fakePage(undefined);
+  const day=(text)=>json(vm.runInContext(`BiancaWarRoom.parseDay(${JSON.stringify(text)},new Date(2026,10,16))`,page.context));
+  for(const text of ['16/11/2026','16-11-2026','16.11.26','16/11','16 Nov','16 nov 2026','16 de noviembre de 2026','Nov 16, 2026','2026-11-16'])assert.deepEqual(day(text),{iso:'2026-11-16'},text);
+  assert.deepEqual(day('05/11/2026'),{iso:'2026-11-05'});
+  assert.deepEqual(day('1 dic'),{iso:'2026-12-01'});
+  assert.deepEqual(day('3/2'),{iso:'2027-02-03'});
+  assert.deepEqual(day(''),{iso:''});
+  assert.equal(day('31/11/2026').error,'November 2026 has 30 days, so 31/11 is not a date.');
+  assert.equal(day('29/2/2027').error,'February 2027 has 28 days, so 29/2 is not a date.');
+  assert.equal(day('11/16/2026').error,'There is no month 16. Dates here are day/month/year, for example 16/11/2026.');
+  assert.equal(day('next week').error,'Use day/month/year, for example 16/11/2026.');
+  assert.equal(day('16 Smarch').error,'"Smarch" is not a month. Use day/month/year, for example 16/11/2026.');
+});
+
+test('An impossible date blocks Save and approve before any request is made',async()=>{
+  const calls=[],s=snapshot();
+  const page=fakePage({callTool:async(name,args)=>{calls.push(name);return {structuredContent:s};}});
+  await new Promise(resolve=>setImmediate(resolve));
+  const article={dataset:{id:s.proposals[0].id}},button={dataset:{action:'edit'},closest:()=>article};
+  page.events.click({target:{closest:()=>button}});
+  const row={dataset:{row:'0'}};
+  page.events.input({target:{closest:()=>row,classList:{contains:key=>key==='ns-date'},value:'31/11/2026'}});
+  let prevented=false,stopped=false;
+  page.events.submit({target:{id:'edit-form'},preventDefault(){prevented=true;},stopImmediatePropagation(){stopped=true;}});
+  assert.ok(prevented&&stopped);
+  assert.equal(page.get('#edit-error').textContent,'Next step 1: November 2026 has 30 days, so 31/11 is not a date.');
+  assert.equal(page.get('#edit-error').hidden,false);
+  assert.deepEqual(calls,[core.TOOLS.workspace]);
+  // A corrected date clears the block and is written in the Sheet's unambiguous text form.
+  page.events.input({target:{closest:()=>row,classList:{contains:key=>key==='ns-date'},value:'1/12/2026'}});
+  prevented=false;
+  page.events.submit({target:{id:'edit-form'},preventDefault(){prevented=true;},stopImmediatePropagation(){}});
+  assert.equal(prevented,false);
+  assert.ok(page.get('#edit-content').value.endsWith('(complete by Dec 1, 2026)'));
+});
+
+test('A status change posts the row, the status the founder saw and the new one, then reloads',async()=>{
+  const requests=[];
+  const fetcher=async(url,options)=>{requests.push({url,method:options.method,body:options.body&&JSON.parse(options.body),auth:options.headers.Authorization});
+    return {ok:true,status:200,json:async()=>url==='/review/workspace'?{...completed(),statusOptions:['0. Paused','4. Pilot',7,'']}:{rowId:'r-1',company:'A real company',status:'0. Paused',inSalesPipeline:true}};};
+  const changes=[];
+  const client=core.createClient(core.restTransport(fetcher,()=> 'founder-access-secret'),{onChange:next=>changes.push(next)});
+  const first=await client.refresh();
+  assert.deepEqual(json(first.statusOptions),['0. Paused','4. Pilot']);
+  const result=await client.setStatus('r-1','4. Pilot',' 0. Paused ');
+  assert.equal(result.status,'0. Paused');
+  assert.deepEqual(json(requests[1]),{url:'/review/rows/r-1/status',method:'POST',body:{expected_status:'4. Pilot',status:'0. Paused'},auth:'Bearer founder-access-secret'});
+  assert.equal(requests[2].url,'/review/workspace');
+  assert.equal(changes.length,2);
+  await assert.rejects(client.setStatus('r-1','4. Pilot',''),/Choose a status/);
+  await assert.rejects(core.restTransport(fetcher,()=> 'token')(core.TOOLS.status,{expected_status:'a',status:'b'}),/missing its identifier/);
+  assert.equal(requests.length,3);
+});
+
+test('The card shows the current Sheet status with a change control that starts disabled',async()=>{
+  const s=snapshot();
+  s.statusOptions=['0. Paused','1. Opening','4. Pilot'];
+  s.rows=[{id:'r-1',company:s.proposals[0].company,owner:'NDL',stage:'1. Opening',lastProgress:'',nextStep:'',revision:0}];
+  const calls=[];
+  const page=fakePage({callTool:async(name,args)=>{calls.push([name,args]);return {structuredContent:name===core.TOOLS.status?{status:'0. Paused',inSalesPipeline:true}:s};}});
+  await new Promise(resolve=>setImmediate(resolve));
+  const card=articleHtml(page);
+  assert.ok(card.includes('<span class="stage stage-1">1. Opening</span>'));
+  assert.ok(card.includes('data-status-current="1. Opening"'));
+  assert.ok(card.includes('<option value="1. Opening" selected>1. Opening</option><option value="4. Pilot">4. Pilot</option>')||card.includes('<option value="0. Paused">0. Paused</option><option value="1. Opening" selected>1. Opening</option>'));
+  assert.ok(card.includes('data-action="set-status" disabled'));
+  // Choosing the same status does nothing; a different one sends exactly one status call.
+  const select={value:'1. Opening',dataset:{statusCurrent:'1. Opening'}};
+  const article={dataset:{id:s.proposals[0].id},querySelector:()=>select,querySelectorAll:()=>[]};
+  const button={dataset:{action:'set-status'},closest:selector=>selector==='article'?article:selector==='[data-action]'?button:article};
+  page.events.click({target:{closest:()=>button}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(calls.filter(([name])=>name===core.TOOLS.status).length,0);
+  select.value='0. Paused';
+  page.events.click({target:{closest:()=>button}});
+  await new Promise(resolve=>setImmediate(resolve));
+  const sent=calls.filter(([name])=>name===core.TOOLS.status);
+  assert.deepEqual(json(sent),[[core.TOOLS.status,{row_id:'r-1',expected_status:'1. Opening',status:'0. Paused'}]]);
 });
 
 

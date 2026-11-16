@@ -53,3 +53,7 @@ Still generated only by `patch_artifact.py` (same command as above); `BiancaLive
   keep this mode, add a `mode: "append"` field to the approve payload and skip the rotation server side; the page
   can then stop re-sending the current bullets. Kept bullets also arrive as founder edits (no source link).
 - Tests: `verify-live.cjs` 45 / 55 and `verify-demo.cjs` 23 / 36, unchanged from the restyle baseline.
+
+## 11/16/2026 - date field, Status control
+
+`WR_JS` and `CARD_JS` in `patch_artifact.py` carry the day-first Complete by field (`parseDay`), the blocked save on an impossible date, and the Status control (`statusControl`). The matching data calls (`TOOLS.status`, the REST route, `setStatus`, `changeStatus`) live in the page scripts of `sales-pipeline-updates.html` and are not produced by this script; the demo page keeps a status change in the browser only.

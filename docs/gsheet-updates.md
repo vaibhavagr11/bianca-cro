@@ -12,6 +12,14 @@ Nico Casaux (`NC`), and Nico de León (`NDL`). One card holds the context and ne
 - Before/after values for all three cells and the exact destination are stored in the durable audit.
 - **Ignore** dismisses the card for all founders without writing any Sheet cell. It remains in the activity history.
 
+### Card limits, order and Status (11/16/2026)
+
+- **Order.** Next Step bullets lead with Bianca's own actions, newest first, then items with no clear owner, then customer-owed items, then blockers. Two wordings of the same step (at least three in four meaningful words shared, four words minimum) become one bullet that keeps both sources.
+- **Limit.** A card suggests at most `REVIEW_MAX_NEXT_STEPS` next steps (default 4) and `REVIEW_MAX_CONTEXT` context bullets (default `0` = no limit, so older customer needs are kept). The newest stay. Sources that supported only the removed bullets are still recorded on the card (`source_versions`), so Approve or Ignore retires them and the old bullets do not come back on the next build.
+- **Status.** `POST /review/rows/{row_id}/status` with `{"expected_status", "status"}` (tool `bianca_set_status`) writes the one Status cell of that company after checking it still holds the value the founder saw. Only labels already used in the Sheet's Status column are accepted. The pipeline mirror and `opportunity_changes` are updated; the change is logged in `sync_runs` with source `sheet_review_status:<founder>`. It is a single-cell write, so the n8n Sheets proxy needs no change.
+- **Dates.** The editor's Complete by field is plain text read day first (`16/11/2026`, `16/11`, `16 Nov`, `16 de noviembre`), independent of the browser language. An impossible date shows why and blocks Save & approve. The Sheet text stays `(complete by Nov 16, 2026)`.
+- **After deploying this change** run `/review/build?force=true` until `done=true`: pending cards built before it hold the old order and are refused at approval with "The sales evidence changed" until rebuilt.
+
 `artifacts/sales-pipeline-updates.html` is the live app. It starts without company data and requires a configured connector
 or authenticated access on the hosted backend. `sales-pipeline-updates-demo.html` is the separate fictional-data preview.
 Real company data and credentials are never written to browser storage. Server records are shared by all reviewers.

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from app.review_content import (approved_lineage, bullet_id, merge_content, proposal_content,
+from app.review_content import (approved_lineage, bullet_id, merge_content, proposal_content, reviewed_content,
                                 review_next_step_bullets, source_id, source_version, validate_lineage)
 
 
@@ -297,3 +297,76 @@ def test_empty_content_has_a_valid_empty_graph():
     content = proposal_content([], [])
     assert content == ([], [], [], {"nextStep": [], "clientContext": []})
     assert validate_lineage(*content)
+
+
+def _step(number, day, **overrides):
+    subjects = ("", "Send Ana the price list", "Book the Lima workshop", "Share the forecast sample",
+                "Confirm store codes", "Draft the pilot scope", "", "Ana needs faster reporting")
+    text = overrides.pop("text", f"Step {number}: {subjects[number]}.")
+    return (record(number, body=text, occurred_at=datetime(2026, 11, day, 15, tzinfo=timezone.utc)),
+            insight(id=f"extract-{number}", text=text, quote=text, source_record_ids=[f"record-{number}"],
+                    origin_record_id=f"record-{number}",
+                    occurred_at=datetime(2026, 11, day, 15, tzinfo=timezone.utc), **overrides))
+
+
+def test_next_steps_lead_with_bianca_actions_newest_first_then_customer_items_and_blockers():
+    pairs = [_step(1, 2, owner_side="customer"), _step(2, 3, type="blocker"), _step(3, 4), _step(4, 9),
+             _step(5, 10, owner_side=None)]
+    actions, context, sources, lineage = proposal_content([r for r, _ in pairs], [i for _, i in pairs])
+    assert [text.split(":")[0] for text in actions] == [
+        "Next step", "Next step", "Next step (owner to confirm)", "Customer next step", "Blocker"]
+    assert actions[0].startswith("Next step: Step 4") and actions[1].startswith("Next step: Step 3")
+    assert validate_lineage(actions, context, sources, lineage)
+
+
+def test_card_limit_keeps_the_newest_bullets_and_names_the_sources_it_retires():
+    pairs = [_step(number, day) for number, day in ((1, 1), (2, 5), (3, 9), (4, 12))]
+    need = _step(7, 2, type="need")
+    records, insights = [r for r, _ in pairs] + [need[0]], [i for _, i in pairs] + [need[1]]
+    (actions, context, sources, lineage), retired = reviewed_content(records, insights, max_next_steps=2, max_context=4)
+    assert [text[:17] for text in actions] == ["Next step: Step 4", "Next step: Step 3"]
+    assert len(context) == 1 and len(sources) == 3
+    assert validate_lineage(actions, context, sources, lineage)
+    assert retired == sorted((source_version(pairs[0][0]), source_version(pairs[1][0])),
+                             key=lambda item: (item["source"], item["external_id"], item["version"]))
+    # No limit, or a limit that is not exceeded, retires nothing.
+    assert reviewed_content(records, insights)[1] == []
+    assert reviewed_content(records, insights, max_next_steps=4, max_context=1)[1] == []
+
+
+def test_a_source_that_still_supports_a_kept_bullet_is_not_retired():
+    shared = record(1, body="Send the price list to Ana today. Confirm the store codes with the regional team.",
+                    occurred_at=datetime(2026, 11, 1, 15, tzinfo=timezone.utc))
+    old = insight(id="a", text="Confirm the store codes with the regional team.",
+                  quote="Confirm the store codes with the regional team.", origin_record_id="record-1",
+                  occurred_at=datetime(2026, 11, 1, 15, tzinfo=timezone.utc))
+    need = insight(id="b", type="need", text="Ana needs the price list.", quote="Send the price list to Ana today.",
+                   origin_record_id="record-1")
+    newer = _step(2, 9)
+    (actions, context, sources, lineage), retired = reviewed_content(
+        [shared, newer[0]], [old, need, newer[1]], max_next_steps=1)
+    assert actions == ["Next step: Step 2: Book the Lima workshop."] and context == ["Customer need: Ana needs the price list."]
+    assert retired == [] and len(sources) == 2
+    assert validate_lineage(actions, context, sources, lineage)
+
+
+def test_two_wordings_of_one_step_become_one_bullet_with_both_sources():
+    ours = _step(1, 9, text="Send Franco the sales analysis deck and schedule the pilot scoping meeting.")
+    theirs = _step(2, 10, owner_side="customer",
+                   text="Franco to review the sales analysis deck before the pilot scoping meeting.")
+    other = _step(3, 10, text="Ask Ana for the KeHE portal credentials.")
+    actions, context, sources, lineage = proposal_content(
+        [ours[0], theirs[0], other[0]], [ours[1], theirs[1], other[1]])
+    assert actions == ["Next step: Ask Ana for the KeHE portal credentials.",
+                       "Next step: Send Franco the sales analysis deck and schedule the pilot scoping meeting."]
+    assert lineage["nextStep"][1]["sourceIds"] == sorted([source_id(ours[0]), source_id(theirs[0])])
+    assert validate_lineage(actions, context, sources, lineage)
+
+
+def test_short_or_different_steps_are_never_merged():
+    first = _step(1, 9, text="Follow up with Ana.")
+    second = _step(2, 9, text="Follow up with Paul.")
+    third = _step(3, 9, text="Send the proposal to the commercial team in Mexico.")
+    fourth = _step(4, 9, text="Send the contract to the legal team in Chile.")
+    pairs = [first, second, third, fourth]
+    assert len(proposal_content([r for r, _ in pairs], [i for _, i in pairs])[0]) == 4

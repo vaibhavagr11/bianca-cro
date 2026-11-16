@@ -1,6 +1,7 @@
 """Narrow Google Sheets adapter for founder-approved pipeline changes.
 
-Only ``Last progress``, ``Next step`` and ``Client Context`` are writable. Every attempt resolves the
+Only ``Last progress``, ``Next step`` and ``Client Context`` are writable by an approval; a founder's
+explicit status change writes the one ``Status`` cell of that company. Every attempt resolves the
 company and columns again, checks all reviewed cell values, and writes the fixed
 before/after plan in one batch. Google Sheets has no cell compare-and-swap: a
 collaborator can still edit or sort between the read and write. Keep the backend's
@@ -55,6 +56,7 @@ class SheetRow:
     client_context: str
     client_context_col: int
     status: str
+    status_col: int = -1
 
 
 class _AuthResponse:
@@ -273,7 +275,43 @@ class SheetsClient:
                         next_step=_review_text(row.get(next_col, {})), row_number=number + 1,
                         sheet_id=sheet_id, last_progress_col=progress_col, next_step_col=next_col,
                         client_context=_review_text(row.get(context_col, {})), client_context_col=context_col,
-                        status=_display_text(row.get(status_col, {})))
+                        status=_display_text(row.get(status_col, {})), status_col=status_col)
+
+    def set_status(self, company: str, expected_status: str, new_status: str) -> SheetRow:
+        """Write one company's Status cell after checking it still holds the value the founder saw."""
+        if not all(isinstance(value, str) for value in (expected_status, new_status)) or not new_status.strip():
+            raise SheetError("Status values must be text.")
+        if len(new_status) > 100 or "\n" in new_status or "\r" in new_status:
+            raise SheetError("A status must be one short line.")
+        key = normalize_name(company) if isinstance(company, str) else ""
+        sheet_id, cells = self._read_tab(review_cells=True)
+        company_col, status_col = self._columns(cells.get(0, {}), STATUS_HEADERS)
+        matches = [(number, row) for number, row in cells.items() if number > 0 and key
+                   and normalize_name(_display_text(row.get(company_col, {}))) == key]
+        if len(matches) != 1:
+            raise SheetConflict("The company must have exactly one matching Empresa row. Refresh the pipeline and resolve duplicates.")
+        number, row = matches[0]
+        cell = row.get(status_col, {})
+        if "formulaValue" in (cell.get("userEnteredValue") or {}) or "errorValue" in (cell.get("effectiveValue") or {}):
+            raise SheetConflict("This Status cell contains a formula or an error. Change it in the Sheet instead.")
+        current = _display_text(cell)
+        if current.strip() == new_status.strip():
+            return self.read_company(company)
+        if current.strip() != expected_status.strip():
+            raise SheetConflict("The Status changed in the Sheet since this page loaded. Refresh before changing it.")
+        self._request("POST", ":batchUpdate", payload={"requests": [{"updateCells": {
+            "range": {"sheetId": sheet_id, "startRowIndex": number, "endRowIndex": number + 1,
+                      "startColumnIndex": status_col, "endColumnIndex": status_col + 1},
+            "rows": [{"values": [{"userEnteredValue": {"stringValue": new_status}}]}],
+            "fields": "userEnteredValue",
+        }}]})
+        try:
+            verified = self.read_company(company)
+        except (SheetError, ValueError):
+            raise SheetWriteUncertain("The Status write was accepted but could not be verified. Refresh to check it.") from None
+        if verified.status.strip() != new_status.strip():
+            raise SheetWriteUncertain("The Status changed again while the update was being verified. Refresh to check it.")
+        return verified
 
     def apply_update(self, company: str, expected_last_progress: str, expected_next_step: str,
                      new_last_progress: str, new_next_step: str, *,

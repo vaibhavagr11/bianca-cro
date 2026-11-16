@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 from datetime import date, datetime
 from typing import Any
 from urllib.parse import quote
@@ -101,37 +102,35 @@ def _supporting_record(insight: dict, passage: str, records: dict[str, dict]) ->
     return matches[0] if len(matches) == 1 else None
 
 
-def proposal_content(records: list[dict], insights: list[dict]) -> Content:
-    """Build sales review bullets and attribute each one to the source of its quote."""
-    groups: dict[str, list[str]] = {destination: [] for destination in DESTINATIONS}
-    lineage: dict[str, list[dict]] = {destination: [] for destination in DESTINATIONS}
-    positions: dict[tuple[str, str], int] = {}
-    sources: dict[str, dict] = {}
+_OWNER_ORDER = {"bianca": 0, None: 1, "customer": 2}
+_BLOCKER_ORDER = 3
+_WORD = re.compile(r"[^\W_]+", re.UNICODE)
+_FILLER = frozenset("a an and are as at be by for from in is it of on or that the their them they this to was "
+                    "we were will with bianca customer".split())
+
+
+def _terms(text: str) -> frozenset[str]:
+    return frozenset(word for word in _WORD.findall(text.casefold()) if len(word) > 2 and word not in _FILLER)
+
+
+def _same_step(left: frozenset[str], right: frozenset[str]) -> bool:
+    """Two wordings of one step: at least three in four meaningful words of the shorter one appears in the other."""
+    smaller = min(len(left), len(right))
+    return smaller >= 4 and len(left & right) / smaller >= 0.75
+
+
+def reviewed_content(records: list[dict], insights: list[dict], *, max_next_steps: int | None = None,
+                     max_context: int | None = None) -> tuple[Content, list[dict]]:
+    """Build the review bullets, and name the source versions whose only bullets were left off the card.
+
+    Next Step leads with Bianca's own actions, newest first; customer-owed items and blockers follow.
+    Two wordings of the same step become one bullet with both sources. When a limit is set, the newest
+    bullets stay. Sources that supported only removed bullets are returned separately so a decision on
+    the card can also retire them, instead of the old bullets returning on the next build.
+    """
     by_id = {str(record["id"]): record for record in records}
-
-    def evidence(record: dict, passage: str) -> str:
-        version = source_version(record)
-        identifier = source_id(record)
-        entry = {"id": identifier, "recordId": str(record["id"]), "source": record["source"],
-                 "externalId": str(record["external_id"]), "version": version["version"],
-                 "type": SOURCE_NAMES[record["source"]],
-                 "date": _stamp(record.get("occurred_at"))[:10] or "Undated",
-                 "recordedAt": _stamp(record.get("created_at")), "subject": str(record.get("subject") or ""),
-                 "url": _source_link(record), "quotes": [passage], "quote": passage}
-        sources[identifier] = _merge_source(sources[identifier], entry) if identifier in sources else entry
-        return identifier
-
-    def add(text: str, destination: str, identifier: str) -> None:
-        key = (destination, _squash(text))
-        if not key[1]:
-            return
-        if key in positions:
-            node = lineage[destination][positions[key]]
-            node["sourceIds"] = _union(node["sourceIds"], [identifier])
-            return
-        positions[key] = len(groups[destination])
-        groups[destination].append(text)
-        lineage[destination].append({"bulletId": bullet_id(destination, text), "text": text, "sourceIds": [identifier]})
+    candidates: dict[str, list[dict]] = {destination: [] for destination in DESTINATIONS}
+    positions: dict[tuple[str, str], dict] = {}
 
     ordered = sorted(insights, key=lambda item: (item["type"] in ("commitment", "next_step"),
                                                _stamp(item.get("occurred_at")), item["text"]))
@@ -145,6 +144,7 @@ def proposal_content(records: list[dict], insights: list[dict]) -> Content:
         passage = insight.get("quote") or ""
         if not (record := _supporting_record(insight, passage, by_id)):
             continue
+        terms = _terms(text)
         prefix = CONTEXT_NAMES.get(kind)
         owner_side = insight.get("owner_side")
         if kind == "commitment":
@@ -160,9 +160,83 @@ def proposal_content(records: list[dict], insights: list[dict]) -> Content:
             label = "requested by" if kind == "next_step" else "due"
             text += f" — {label} {_stamp(insight['due_date'])[:10]}"
         destination = "nextStep" if kind in ACTION_TYPES else "clientContext"
-        add(text, destination, evidence(record, passage))
+        key = (destination, _squash(text))
+        if not key[1]:
+            continue
+        day = _stamp(insight.get("occurred_at"))[:10]
+        rank = (_BLOCKER_ORDER if kind == "blocker" else _OWNER_ORDER.get(owner_side, 1)) if destination == "nextStep" else 0
+        entry = positions.get(key)
+        if entry is None:
+            entry = {"text": text, "terms": terms, "day": day, "rank": rank, "evidence": []}
+            positions[key] = entry
+            candidates[destination].append(entry)
+        entry["day"] = max(entry["day"], day)
+        entry["evidence"].append((record, passage))
 
-    return groups["nextStep"], groups["clientContext"], list(sources.values()), lineage
+    # Prefer Bianca's own wording, then the newer source, when two bullets describe the same step.
+    steps: list[dict] = []
+    for entry in sorted(candidates["nextStep"], key=lambda item: (item["rank"], _reverse(item["day"]), item["text"])):
+        twin = next((kept for kept in steps if _same_step(kept["terms"], entry["terms"])), None)
+        if twin is None:
+            steps.append(entry)
+        else:
+            twin["day"] = max(twin["day"], entry["day"])
+            twin["evidence"].extend(entry["evidence"])
+    candidates["nextStep"] = steps
+
+    removed: list[dict] = []
+    for destination, limit in zip(DESTINATIONS, (max_next_steps, max_context)):
+        entries = candidates[destination]
+        if limit is not None and limit > 0 and len(entries) > limit:
+            newest = sorted(entries, key=lambda item: (_reverse(item["day"]), item["rank"], item["text"]))
+            keep = {id(item) for item in newest[:limit]}
+            removed.extend(item for item in entries if id(item) not in keep)
+            entries = [item for item in entries if id(item) in keep]
+        if destination == "nextStep":
+            entries = sorted(entries, key=lambda item: (item["rank"], _reverse(item["day"]), item["text"]))
+        candidates[destination] = entries
+
+    groups: dict[str, list[str]] = {destination: [] for destination in DESTINATIONS}
+    lineage: dict[str, list[dict]] = {destination: [] for destination in DESTINATIONS}
+    sources: dict[str, dict] = {}
+
+    def evidence(record: dict, passage: str) -> str:
+        version = source_version(record)
+        identifier = source_id(record)
+        entry = {"id": identifier, "recordId": str(record["id"]), "source": record["source"],
+                 "externalId": str(record["external_id"]), "version": version["version"],
+                 "type": SOURCE_NAMES[record["source"]],
+                 "date": _stamp(record.get("occurred_at"))[:10] or "Undated",
+                 "recordedAt": _stamp(record.get("created_at")), "subject": str(record.get("subject") or ""),
+                 "url": _source_link(record), "quotes": [passage], "quote": passage}
+        sources[identifier] = _merge_source(sources[identifier], entry) if identifier in sources else entry
+        return identifier
+
+    for destination in DESTINATIONS:
+        for entry in candidates[destination]:
+            identifiers = sorted({evidence(record, passage) for record, passage in entry["evidence"]})
+            groups[destination].append(entry["text"])
+            lineage[destination].append({"bulletId": bullet_id(destination, entry["text"]), "text": entry["text"],
+                                         "sourceIds": identifiers})
+
+    retired: dict[str, dict] = {}
+    for entry in removed:
+        for record, _ in entry["evidence"]:
+            if source_id(record) not in sources:
+                retired[source_id(record)] = source_version(record)
+    content = groups["nextStep"], groups["clientContext"], list(sources.values()), lineage
+    return content, sorted(retired.values(), key=lambda item: (item["source"], item["external_id"], item["version"]))
+
+
+def _reverse(day: str) -> tuple[int, ...]:
+    """Sort key that puts the latest ISO day first and undated items last."""
+    return tuple(-ord(char) for char in day) if day else (1,)
+
+
+def proposal_content(records: list[dict], insights: list[dict], *, max_next_steps: int | None = None,
+                     max_context: int | None = None) -> Content:
+    """Build sales review bullets and attribute each one to the source of its quote."""
+    return reviewed_content(records, insights, max_next_steps=max_next_steps, max_context=max_context)[0]
 
 
 def validate_lineage(next_steps: list[str], context: list[str], sources: list[dict], lineage: dict,

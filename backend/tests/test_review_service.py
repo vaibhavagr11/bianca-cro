@@ -1148,9 +1148,10 @@ def test_still_qualified_pending_bullets_survive_more_than_14_days_and_grow(monk
     conn.records["company-0"].append(dated_record(9, conn.now, created=conn.now))
     assert review.build_proposals(conn, WORKSPACE)["updated"] == 1
     pending = conn.proposals["company-0"]
-    assert pending["next_step_bullets"][:len(old["next_step_bullets"])] == old["next_step_bullets"]
+    assert set(old["next_step_bullets"]) < set(pending["next_step_bullets"])
+    assert pending["next_step_bullets"][0] == "We owe: New commercial item 9."  # newest first
     assert len(pending["next_step_bullets"]) == len(old["next_step_bullets"]) + 1
-    assert pending["bullet_lineage"]["nextStep"][0] == old["bullet_lineage"]["nextStep"][0]
+    assert old["bullet_lineage"]["nextStep"][0] in pending["bullet_lineage"]["nextStep"]
     assert review.build_proposals(conn, WORKSPACE)["skipped"] is True
 
 
@@ -1274,3 +1275,123 @@ def test_edited_text_has_no_false_source_edges_in_the_durable_decision_audit(ser
         assert lineage[destination][0]["sourceIds"] == []
         assert lineage[destination][0]["origin"] == "founder_edit"
     assert store.data["intents"][0]["bullet_lineage"] == lineage
+
+
+def test_card_limit_keeps_the_newest_step_and_a_decision_retires_the_older_sources(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20, review_max_next_steps=1))
+    conn = BuildConnection(1)
+    review.build_proposals(conn, WORKSPACE)
+    conn.now += timedelta(days=3)
+    newer = dated_record(9, conn.now, created=conn.now)
+    conn.records["company-0"].append(newer)
+    assert review.build_proposals(conn, WORKSPACE)["updated"] == 1
+    pending = conn.proposals["company-0"]
+    assert pending["next_step_bullets"] == ["We owe: New commercial item 9."]
+    assert [source["externalId"] for source in pending["sources"]] == ["dated-9"]
+    # Both versions are recorded on the card, so approving or ignoring it also retires the older email.
+    assert {version["external_id"] for version in pending["source_versions"]} == {"company-0", "dated-9"}
+    assert pending["observed_source_versions"] == pending["source_versions"]
+    conn.receipts = [{"company_id": "company-0", **version} for version in pending["source_versions"]]
+    conn.proposals.clear()
+    conn.now += timedelta(days=1)
+    assert review.build_proposals(conn, WORKSPACE)["created"] == 0
+
+
+class StatusConnection:
+    def __init__(self, stage="1. Opening", removed=None):
+        self.row = {"id": OPPORTUNITY, "name": "Diageo", "country": "MEX", "stage": stage, "removed_at": removed,
+                    "owner_code": "RG", "primary_buyer": None, "contacts_text": None, "last_progress": None,
+                    "next_step": "- last push", "client_context": None, "row_hash": "old-hash"}
+        self.changes, self.runs, self.committed = [], [], False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def commit(self):
+        self.committed = True
+
+    def execute(self, sql, params=()):
+        q = " ".join(sql.split())
+        if q.startswith("select o.*, c.name"):
+            return Result([dict(self.row)] if params == (WORKSPACE, OPPORTUNITY) else [])
+        if q.startswith("update opportunities set stage"):
+            self.row["stage"], self.row["row_hash"] = params[0], params[1]
+            return Result([])
+        if q.startswith("insert into sync_runs"):
+            self.runs.append(params[1])
+            return Result([{"id": "run-1"}])
+        if q.startswith("insert into opportunity_changes"):
+            self.changes.append(params[3:])
+            return Result([])
+        raise AssertionError(q)
+
+
+class StatusSheets:
+    statuses = {"diageo": "1. Opening", "campari": "4. Pilot", "bees": "0. Paused", "delta": "5. Working client"}
+    calls = []
+    error = None
+
+    def read_company_statuses(self):
+        return dict(self.statuses)
+
+    def set_status(self, company, expected, new):
+        if self.error:
+            raise self.error
+        type(self).calls.append((company, expected, new))
+        return SimpleNamespace(status=new)
+
+
+@pytest.fixture
+def status_service(monkeypatch):
+    conn = StatusConnection()
+    StatusSheets.calls, StatusSheets.error = [], None
+    monkeypatch.setattr(review.db, "connect", lambda: conn)
+    monkeypatch.setattr(review, "SheetsClient", StatusSheets)
+    return conn
+
+
+def test_status_change_writes_the_sheet_then_mirrors_the_stage_with_history(status_service):
+    result = review.change_status(WORKSPACE, OPPORTUNITY, "RG", "1. Opening", " 0. Paused ")
+    assert StatusSheets.calls == [("Diageo", "1. Opening", "0. Paused")]
+    assert result["status"] == "0. Paused" and result["company"] == "Diageo" and result["inSalesPipeline"] is True
+    assert status_service.row["stage"] == "0. Paused" and status_service.row["row_hash"] != "old-hash"
+    assert status_service.changes == [("1. Opening", "0. Paused")]
+    assert status_service.runs == ["sheet_review_status:RG"] and status_service.committed
+
+
+def test_status_change_allows_only_statuses_already_in_the_sheet_and_valid_founders(status_service):
+    for bad in ("9. Won", "", "paused"):
+        with pytest.raises(ValueError):
+            review.change_status(WORKSPACE, OPPORTUNITY, "RG", "1. Opening", bad)
+    with pytest.raises(ValueError):
+        review.change_status(WORKSPACE, OPPORTUNITY, "someone", "1. Opening", "0. Paused")
+    with pytest.raises(review.ReviewNotFound):
+        review.change_status(WORKSPACE, PROPOSAL, "RG", "1. Opening", "0. Paused")
+    assert not StatusSheets.calls and not status_service.changes
+
+
+def test_status_change_conflict_or_outage_leaves_the_mirror_untouched(status_service):
+    StatusSheets.error = SheetConflict("changed")
+    with pytest.raises(review.ReviewConflict):
+        review.change_status(WORKSPACE, OPPORTUNITY, "RG", "1. Opening", "0. Paused")
+    StatusSheets.error = SheetWriteUncertain("unverified")
+    with pytest.raises(review.ReviewUnavailable):
+        review.change_status(WORKSPACE, OPPORTUNITY, "RG", "1. Opening", "0. Paused")
+    assert status_service.row["stage"] == "1. Opening" and not status_service.changes
+
+
+def test_status_change_does_not_overwrite_a_mirror_that_a_newer_sync_already_moved(status_service):
+    status_service.row["stage"] = "2. In Talks"
+    result = review.change_status(WORKSPACE, OPPORTUNITY, "NC", "1. Opening", "0. Paused")
+    assert result["mirror_refreshed"] is False
+    assert status_service.row["stage"] == "2. In Talks" and not status_service.changes
+
+
+def test_moving_a_deal_to_working_client_reports_that_it_left_the_sales_pipeline(status_service):
+    result = review.change_status(WORKSPACE, OPPORTUNITY, "RG", "1. Opening", "5. Working client")
+    assert result["inSalesPipeline"] is False
+    assert review.status_options({"a": "4. Pilot", "b": None, "c": " 4. Pilot ", "d": "0. Paused", "e": ""}) == [
+        "0. Paused", "4. Pilot"]
