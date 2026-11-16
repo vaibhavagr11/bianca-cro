@@ -1,0 +1,101 @@
+{
+  "name": "Bianca - Send Daily Brief",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "brief",
+              "type": "object"
+            },
+            {
+              "name": "from",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "id": "6da67fd7-66d9-4473-834a-72454358d957",
+      "name": "After the Daily Brief is ready",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nif (items.length !== 1) {\n  throw new Error('Expected one Daily Brief build response.');\n}\n\nconst { brief, from } = items[0].json;\nif (\n  brief?.version !== 'v2' ||\n  brief.dry_run !== false ||\n  ((brief.verification_status !== undefined || brief.ready_to_send !== undefined) &&\n    brief.ready_to_send !== true)\n) {\n  throw new Error('The Daily Brief build is not ready to send.');\n}\n\nconst address = /^[a-z0-9.!#$%&'*+/=?^_{|}~-]+@[a-z0-9.-]+$/i;\nconst recipients = typeof brief.to === 'string' ? brief.to.split(',').map(value => value.trim()) : [];\nif (typeof from !== 'string' || !address.test(from) || !recipients.length || !recipients.every(value => address.test(value))) {\n  throw new Error('Enter a Gmail sender and comma-separated recipient email addresses.');\n}\nif (typeof brief.subject !== 'string' || !brief.subject.trim() || /[\\r\\n]/.test(brief.subject)) {\n  throw new Error('The Daily Brief subject must be a single line.');\n}\nif (typeof brief.text !== 'string' || !brief.text || typeof brief.html !== 'string' || !brief.html) {\n  throw new Error('The Daily Brief requires both text and HTML bodies.');\n}\nif (brief.amp_html != null && typeof brief.amp_html !== 'string') {\n  throw new Error('The AMP body must be HTML text.');\n}\n\nconst parts = [['text/plain', brief.text]];\nif (brief.amp_html) {\n  parts.push(['text/x-amp-html', brief.amp_html]);\n}\nparts.push(['text/html', brief.html]);\n\n// Fold UTF-8 encoded words without cutting a Unicode character in half.\nconst subjectWords = [];\nlet subjectChunk = '';\nfor (const character of brief.subject) {\n  if (Buffer.byteLength(subjectChunk + character) > 42) {\n    subjectWords.push(subjectChunk);\n    subjectChunk = '';\n  }\n  subjectChunk += character;\n}\nsubjectWords.push(subjectChunk);\nconst subject = subjectWords.map(word => '=?UTF-8?B?' + Buffer.from(word).toString('base64') + '?=').join('\\r\\n ');\n\n// MIME bodies are base64, so the hyphens in the boundary cannot match body content.\nconst boundary = 'bianca-daily-brief';\nconst message = [\n  'From: ' + from,\n  'To: ' + recipients.join(',\\r\\n '),\n  'Subject: ' + subject,\n  'Date: ' + new Date().toUTCString().replace(/GMT$/, '+0000'),\n  'MIME-Version: 1.0',\n  'Content-Type: multipart/alternative; boundary=\"' + boundary + '\"',\n  '',\n];\nfor (const [contentType, body] of parts) {\n  const encoded = Buffer.from(body.replace(/\\r\\n|\\r|\\n/g, '\\r\\n')).toString('base64');\n  message.push(\n    '--' + boundary,\n    'Content-Type: ' + contentType + '; charset=UTF-8',\n    'Content-Transfer-Encoding: base64',\n    '',\n    encoded.match(/.{1,76}/g).join('\\r\\n'),\n  );\n}\nmessage.push('--' + boundary + '--', '');\n\nreturn [{ json: { raw: Buffer.from(message.join('\\r\\n')).toString('base64url') } }];\n"
+      },
+      "id": "24fc7e74-1366-4af8-9dcc-4c1c38250b40",
+      "name": "Build the email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "gmailOAuth2",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ { raw: $json.raw } }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "2fd48c62-f12d-42dc-b87a-1f2cc22e7448",
+      "name": "Send via Gmail",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        0
+      ],
+      "notesInFlow": true,
+      "notes": "Select the Gmail OAuth2 credential for the configured From address. The caller continues to handle verification and delivery deduplication."
+    }
+  ],
+  "connections": {
+    "After the Daily Brief is ready": {
+      "main": [
+        [
+          {
+            "node": "Build the email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build the email": {
+      "main": [
+        [
+          {
+            "node": "Send via Gmail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "none",
+    "saveManualExecutions": false
+  },
+  "pinData": {},
+  "tags": []
+}
