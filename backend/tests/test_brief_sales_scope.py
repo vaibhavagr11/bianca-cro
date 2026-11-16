@@ -351,12 +351,14 @@ def test_waiting_row_beyond_display_cap_stays_out_of_highlights_and_followups(mo
     result = response.json()
     founder = result["payload"]["sections"][0]
     assert [w["deal"] for w in founder["waiting"]] == ["visible"]
+    assert [w["deal"] for w in founder["overflow_waiting"]] == ["capped"]
     assert founder["more_waiting"] == 1
     assert not founder["highlights"]
     assert not founder["followups"]
-    for body in (result["html"], result["text"]):
+    assert "Show 1 more" in result["amp_html"]
+    for body in (result["html"], result["text"], result["amp_html"]):
         assert "Customer to approve the visible proposal" in body
-        assert "Customer to approve the capped proposal" not in body
+        assert "Customer to approve the capped proposal" in body
         assert "Follow up on the capped proposal approval" not in body
 
 
