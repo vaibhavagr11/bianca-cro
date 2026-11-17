@@ -240,27 +240,25 @@ test('Header and cards follow the connected Pipeline Sheet and clear invalid or 
   }
 });
 
-test('Company cards display escaped source labels as plain lines without exposing source quotes',async()=>{
+test('Company cards show each source with a short, escaped excerpt of at most 15 words',async()=>{
   const s=snapshot();
+  const long='one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen';
   s.proposals[0].sources=[
     {id:'email-scope',type:'Meeting notes',date:'2026-09-28',subject:'Pilot notes',quote:'Notes quotation.'},
-    {id:'email-review',type:'Email',date:'2026-10-06',subject:'Review request',quote:'Email quotation.'},
+    {id:'email-review',type:'Email',date:'2026-10-06',subject:'Review request',quote:long,quotes:[long,'Second passage.']},
     {id:'calendar-kickoff',type:'Calendar',date:'2026-10-07',subject:'<script>Calendar',quote:'<img src=x> Calendar quotation.'},
-    {id:'undated-email',type:'Email',date:'',subject:'Additional update',quote:'Fourth excerpt.'}
+    {id:'undated-email',type:'Email',date:'',subject:'Additional update',quote:''}
   ];
   const page=fakePage({callTool:async()=>({structuredContent:s})});
   await new Promise(resolve=>setImmediate(resolve));
   const card=page.get('#review-list').innerHTML;
-  for(const [title,label] of [
-    ['Pilot notes','Source: Notes, Sep 28'],
-    ['Review request','Source: Email, Oct 6'],
-    ['&lt;script&gt;Calendar','Source: Calendar, Oct 7']
-  ])assert.ok(card.includes(`<li class="plain"><span>${title}</span><span class="src">${label}</span></li>`),label);
-  assert.equal(card.includes('<div class="ctx">'),false,'A source with nothing more to show is a plain line, not an empty dropdown.');
-  for(const source of s.proposals[0].sources)assert.equal(card.includes(source.quote),false);
-  assert.equal(card.includes('Fourth excerpt.'),false);
+  assert.ok(card.includes('<details><summary><span>Pilot notes</span><span class="src">Source: Notes, Sep 28</span></summary><div class="ctx"><p>&ldquo;Notes quotation.&rdquo;</p></div></details>'));
+  assert.ok(card.includes('<span>Review request</span><span class="src">Source: Email, Oct 6</span></summary><div class="ctx"><p>&ldquo;one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen ...&rdquo;</p><p>&ldquo;Second passage.&rdquo;</p></div>'));
+  assert.equal(card.includes('sixteen'),false,'An excerpt stops at 15 words.');
+  assert.ok(card.includes('<span>&lt;script&gt;Calendar</span><span class="src">Source: Calendar, Oct 7</span></summary><div class="ctx"><p>&ldquo;&lt;img src=x&gt; Calendar quotation.&rdquo;</p></div>'));
   assert.equal(card.includes('<img src=x>'),false);
-  assert.equal(card.includes('<script>'),false);
+  // A source with no passage is a plain line, never an empty dropdown.
+  assert.ok(card.includes('<li class="plain"><span>Additional update</span>'));
 });
 
 test('Current Next steps is a collapsed native dropdown using the latest matching company row',async()=>{
@@ -1131,8 +1129,8 @@ test('Messages of one thread on one day show as a single What\'s new line',async
   await new Promise(resolve=>setImmediate(resolve));
   const card=page.get('#review-list').innerHTML;
   assert.equal(card.split('<span>Re: Ramiro &lt;&gt; Allison</span>').length-1,1);
-  assert.ok(card.includes('<li class="plain"><span>Freestyle Snacks</span><span class="src">Source: Notes, Nov 5</span></li>'));
-  for(const source of s.proposals[0].sources)assert.equal(card.includes(source.quote),false);
+  assert.ok(card.includes('<div class="ctx"><p>&ldquo;First passage.&rdquo;</p><p>&ldquo;Second passage.&rdquo;</p></div>'));
+  assert.ok(card.includes('<span>Freestyle Snacks</span><span class="src">Source: Notes, Nov 5</span></summary><div class="ctx"><p>&ldquo;Notes passage.&rdquo;</p></div>'));
 });
 
 

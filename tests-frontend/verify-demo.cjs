@@ -228,7 +228,7 @@ test('Demo sources show types and dates and keep escaped excerpts in closed disc
     ['Notes title','Source: Notes, Sep 28','Notes quotation.'],
     ['Email title','Source: Email, Oct 6','Email quotation.'],
     ['Calendar title','Source: Calendar, Oct 7','&lt;img src=x&gt; Calendar quotation.']
-  ])assert.ok(card.includes(`<details><summary><span>${title}</span><span class="src">${label}</span></summary><div class="ctx"><p>${excerpt}</p></div></details>`),label);
+  ])assert.ok(card.includes(`<details><summary><span>${title}</span><span class="src">${label}</span></summary><div class="ctx"><p>&ldquo;${excerpt}&rdquo;</p></div></details>`),label);
   assert.equal(card.includes('<img src=x>'),false);
 });
 
