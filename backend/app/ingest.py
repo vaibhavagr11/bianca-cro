@@ -196,6 +196,27 @@ def store_gmail(conn: psycopg.Connection, workspace_id, kept: list, mailbox: str
     return created, updated, duplicates
 
 
+def apply_cancellation_notices(conn: psycopg.Connection, workspace_id, notices: list[tuple[str, date, str]]) -> int:
+    """Mark a stored meeting cancelled when Google's "Canceled event" mail for it arrived after the calendar fetch.
+
+    The meeting must have the same title and fall on the same local day. A notice sent before the latest calendar
+    sync is ignored: that sync already read the calendar's own, newer state.
+    """
+    cancelled = 0
+    for title, day, sent_at in notices:
+        cancelled += conn.execute(
+            "update source_records r set meta = r.meta || %s where r.workspace_id = %s and r.source = 'calendar'"
+            " and lower(btrim(r.subject)) = lower(%s)"
+            " and (r.occurred_at at time zone (select timezone from workspaces where id = %s))::date = %s"
+            " and r.meta->>'status' is distinct from 'cancelled'"
+            " and %s::timestamptz > coalesce((select max(started_at) from sync_runs where workspace_id = %s"
+            " and source = 'calendar' and status = 'succeeded'), '-infinity'::timestamptz)",
+            (Jsonb({"status": "cancelled", "cancelled_by": "mail notice", "cancelled_at": sent_at}), workspace_id,
+             title, workspace_id, day, sent_at, workspace_id),
+        ).rowcount
+    return cancelled
+
+
 def link_thread(conn: psycopg.Connection, workspace_id, mailbox: str, inbox_thread: str, canonical: str) -> None:
     """Point this inbox's thread at the stored conversation, and move anything already filed under it."""
     conn.execute("insert into gmail_thread_aliases (workspace_id, mailbox, thread_id, canonical_thread_id)"
@@ -229,6 +250,8 @@ def ingest_gmail(payload: GmailPayload, x_ingest_token: str | None = Header(defa
                 created, updated, duplicates = store_gmail(conn, workspace_id, kept, payload.mailbox.upper())
                 if duplicates:
                     skipped["already_stored_from_other_inbox"] = duplicates
+                notices = gmail.cancellation_notices(payload.messages)
+                meetings_cancelled = apply_cancellation_notices(conn, workspace_id, notices) if notices else 0
                 counts = {
                     "created": created,
                     "updated": updated,
@@ -246,7 +269,8 @@ def ingest_gmail(payload: GmailPayload, x_ingest_token: str | None = Header(defa
             raise HTTPException(status_code=500, detail="gmail sync failed")
 
     log.info("gmail sync %s succeeded: received=%s %s skipped_by_reason=%s", run_id, len(payload.messages), counts, skipped)
-    return {"sync_run_id": str(run_id), "received": len(payload.messages), **counts, "skipped_by_reason": skipped}
+    return {"sync_run_id": str(run_id), "received": len(payload.messages), **counts, "skipped_by_reason": skipped,
+            "meetings_cancelled": meetings_cancelled}
 
 
 @router.post("/notes")
@@ -348,6 +372,16 @@ def ingest_calendar(payload: CalendarPayload, x_ingest_token: str | None = Heade
                         created += 1
                     else:
                         updated += 1
+                # The calendar itself is the authority: a meeting it still lists as on, fetched well after a
+                # "Canceled event" mail marked it off, is on again (re-instated or a same-title lookalike).
+                conn.execute(
+                    "update source_records set meta = (meta - 'cancelled_by' - 'cancelled_at') || %s"
+                    " where workspace_id = %s and source = 'calendar' and external_id = any(%s)"
+                    " and meta->>'cancelled_by' = 'mail notice'"
+                    " and (meta->>'cancelled_at')::timestamptz < now() - interval '30 minutes'",
+                    (Jsonb({"status": "confirmed"}), workspace_id,
+                     [e.external_id for e in kept if e.meta.get("status") != "cancelled"]),
+                )
                 # Cancellations only touch meetings we already have; the classification stays.
                 cancelled = conn.execute(
                     "update source_records set meta = meta || '{\"status\": \"cancelled\"}'::jsonb"
