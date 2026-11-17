@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     brief_critical_ahead_days: int = 3
     # Preferred number of active In Talks deals among the four shown per founder (not a quota).
     brief_in_talks_target: int = 2
+    # Quiet In Talks deals (no recorded contact in 2+ weeks, nothing else open) come back a few per founder per day,
+    # longest-untouched first, and one that was listed is not listed again for the cooldown. 0 turns this off.
+    brief_resurface_per_day: int = Field(default=3, ge=0)
+    brief_resurface_cooldown_days: int = Field(default=14, ge=0)
     # No table in the brief lists more than this many rows; what is left out is counted on a line under the table.
     brief_max_table_rows: int = Field(default=7, gt=0)
     # Follow-up cadence while a customer has not answered: one "follow up this week" nudge per deal every this many

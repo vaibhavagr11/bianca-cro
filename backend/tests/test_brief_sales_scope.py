@@ -68,6 +68,8 @@ class BriefData:
         self.contacts = contacts
         self.last_contact_days = 2
         self.briefed = []           # days a brief was already sent, for the weekly nudge
+        self.resurfaced = []        # per earlier brief, the quiet In Talks deals it listed
+        self.last_contact = {}      # company id -> days since the last record (None: no record at all)
 
     def execute(self, query, params=()):
         if "from company_domains" in query:
@@ -80,6 +82,8 @@ class BriefData:
             return Result([{"owner_code": "RG", "full_name": "Ramiro Godfrid", "email": "ramiro@bianca.example",
                             "receives_brief": True}])
         if "from briefs" in query:
+            if "resurfaced" in query:
+                return Result([{"deals": names} for names in self.resurfaced])
             if "for_date" in query:
                 return Result([{"for_date": day} for day in self.briefed])
             return Result([{"created_at": NOW - timedelta(hours=6)}])
@@ -97,8 +101,9 @@ class BriefData:
         if "from sync_runs" in query:
             return Result()
         if "max(occurred_at) as last" in query:
-            return Result([{"company_id": d["company_id"], "last": NOW - timedelta(days=self.last_contact_days)}
-                           for d in self.deals])
+            days = {d["company_id"]: self.last_contact.get(d["company_id"], self.last_contact_days) for d in self.deals}
+            return Result([{"company_id": company, "last": NOW - timedelta(days=n)} for company, n in days.items()
+                           if n is not None])
         if "created_at >" in query or "occurred_at > %s" in query:
             return Result(m for m in self.messages if m["occurred_at"] > params[1])
         if "from source_records" in query and "source = 'gmail'" in query:
@@ -622,3 +627,49 @@ def test_table_limit_is_a_setting(monkeypatch, brief_client):
         "/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"}).json()
     founder = result["payload"]["sections"][0]
     assert len(founder["today"]) == 4 and founder["more_today"] == 2 and len(founder["highlights"]) <= 4
+
+
+# ---- B-12 (11/12): frozen In Talks deals come back in small batches, never all at once
+
+def test_quiet_in_talks_deals_come_back_three_a_day_longest_untouched_first(monkeypatch, brief_client):
+    quiet = {f"Quiet {n}": days for n, days in enumerate((70, 50, 40, 30, 20), start=1)}
+    deals = [{**deal(name), "next_step": "- Reconnect after their reorg"} for name in quiet]
+    deals += [deal("Never Seen"), deal("Active"), {**deal("Proposal"), "stage": "3. Proposal", "stage_rank": 3},
+              {**deal("On Hold"), "stage": "0. Paused", "stage_rank": 0},
+              {**deal("Dated"), "next_step": "- Call in January (complete by Jan 15, 2027)"}, deal("Waiting")]
+    ask = email("waiting-ask", "Waiting", "Can you approve the proposal?", days=20, outgoing=True)
+    data = BriefData(deals, [ask], [], [])
+    data.last_contact = {**quiet, "Never Seen": None, "Active": 3, "Proposal": 60, "On Hold": 60, "Dated": 60,
+                         "Waiting": 20}
+
+    def build():
+        result = brief_client(data).post("/brief/build?dry_run=true&version=v2",
+                                         headers={"X-Ingest-Token": "test-token"}).json()
+        return result, result["payload"]["sections"][0]
+
+    result, founder = build()
+    # In Talks only, nothing else open, not dated in the Sheet, not waiting: 6 qualify, 3 are shown.
+    assert [r["deal"] for r in founder["resurfaced"]] == ["Never Seen", "Quiet 1", "Quiet 2"]
+    assert founder["quiet_in_talks"] == 6
+    page = html.unescape(result["html"])
+    assert "Quiet In Talks deals to revisit (3 of 6)" in page
+    assert "last contact Aug 27 (10 weeks ago) · Sheet next step: Reconnect after their reorg" in page
+    assert "no email, meeting or note on record" in page
+    assert "A few each day, longest-untouched first." in page
+    assert "• Quiet 1 — last contact Aug 27 (10 weeks ago) · Sheet next step: Reconnect after their reorg" in result["text"]
+    for name in ("Quiet 3", "Quiet 4", "Quiet 5"):
+        assert f"<b>{name}</b>" not in page
+
+    data.resurfaced = [["Never Seen", "Quiet 1", "Quiet 2"]]         # yesterday's brief listed those
+    _, founder = build()
+    assert [r["deal"] for r in founder["resurfaced"]] == ["Quiet 3", "Quiet 4", "Quiet 5"]
+    data.resurfaced.append(["Quiet 3", "Quiet 4", "Quiet 5"])        # all six listed inside the cooldown
+    _, founder = build()
+    assert founder["resurfaced"] == []
+
+    data.resurfaced = []
+    monkeypatch.setattr(brief_api.settings, "brief_resurface_per_day", 1)
+    assert [r["deal"] for r in build()[1]["resurfaced"]] == ["Never Seen"]
+    monkeypatch.setattr(brief_api.settings, "brief_resurface_per_day", 0)
+    result, founder = build()
+    assert founder["resurfaced"] == [] and "Quiet In Talks deals" not in result["html"]

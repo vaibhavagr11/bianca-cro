@@ -731,6 +731,14 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             r["for_date"] for r in conn.execute(
                 "select distinct for_date from briefs where workspace_id = %s and for_date >= %s",
                 (workspace_id, today - timedelta(days=settings.brief_nudge_every_days))) if r.get("for_date")))
+        # Quiet In Talks deals listed by an earlier day's brief wait out the cooldown (today's own rebuilds do not
+        # count, so a retry shows the same batch).
+        resurfaced_recently = frozenset(
+            name for r in conn.execute(
+                "select jsonb_path_query_array(payload, '$.sections[*].resurfaced[*].deal') as deals from briefs"
+                " where workspace_id = %s and for_date >= %s and for_date < %s",
+                (workspace_id, today - timedelta(days=settings.brief_resurface_cooldown_days), today))
+            for name in r.get("deals") or [])
         waiting_candidates: list[brief_v2.Waiting] = []
         waiting: dict[str, brief_v2.Waiting] = {}
         for thread_id, msgs in threads.items():
@@ -939,7 +947,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             code, full, short, views, items, [(m, m.context) for m in meetings if code in m.attendees], today, display,
             0 if gate else hidden.get(code, 0), settings.brief_critical_ahead_days, settings.brief_in_talks_target,
             waiting=shown, more_waiting=more, waiting_candidates=waiting_candidates,
-            sheet_overdue_days=settings.brief_sheet_step_overdue_days, cadence=cadence, max_rows=max_rows))
+            sheet_overdue_days=settings.brief_sheet_step_overdue_days, cadence=cadence, max_rows=max_rows,
+            resurface=settings.brief_resurface_per_day, resurfaced_recently=resurfaced_recently))
 
     ndl = [brief_v2.TodayRow(i.deal, views[i.deal].stage, "Due now", i.text, f"due {i.due:%b} {i.due.day}", "Nico DL",
                              i.link, i.id, i.source, f"insight:{i.id}")

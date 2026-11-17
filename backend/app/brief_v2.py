@@ -740,6 +740,8 @@ class Section:
     held: int = 0                   # extracted items waiting for the Sheet date a founder gave them
     more_today: int = 0             # rows that need the founder today but did not fit the table
     more_meetings: int = 0
+    resurfaced: list[DealView] = field(default_factory=list)   # today's small batch of quiet In Talks deals
+    quiet_in_talks: int = 0         # all quiet In Talks deals this founder owns, shown today or not
 
 
 def cap_tables(section: Section, limit: int = MAX_TABLE_ROWS) -> Section:
@@ -894,7 +896,8 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                   hidden: int = 0, critical_ahead: int = 3, in_talks_target: int = 2, *,
                   waiting: list[Waiting] | None = None, more_waiting: int = 0,
                   waiting_candidates: list[Waiting] | None = None, sheet_overdue_days: int = 14,
-                  cadence: Cadence = Cadence(), max_rows: int = MAX_TABLE_ROWS) -> Section:
+                  cadence: Cadence = Cadence(), max_rows: int = MAX_TABLE_ROWS, resurface: int = 0,
+                  resurfaced_recently: frozenset[str] = frozenset()) -> Section:
     mine: dict[str, DealView] = {}
 
     def view(deal: str) -> DealView:
@@ -1041,6 +1044,17 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
     dormant = sum(1 for v in owned if v.rank in PROSPECT_RANKS and v.deal not in shown and v.deal not in sheet_dated
                   and deal_status(v, today) == "dormant")
 
+    # Quiet In Talks deals come back in small batches (founders, 11/12: "if it is In Talks it should appear
+    # somewhere, but not 70 emails in one day"): owned, In Talks, no recorded contact in over two weeks (or none
+    # at all), and not already in this section. Longest-untouched first; a deal listed in the last cooldown
+    # period waits its turn, so the batch moves through the list instead of repeating.
+    busy = (shown | in_today | sheet_dated | set(waits_by_deal)
+            | {m.deal or m.text.split(":", 1)[0] for m in follow_shown})
+    quiet = sorted((v for v in owned if v.rank == IN_TALKS_RANK and v.deal not in busy
+                    and deal_status(v, today) != "active"), key=lambda v: (v.last_contact or date.min, v.deal))
+    resurfaced = [v for v in quiet if v.deal not in resurfaced_recently][:max(0, resurface)]
+    unclear = [v for v in unclear if v not in resurfaced]
+
     # Backlog: everything else still open, summarized; individual items only for promised deadlines to active deals.
     rest = [i for v in mine.values() for i in v.items if i.id not in used and i.bucket in ("stale", "old_undated")]
     b = Backlog(len(rest), len({i.deal for i in rest}), min((i.due or i.recorded for i in rest), default=None),
@@ -1059,7 +1073,8 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                    hidden, routed, audit, waiting=waiting, more_waiting=more_waiting,
                    sheet_later=sorted(sheet_later, key=lambda pair: pair[1]),
                    sheet_stale=sorted(sheet_stale, key=lambda pair: pair[1]),
-                   held=sum(v.held for v in mine.values()))
+                   held=sum(v.held for v in mine.values()), resurfaced=resurfaced,
+                   quiet_in_talks=len(quiet) if resurface > 0 else 0)
 
 
 # ---------------------------------------------------------------- meeting prep (pure)
@@ -1311,6 +1326,12 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, 
                 if s.more_followups else "")
         out.append(lines + more)
 
+    if s.resurfaced:
+        out.append(_h(f"Quiet In Talks deals to revisit ({len(s.resurfaced)} of {s.quiet_in_talks})", MUTED))
+        out.append("".join(f'<p style="margin:3px 0;font:13px/1.4 {FONT};color:{INK}"><b>{_e(v.deal)}</b> '
+                           f'{_muted(_e(quiet_line(v, today)))}</p>' for v in s.resurfaced))
+        out.append(_left_out(RESURFACE_NOTE))
+
     notes = []
     if s.unclear:
         names = ", ".join(f"{v.deal} ({_date(v.last_contact)})" for v in s.unclear[:MAX_NAMES])
@@ -1346,6 +1367,17 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, 
     if notes:
         out.append("".join(f'<p style="margin:6px 0 0;font:12px/1.5 {FONT};color:{MUTED}">{n}</p>' for n in notes))
     return "".join(out) + verification_html(s.verification)
+
+
+RESURFACE_NOTE = ("A few each day, longest-untouched first. For each: email them, set a date in the Sheet's Next step, "
+                  "or move the deal to Paused.")
+
+
+def quiet_line(v: DealView, today: date) -> str:
+    """What we know about a quiet deal: how long since the last recorded contact, and the Sheet's own next step."""
+    last = (f"last contact {_date(v.last_contact)} ({elapsed((today - v.last_contact).days)} ago)" if v.last_contact
+            else "no email, meeting or note on record")
+    return last + (f" · Sheet next step: {first_sentence(v.sheet_next, 110)}" if v.sheet_next else "")
 
 
 def _long_date(d: date, today: date) -> str:
@@ -1435,6 +1467,9 @@ def plain_text(sections: list[Section], today: date, ndl_review: VerificationNot
         if s.followups:
             lines.append(f"Follow-ups that may be needed ({len(s.followups) + s.more_followups})")
             lines += [f"• [{m.tag}] {display(_move_text(m))} ({m.when})" for m in s.followups]
+        if s.resurfaced:
+            lines.append(f"Quiet In Talks deals to revisit ({len(s.resurfaced)} of {s.quiet_in_talks})")
+            lines += [f"• {v.deal} — {quiet_line(v, today)}" for v in s.resurfaced]
         lines.extend(verification_text(s.verification))
     if ndl_review and (ndl_review.waiting or ndl_review.unclear):
         lines += ["\nNICO DE LEÓN", *verification_text(ndl_review)]
@@ -1454,6 +1489,8 @@ def to_payload(sections: list[Section], ndl_rows: list[TodayRow], changes: list[
         "today": [{"deal": r.deal, "tag": r.tag, "text": r.text, "when": r.when, "item_id": r.item_id,
                    "source": r.source} for r in s.today],
         "more_today": s.more_today, "more_meetings": s.more_meetings,
+        "resurfaced": [{"deal": v.deal, "last_contact": v.last_contact} for v in s.resurfaced],
+        "quiet_in_talks": s.quiet_in_talks,
         "sheet_later": [{"deal": deal, "due": due} for deal, due in s.sheet_later],
         "sheet_stale": [{"deal": deal, "due": due} for deal, due in s.sheet_stale],
         "highlights": [{"deal": v.deal, "stage": v.stage, "situation": sit.text if sit else None, "move": move(m)}
