@@ -16,7 +16,7 @@ from app.brief import (
     meeting_text_fields, meeting_text_rows, meetings_table, stage_short, verification_html, verification_text,
 )
 from app.brief_followups import is_followup_only
-from app.brief_text import TableText, read_table_text
+from app.brief_text import TableText, read_table_text, split_sentences
 
 ACTIVE_DAYS = 14            # last recorded interaction within this = active
 UNCLEAR_DAYS = 45           # 15..45 days = status unclear (confirm); older = dormant
@@ -352,7 +352,7 @@ def _waiting_status(w: Waiting) -> str:
 
 
 def first_sentence(text: str, limit: int = 95) -> str:
-    parts = re.split(r"(?<=[^\d\s][.!?])\s+(?=[A-Z¿¡\"'])", text.strip(), maxsplit=2)
+    parts = split_sentences(text)
     s = parts[0] if len(parts[0]) >= 30 or len(parts) == 1 else f"{parts[0]} {parts[1]}"  # "Call Ale." alone says too little
     return s if len(s) <= limit else s[:limit].rsplit(" ", 1)[0] + "…"
 

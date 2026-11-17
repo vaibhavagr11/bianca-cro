@@ -118,3 +118,47 @@ def test_local_resolution_ignores_an_invalid_fallback_and_cuts_keeping_required_
     field = TableText("What", LONG_TEXT, ("Nov 5",), fallback)
     shown = read_table_text(field)
     assert shown != fallback and len(shown) <= TABLE_TEXT_LIMIT and "Nov 5" in shown
+
+
+# ---- finding 13 (11/09 evals): "CCU Chile is in '2." - a stage number is not the end of a sentence
+
+STAGE_SITUATION = ("CCU Chile is in '2. In Talks' after two calls with the commercial team, who asked for a proposal "
+                   "covering the three northern regions and a pilot timeline before the quarter ends. Next call pending.")
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("CCU Chile is in '2. In Talks' with no project yet. Next call pending.",
+     ["CCU Chile is in '2. In Talks' with no project yet.", "Next call pending."]),
+    ("Altavista Wines is at stage 1. Opening. Nico sent an invite.",
+     ["Altavista Wines is at stage 1. Opening.", "Nico sent an invite."]),
+    ("We met in 2025. Next step is a demo.", ["We met in 2025.", "Next step is a demo."]),
+    ("Sales grew 3.5 percent, e.g. in the north. J. Smith at bianca-ai.com agreed. Done!",
+     ["Sales grew 3.5 percent, e.g. in the north.", "J. Smith at bianca-ai.com agreed.", "Done!"]),
+    ('He said "We are done. Call me." Then he left.', ['He said "We are done. Call me."', "Then he left."]),
+    ("The buyer's team is ready. Next.", ["The buyer's team is ready.", "Next."]),
+    ("Sr. Pérez pidió la propuesta. Falta el precio.", ["Sr. Pérez pidió la propuesta.", "Falta el precio."]),
+])
+def test_sentences_do_not_end_at_stage_numbers_decimals_abbreviations_initials_or_inside_quotes(text, expected):
+    from app.brief_text import split_sentences
+    assert split_sentences(text) == expected
+
+
+def test_long_situation_is_never_cut_at_the_stage_number_mid_quote_or_with_an_ellipsis():
+    assert len(STAGE_SITUATION) > TABLE_TEXT_LIMIT
+    shown = read_table_text(TableText("Situation", STAGE_SITUATION))
+    assert shown == "CCU Chile is in '2. In Talks' after two calls with the commercial team."
+    no_breaks = "The buyer said the team is still validating store data against its own exports " * 3
+    cut = read_table_text(TableText("Situation", no_breaks))
+    assert len(cut) <= TABLE_TEXT_LIMIT and cut.endswith("(cut short)") and "…" not in cut
+    quoted = ("The deal is in '2. In Talks' and the buyer wrote 'we cannot commit to any of the dates you proposed for "
+              "the regional rollout until finance signs off on next year's budget and the new head of sales starts'.")
+    cut = read_table_text(TableText("Situation", quoted))
+    assert len(cut) <= TABLE_TEXT_LIMIT and "…" not in cut and not cut.endswith("'2.")
+    assert cut.count("'") % 2 == 0     # the quote that was opened is closed or left out
+
+
+@pytest.mark.parametrize("rewrite", ["CCU Chile is in '2.", "CCU Chile is in '2. In Talks' after two calls."])
+def test_model_rewrite_that_stops_at_the_stage_number_or_mid_sentence_is_rejected(rewrite):
+    field = TableText("Situation", STAGE_SITUATION)
+    display = prepare_table_text([field], StubClaude([{"id": "1", "text": rewrite}]), "test-model")
+    assert display(field) == "CCU Chile is in '2. In Talks' after two calls with the commercial team."
