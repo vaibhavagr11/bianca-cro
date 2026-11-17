@@ -457,11 +457,12 @@ def _date(d: date) -> str:
 
 
 SHEET_SOURCE = "Sheet next step"
-TODAY_ORDER = {"Due now": 0, "Sheet date": 1, "Reply needed": 2}
+TODAY_ORDER = {"Sheet date": 0, "Due now": 1, "Reply needed": 2}
 
 
 def sort_today(rows: list[TodayRow]) -> list[TodayRow]:
-    """Promises due first, then the founders' own Sheet dates, then replies; stable inside each group."""
+    """The dates the founders set themselves in the Sheet first (so the table's row limit never cuts them), then
+    promises due, then replies; stable inside each group."""
     return sorted(rows, key=lambda r: (TODAY_ORDER.get(r.tag, 3), r.when))
 
 
@@ -1004,6 +1005,7 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
     highlight_views = []
     followup_only = set()
     dated_only = set()
+    today_only = set()
     sheet_dated = {r.deal for r in today_rows if r.tag == "Sheet date"} | {deal for deal, _ in sheet_later}
     primary_moves = {}
     for original in eligible:
@@ -1019,6 +1021,10 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
         if move.tag == "Confirm status" and v.deal in sheet_dated:
             dated_only.add(v.deal)
             continue
+        # A deal whose one open thing is already in Needs you today has nothing left for a second row.
+        if move.tag == "Confirm status" and v.deal in in_today:
+            today_only.add(v.deal)
+            continue
         primary_moves[v.deal] = move
         highlight_views.append(v)
 
@@ -1031,6 +1037,9 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
         elif v.deal in dated_only:
             audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
                                          "not eligible: its next step is dated in the Sheet and nothing else is open"))
+        elif v.deal in today_only:
+            audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
+                                         "not eligible: already in Needs you today and nothing else is open"))
         elif v.rank in PROSPECT_RANKS and v not in eligible:
             status = deal_status(v, today)
             audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
@@ -1082,6 +1091,7 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                     and deal_status(v, today) != "active"), key=lambda v: (v.last_contact or date.min, v.deal))
     resurfaced = [v for v in quiet if v.deal not in resurfaced_recently][:max(0, resurface)]
     unclear = [v for v in unclear if v not in resurfaced]
+    dormant -= sum(1 for v in resurfaced if deal_status(v, today) == "dormant")   # named above, not counted again
 
     # Backlog: everything else still open, summarized; individual items only for promised deadlines to active deals.
     rest = [i for v in mine.values() for i in v.items if i.id not in used and i.bucket in ("stale", "old_undated")]

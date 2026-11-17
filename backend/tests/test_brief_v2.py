@@ -483,7 +483,10 @@ def test_reply_needed_uses_the_extracted_request_without_duplicating_it_as_a_mov
     s = section("RG", [view("Pernod", 3, owner="RG", unanswered=specific)], [request])
     assert [(row.tag, row.text) for row in s.today] == [("Reply needed", request.text)]
     assert s.today[0].done == "insight:i"
-    assert s.highlights[0][1].text == "Check where this deal stands"
+    # B-09 (11/12): the deal is already in Needs you today with its one open thing, so it gets no second,
+    # generic "Check where this deal stands" row in Deals to move (until 11/17 it did).
+    assert s.highlights == []
+    assert [r.reason for r in s.audit] == ["not eligible: already in Needs you today and nothing else is open"]
 
 
 def test_semantic_fixes_do_not_change_deal_selection():
