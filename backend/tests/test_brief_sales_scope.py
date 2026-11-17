@@ -71,6 +71,9 @@ class BriefData:
         self.resurfaced = []        # per earlier brief, the quiet In Talks deals it listed
         self.last_contact = {}      # company id -> days since the last record (None: no record at all)
 
+    def transaction(self):
+        return nullcontext()
+
     def execute(self, query, params=()):
         if "from company_domains" in query:
             return Result(self.domains)

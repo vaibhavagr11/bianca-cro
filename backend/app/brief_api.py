@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+from dataclasses import replace
 from datetime import datetime, time, timedelta
 from typing import Literal
 from uuid import UUID
@@ -35,6 +36,28 @@ router = APIRouter(prefix="/brief")
 FOUNDER_ORDER = ["RG", "NC"]  # sections in this order; NDL gets the small shared table
 # Two founders are named Nicolás, so the brief uses these names, not first names.
 DISPLAY = {"RG": ("Ramiro", "Ramiro Godfrid"), "NC": ("Nico", "Nico Casaux"), "NDL": ("Nico DL", "Nico de León")}
+
+
+def _optional(conn, what: str, read, default):
+    """Run a read the brief can do without. If it fails, log why and build the brief without it.
+
+    The read runs in a savepoint, so a failed statement does not poison the queries that follow it.
+    """
+    try:
+        with conn.transaction():
+            return read()
+    except Exception:
+        log.exception("brief built without %s", what)
+        return default
+
+
+def _safely(what: str, compute, default=None):
+    """An extra the brief can do without, computed from data already read: on failure log why and leave it out."""
+    try:
+        return compute()
+    except Exception:
+        log.exception("brief built without %s", what)
+        return default
 
 
 def _sales_deals(conn, workspace_id) -> tuple[dict[str, dict], dict[str, str]]:
@@ -223,8 +246,12 @@ def _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, em
         deal = deals.get(str(m["company_id"])) or deals.get(str(m.get("rules_company_id")))
         matched_by = None
         if deal is None and not m["company_id"] and internal:
-            company_id, matched_by = _deal_for_guests(guests, deals, working_clients, domain_company or {},
-                                                      contact_company or {})
+            try:
+                company_id, matched_by = _deal_for_guests(guests, deals, working_clients, domain_company or {},
+                                                          contact_company or {})
+            except Exception:           # the meeting is still listed, just not tied to a deal
+                log.exception("guest matching skipped for meeting %s", m["id"])
+                company_id, matched_by = None, None
             if company_id in working_clients:
                 continue            # a working client's meeting: out of the brief, like the rest of its activity
             deal = deals.get(company_id)
@@ -244,7 +271,14 @@ def _apply_sheet_dates(deals: dict[str, dict], views: dict[str, brief_v2.DealVie
     look at it), and from the date on the Sheet row stands in for it, so one step is never listed twice. A bullet
     whose matching item was already closed, or that a founder marked Done, is not raised again.
     """
-    overdue_days = settings.brief_sheet_step_overdue_days
+    for d in deals.values():
+        views[d["name"]].sheet_next = brief_sheet_steps.first_bullet(d.get("next_step"))
+    if not settings.brief_sheet_dates:
+        return items
+    overdue_days, hold = settings.brief_sheet_step_overdue_days, settings.brief_sheet_hold_matching
+    # An item that is due (or due tomorrow) or overdue by its own date is never held for a later Sheet date: the
+    # promise the customer heard stands until someone closes it.
+    due_now = {i.id for i in items if i.due is not None and (i.due - today).days <= 1}
     actions_by_deal: dict[str, list[dict]] = {}
     for r in insight_rows:
         if r["type"] in ("commitment", "next_step"):
@@ -253,38 +287,53 @@ def _apply_sheet_dates(deals: dict[str, dict], views: dict[str, brief_v2.DealVie
     taken: set[str] = set()
     for d in deals.values():
         view = views[d["name"]]
-        view.sheet_next = brief_sheet_steps.first_bullet(d.get("next_step"))
         if is_paused(d["stage"]):
             continue
-        kept_keys, deal_taken = [], set()
-        for step in brief_sheet_steps.parse_cell(d.get("next_step"), today):
-            ref = _recommendation_ref(d["id"], f"sheet step: {step.key} {step.due.isoformat()}")
-            if closed.get(("rec", ref), ("",))[0] == "done":
-                continue
-            same = [r for r in actions_by_deal.get(str(d["id"]), [])
-                    if brief_sheet_steps.same_step(step.key, brief_sheet_steps.match_key(r["text"]))]
-            matched = [str(r["id"]) for r in same if str(r["id"]) in open_ids]
-            if same and not matched and any(r["status"] in ("done", "dismissed", "possibly_done") for r in same):
-                continue                # the step itself was closed; the Sheet text is just not updated yet
-            late = (today - step.due).days
-            current = late <= overdue_days
-            if current:                 # not yet due (held) or due now (the Sheet row replaces the item)
-                deal_taken.update(matched)
-                kept_keys.append(step.key)
-                view.held += len(matched) if late < 0 else 0
-            view.sheet_steps.append(brief_v2.SheetDue(step.text, step.due, ref,
-                                                      matched[0] if matched and 0 <= late and current else None))
-        if kept_keys:
-            def repeats(note: brief_v2.Note) -> bool:
-                return bool(note.evidence and note.evidence <= deal_taken) or any(
-                    brief_sheet_steps.same_step(key, brief_sheet_steps.match_key(note.text)) for key in kept_keys)
-            view.recommendations = [n for n in view.recommendations if not repeats(n)]
-            if view.recommendation and repeats(view.recommendation):
-                view.recommendation = next(iter(view.recommendations), None)
-            if view.unanswered and view.unanswered.item_id in deal_taken:
-                view.unanswered = None
-        taken |= deal_taken
+        try:
+            taken |= _deal_sheet_dates(d, view, actions_by_deal.get(str(d["id"]), []), open_ids, due_now, closed,
+                                       today, overdue_days, hold)
+        except Exception:               # one unreadable cell must not stop the brief or the other deals' dates
+            log.exception("sheet dates skipped for opportunity %s", d["id"])
+            view.sheet_steps, view.held = [], 0
     return [i for i in items if i.id not in taken]
+
+
+def _deal_sheet_dates(d: dict, view: brief_v2.DealView, deal_actions: list[dict], open_ids: set[str],
+                      due_now: set[str], closed: dict, today, overdue_days: int, hold: bool) -> set[str]:
+    """One deal's dated Sheet bullets onto its view; returns the ids of the items they hold back or stand in for."""
+    kept_keys, deal_taken = [], set()
+    for step in brief_sheet_steps.parse_cell(d.get("next_step"), today):
+        ref = _recommendation_ref(d["id"], f"sheet step: {step.key} {step.due.isoformat()}")
+        if closed.get(("rec", ref), ("",))[0] == "done":
+            continue
+        same = [r for r in deal_actions
+                if brief_sheet_steps.same_step(step.key, brief_sheet_steps.match_key(r["text"]))]
+        matched = [str(r["id"]) for r in same if str(r["id"]) in open_ids]
+        if same and not matched and any(r["status"] in ("done", "dismissed", "possibly_done") for r in same):
+            continue                # the step itself was closed; the Sheet text is just not updated yet
+        late = (today - step.due).days
+        current = late <= overdue_days
+        if current and late >= 0:   # due now: the Sheet row replaces the item
+            deal_taken.update(matched)
+            kept_keys.append(step.key)
+        elif current and hold:      # not yet due: hold the item until then, unless its own date has come
+            held = [i for i in matched if i not in due_now]
+            deal_taken.update(held)
+            view.held += len(held)
+            if len(held) == len(matched):
+                kept_keys.append(step.key)
+        view.sheet_steps.append(brief_v2.SheetDue(step.text, step.due, ref,
+                                                  matched[0] if matched and 0 <= late and current else None))
+    if kept_keys:
+        def repeats(note: brief_v2.Note) -> bool:
+            return bool(note.evidence and note.evidence <= deal_taken) or any(
+                brief_sheet_steps.same_step(key, brief_sheet_steps.match_key(note.text)) for key in kept_keys)
+        view.recommendations = [n for n in view.recommendations if not repeats(n)]
+        if view.recommendation and repeats(view.recommendation):
+            view.recommendation = next(iter(view.recommendations), None)
+        if view.unanswered and view.unanswered.item_id in deal_taken:
+            view.unanswered = None
+    return deal_taken
 
 
 class BuildSyncReceipts(BaseModel):
@@ -647,8 +696,9 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         since = since or (last["created_at"] if last else now - timedelta(hours=24))
 
         deals, working_clients = _sales_deals(conn, workspace_id)
-        own_domains, domain_company, contact_company = _company_addresses(
-            conn, workspace_id, {company_id: d["name"] for company_id, d in deals.items()})
+        own_domains, domain_company, contact_company = _optional(
+            conn, "learned company domains (guest matching, reply origin)", lambda: _company_addresses(
+                conn, workspace_id, {company_id: d["name"] for company_id, d in deals.items()}), ({}, {}, {}))
         profiles = {str(r["opportunity_id"]): r for r in conn.execute(
             "select distinct on (opportunity_id) opportunity_id, profile, generated_at, profiler_version"
             " from opportunity_profiles"
@@ -733,18 +783,27 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                 latest = last_reply if from_customer(m) else last_ours
                 if d["name"] not in latest or m["at"] > latest[d["name"]]:
                     latest[d["name"]] = m["at"]
-        cadence = brief_v2.Cadence(settings.brief_nudge_every_days, settings.brief_pause_after_emails, frozenset(
-            r["for_date"] for r in conn.execute(
-                "select distinct for_date from briefs where workspace_id = %s and for_date >= %s",
-                (workspace_id, today - timedelta(days=settings.brief_nudge_every_days))) if r.get("for_date")))
+        # Both read the archive of sent briefs. Briefs archived before 11/17 have no "resurfaced" key: they count
+        # as days a brief was sent and as listing no quiet deal.
+        cadence = None                  # None: time-based nudges are switched off (see _split_followups)
+        if settings.brief_followup_nudges:
+            cadence = brief_v2.Cadence(settings.brief_nudge_every_days, settings.brief_pause_after_emails, _optional(
+                conn, "the days a brief was sent (a weekly nudge may repeat)", lambda: frozenset(
+                    r["for_date"] for r in conn.execute(
+                        "select distinct for_date from briefs where workspace_id = %s and for_date >= %s",
+                        (workspace_id, today - timedelta(days=settings.brief_nudge_every_days))) if r.get("for_date")),
+                frozenset()))
         # Quiet In Talks deals listed by an earlier day's brief wait out the cooldown (today's own rebuilds do not
         # count, so a retry shows the same batch).
-        resurfaced_recently = frozenset(
+        resurface = settings.brief_resurface_per_day
+        resurfaced_recently = _optional(conn, "the quiet-deal batch (earlier batches unreadable)", lambda: frozenset(
             name for r in conn.execute(
                 "select jsonb_path_query_array(payload, '$.sections[*].resurfaced[*].deal') as deals from briefs"
                 " where workspace_id = %s and for_date >= %s and for_date < %s",
                 (workspace_id, today - timedelta(days=settings.brief_resurface_cooldown_days), today))
-            for name in r.get("deals") or [])
+            for name in r.get("deals") or [] if isinstance(name, str)), None) if resurface > 0 else frozenset()
+        if resurfaced_recently is None:     # without the cooldown the same deals would repeat daily: skip the batch
+            resurface, resurfaced_recently = 0, frozenset()
         def answered_after(thread_id: str | None, at: datetime | None) -> datetime | None:
             """When we last sent a real email to someone outside Bianca in this thread after the given moment."""
             if at is None:
@@ -776,13 +835,15 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                 replied = last_reply.get(d["name"])
                 nudges = sum(1 for at in ours_sent.get(d["name"], []) if not replied or at > replied)  # every thread
                 action, evidence = _waiting_action(email_asks, w)
+                timed = cadence is not None and not is_paused(d["stage"])   # a Paused deal is never nudged
                 candidate = brief_v2.Waiting(
                     d["name"], d["stage"], w["to"], sent.date(), w["days"], max(nudges, w["nudges"]), replied is not None,
                     w["auto_reply"] or last_auto.get(d["name"], t["occurred_at"]) > t["occurred_at"],
                     timeline.GMAIL_THREAD_URL.format(thread_id), f"Email · {sent:%b} {sent.day}",
                     thread_id, sender if sender in FOUNDER_ORDER else d["owner_code"], d["stage_rank"],
-                    action=action, evidence=evidence, nudge=cadence.due(sent.date(), today),
-                    pause_after=cadence.pause_after)
+                    action=action, evidence=evidence,
+                    nudge=bool(timed and _safely("a weekly nudge", lambda: cadence.due(sent.date(), today), False)),
+                    pause_after=cadence.pause_after if timed else None)
                 waiting_candidates.append(candidate)
                 if d["name"] not in waiting or sent.date() > waiting[d["name"]].sent:
                     waiting[d["name"]] = candidate
@@ -875,7 +936,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                  and closed.get(("rec", n.ref), ("",))[0] != "done"]
         if not gate:                    # a verified build asks the pre-send check instead
             for n in recs_:
-                n.replied = replied_since(n.evidence)
+                n.replied = _safely("the wrote-back cue on a suggestion", lambda: replied_since(n.evidence))
         views[d["name"]] = brief_v2.DealView(
             d["name"], d["stage"], d["stage_rank"], d["owner_code"], last_contact.get(company_id),
             blocker=blockers[0] if blockers else None,
@@ -942,7 +1003,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         replied = None
         if not gate and kind == "customer_request" and r["source"] == "gmail":
             # The customer asked by email and we have written back in that thread since: flag it, do not hide it.
-            replied = answered_after(r["unit_id"], timestamp)
+            replied = _safely("the wrote-back cue on a request", lambda: answered_after(r["unit_id"], timestamp))
         items.append(brief_v2.Item(
             str(r["id"]), d["name"], r["text"], r["due_date"], recorded, r["owner_name"], route, basis, delegated,
             f"{SOURCE_LABEL.get(r['source'], r['source'])} · {when:%b} {when.day}" if when else r["source"],
@@ -950,6 +1011,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             brief_v2.bucket(r["due_date"], recorded, today, t1, t2), kind,
             replied=replied.astimezone(tz).date() if replied else None))
 
+    items_before_sheet = items
     items = _apply_sheet_dates(deals, views, items, ins_rows, closed, today)
 
     # ---- classify every newly extracted insight by the event time of the record its quote comes from
@@ -978,12 +1040,22 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
     for code in FOUNDER_ORDER:
         short, full = DISPLAY.get(code, (code, names.get(code, code)))
         shown, more = picked_waits[code]
-        sections.append(brief_v2.build_section(
-            code, full, short, views, items, [(m, m.context) for m in meetings if code in m.attendees], today, display,
-            0 if gate else hidden.get(code, 0), settings.brief_critical_ahead_days, settings.brief_in_talks_target,
-            waiting=shown, more_waiting=more, waiting_candidates=waiting_candidates,
-            sheet_overdue_days=settings.brief_sheet_step_overdue_days, cadence=cadence, max_rows=max_rows,
-            resurface=settings.brief_resurface_per_day, resurfaced_recently=resurfaced_recently))
+
+        def section(views, items, cadence, resurface):
+            return brief_v2.build_section(
+                code, full, short, views, items, [(m, m.context) for m in meetings if code in m.attendees], today,
+                display, 0 if gate else hidden.get(code, 0), settings.brief_critical_ahead_days,
+                settings.brief_in_talks_target, waiting=shown, more_waiting=more, waiting_candidates=waiting_candidates,
+                sheet_overdue_days=settings.brief_sheet_step_overdue_days, cadence=cadence, max_rows=max_rows,
+                resurface=resurface, resurfaced_recently=resurfaced_recently)
+        try:
+            sections.append(section(views, items, cadence, resurface))
+        except Exception:
+            # The 11/17 additions are extras. If one of them breaks on today's data, send the brief without them
+            # rather than no brief: no Sheet dates, no time-based nudges, no quiet-deal batch for this founder.
+            log.exception("brief section %s rebuilt without Sheet dates, nudges and the quiet-deal batch", code)
+            plain = {name: replace(v, sheet_steps=[], held=0) for name, v in views.items()}
+            sections.append(section(plain, items_before_sheet, None, 0))
 
     ndl = [brief_v2.TodayRow(i.deal, views[i.deal].stage, "Due now", i.text, f"due {i.due:%b} {i.due.day}", "Nico DL",
                              i.link, i.id, i.source, f"insight:{i.id}")
@@ -994,13 +1066,15 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             for v in views.values() if v.owner == "NDL" and v.unanswered and brief_v2.reply_label(v.unanswered) == "reply_needed"]
     for v in views.values():
         if v.owner == "NDL":
-            ndl += brief_v2.sheet_rows(v, today, settings.brief_sheet_step_overdue_days, "Nico DL (Sheet)")[0]
+            ndl += _safely("a Sheet date for Nico DL", lambda: brief_v2.sheet_rows(
+                v, today, settings.brief_sheet_step_overdue_days, "Nico DL (Sheet)")[0], [])
     ndl = brief_v2.sort_today(ndl)[:brief.MAX_NDL]
     ndl_review = brief_review.verify_v2(sections, ndl, {d["name"]: key for key, d in deals.items()}, sources, gate) \
         if gate else None
     # Prep is written last, from the rows that survived the check above, so it never revives a closed action.
     for s in sections:
-        s.meetings = [(m, prep or brief_v2.meeting_prep(m, s, views.get(m.deal), today, checked=gate is not None))
+        s.meetings = [(m, prep or _safely("a meeting's prep line", lambda: brief_v2.meeting_prep(
+            m, s, views.get(m.deal), today, checked=gate is not None), ""))
                       for m, prep in s.meetings]
         brief_v2.cap_tables(s, max_rows)    # after the check, so rows that passed it fill the tables
 

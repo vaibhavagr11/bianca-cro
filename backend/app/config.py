@@ -56,9 +56,17 @@ class Settings(BaseSettings):
     # days since our last email, and after this many of our emails in a row with no reply, suggest Paused instead.
     brief_nudge_every_days: int = Field(default=7, gt=0)
     brief_pause_after_emails: int = Field(default=5, gt=0)
+    # False switches the time-based reminders off: "keep following up" rows print as written and Waiting rows carry
+    # no "follow up this week" or "consider moving to Paused", as before 11/17.
+    brief_followup_nudges: bool = True
     # A "(complete by <date>)" note in the Sheet's Next step shows in "Needs you today" from its date until it is
     # this many days late; after that it moves to a one-line reminder to update the Sheet.
     brief_sheet_step_overdue_days: int = Field(default=14, ge=0)
+    # False: the Sheet's "(complete by <date>)" notes are not read at all, as before 11/17.
+    brief_sheet_dates: bool = True
+    # While a dated Sheet step is not due yet, the extracted item that is the same step is held back until that date
+    # (never one that is due or overdue by its own date). False: such items keep showing by their own rules.
+    brief_sheet_hold_matching: bool = True
     # Turn on after n8n is configured to provide receipts and check ready_to_send.
     brief_verification_required: bool = False
     brief_verification_feeds: list[str] = ["gmail:RG", "gmail:NC", "calendar:RG", "calendar:NC", "notes", "pipeline"]

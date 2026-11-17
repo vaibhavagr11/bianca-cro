@@ -78,6 +78,23 @@ def test_a_sheet_date_from_another_year_is_shown_with_its_year(brief_client):
 
 # ---- a Paused deal is parked on purpose: no reminder of any kind
 
+def test_paused_deal_is_never_nudged_or_told_to_move_to_paused(brief_client):
+    six = [email(f"p-{n}", "Parked", "Can you confirm?", days=days, outgoing=True, thread="parked-thread")
+           for n, days in enumerate((49, 42, 35, 28, 21, 14))]
+    once = email("o-ask", "Parked Once", "Can you approve the proposal?", days=14, outgoing=True)
+    active = email("a-ask", "Active", "Can you approve the proposal?", days=14, outgoing=True)
+    deals = [{**deal("Parked"), **PAUSED}, {**deal("Parked Once"), **PAUSED}, deal("Active"),
+             {**deal("Parked Note"), **PAUSED}]
+    insights = [insight("keep", "Parked Note", "Keep following up with the buyer", SALES, type_="next_step", dated=False)]
+    result = build(brief_client(BriefData(deals, [*six, once, active], insights, [])))
+    text = result["text"]
+    assert "• Parked: To Buyer · no reply to our 6 emails (14d since Oct 22)" in text       # the wording before 11/17
+    assert "• Parked Once: To Buyer · no reply yet (14d since Oct 22)" in text
+    assert "• Active: To Buyer · no reply yet, 2 weeks since your last email - follow up this week" in text
+    assert text.count("follow up this week") == 1 and "consider moving to Paused" not in text
+    assert "Parked Note" not in text and "Parked Note" not in result["html"]
+
+
 def test_nudge_rules_for_paused_deals_and_undated_sources():
     paused = DealView("Parked", "0. Paused", 0, "RG", TODAY - timedelta(days=30), last_outbound=TODAY - timedelta(days=21),
                       unanswered_emails=7)
@@ -92,6 +109,63 @@ def test_nudge_rules_for_paused_deals_and_undated_sources():
 
 
 # ---- the hold-back rule never hides what is due by its own date
+
+def test_item_due_by_its_own_date_is_not_held_for_a_later_sheet_date(monkeypatch, brief_client):
+    promised = "Send the pricing proposal to Hernan"
+    someday = "Share the route optimization demo video"
+    deals = [{**deal("Promised"), "next_step": f"- {promised} (complete by Feb 9, 2027)"},
+             {**deal("Someday"), "next_step": f"- {someday} (complete by Feb 9, 2027)"}]
+    insights = [insight("promise", "Promised", promised, SALES),                          # due today by its own date
+                insight("someday", "Someday", someday, SALES, type_="next_step", dated=False)]
+    client = brief_client(BriefData(deals, [], insights, []))
+    result = build(client)
+    section = result["payload"]["sections"][0]
+    assert [(r["deal"], r["tag"], r["text"]) for r in section["today"]] == [("Promised", "Due now", promised)]
+    assert someday not in html.unescape(result["html"])                                   # undated: held until Feb 9
+    assert "2 dated Sheet step(s) not due yet (1 matching item(s) held back until then)" in html.unescape(result["html"])
+
+    monkeypatch.setattr(brief_api.settings, "brief_sheet_hold_matching", False)            # the rule's own switch
+    relaxed = build(client)
+    assert someday in html.unescape(relaxed["html"]) and "held back" not in relaxed["html"]
+    assert len(relaxed["payload"]["sections"][0]["sheet_later"]) == 2                     # the dates are still read
+
+
+def test_sheet_dates_switch_turns_the_whole_feature_off(monkeypatch, brief_client):
+    step = "Email Franco the revised deck"
+    deals = [{**deal("Dated"), "next_step": f"- {step} (complete by Nov 5, 2026)"},
+             {**deal("Later"), "next_step": "- Share the plan (complete by Dec 1, 2026)"}]
+    insights = [insight("plan", "Later", "Share the plan", SALES, type_="next_step", dated=False)]
+    client = brief_client(BriefData(deals, [], insights, []))
+    assert [r["tag"] for r in build(client)["payload"]["sections"][0]["today"]] == ["Sheet date"]
+    monkeypatch.setattr(brief_api.settings, "brief_sheet_dates", False)
+    off = build(client)
+    section = off["payload"]["sections"][0]
+    assert section["today"] == [] and section["sheet_later"] == [] and section["sheet_stale"] == []
+    assert "Share the plan" in html.unescape(off["html"]) and "Sheet" not in off["text"]
+
+
+# ---- time-based nudges have an off switch that gives the rows from before 11/17
+
+def test_nudges_switch_prints_reminders_as_written_and_leaves_waiting_rows_plain(monkeypatch, brief_client):
+    five = [email(f"s-{n}", "Silent", "Can you confirm the pilot dates?", days=days, outgoing=True, thread="s-thread")
+            for n, days in enumerate((40, 33, 26, 19, 12))]
+    weekly = email("w-ask", "Weekly", "Can you approve the proposal?", days=14, outgoing=True)
+    insights = [insight("chase", "Chase", "Check in with the buyer about the proposal", SALES, type_="next_step", dated=False),
+                insight("wait", "Hold", "Wait for the buyer's reply on pricing", SALES, type_="next_step", dated=False)]
+    data = BriefData([deal("Silent"), deal("Weekly"), deal("Chase"), deal("Hold")], [*five, weekly], insights, [])
+    client = brief_client(data)
+    on = build(client)["text"]
+    assert "consider moving to Paused" in on and "follow up this week" in on
+    assert "Check in with the buyer" not in on and "Wait for the buyer's reply" not in on
+
+    monkeypatch.setattr(brief_api.settings, "brief_followup_nudges", False)
+    off = build(client)["text"]
+    assert "• Silent: To Buyer · no reply to our 5 emails (12d since Oct 24)" in off
+    assert "• Weekly: To Buyer · no reply yet (14d since Oct 22)" in off
+    assert "• [Follow up] Chase: Check in with the buyer about the proposal (recorded Nov 3)" in off
+    assert "Wait for the buyer's reply on pricing" in off                # a waiting statement is an ordinary step again
+    assert "follow up this week" not in off and "consider moving to Paused" not in off
+
 
 def test_split_followups_without_a_cadence_is_the_function_from_before_1117():
     note = Item("i1", "Deal", "Follow up with Ana", None, TODAY - timedelta(days=3), None, "RG", "deal_owner", None,
@@ -131,6 +205,32 @@ def _boom(*_, **__):
     raise RuntimeError("injected failure")
 
 
+@pytest.mark.parametrize("target, name, lost, logged", [
+    (brief_sheet_steps, "parse_cell", "Email Franco the revised deck", "sheet dates skipped for opportunity"),
+    (brief_v2, "meeting_prep", "With Ana", "brief built without a meeting's prep line"),
+    (brief_api, "_deal_for_guests", "deal matched by guest domain", "guest matching skipped for meeting"),
+    (brief_api, "_company_addresses", None, "brief built without learned company domains"),
+    (brief_v2, "_nudge", None, "rebuilt without Sheet dates, nudges and the quiet-deal batch"),
+    (brief_v2.Cadence, "due", "follow up this week", "brief built without a weekly nudge"),
+])
+def test_a_failing_extra_is_logged_and_left_out_and_the_brief_still_builds(monkeypatch, brief_client, caplog,
+                                                                             target, name, lost, logged):
+    data = _fixture_for_isolation()
+    data.insights.append(insight("nudge", "Promise", "Keep following up with the buyer", SALES, type_="next_step",
+                                 dated=False))
+    client = brief_client(data)
+    whole = build(client)
+    assert all(text in html.unescape(whole["html"]) for text in ("Email Franco the revised deck", "With Ana"))
+    monkeypatch.setattr(target, name, _boom)
+    with caplog.at_level("ERROR", logger="bianca_cro.brief"):
+        result = build(client)
+    body = html.unescape(result["html"])
+    assert "Send the signed order form" in body and "Call with Ana" in body       # what a founder must not lose
+    assert any(logged in record.getMessage() for record in caplog.records)
+    if lost:
+        assert lost not in body
+
+
 def test_unreadable_archive_drops_the_quiet_batch_and_keeps_the_brief(monkeypatch, brief_client, caplog):
     class BrokenArchive(BriefData):
         def execute(self, query, params=()):
@@ -149,6 +249,15 @@ def test_unreadable_archive_drops_the_quiet_batch_and_keeps_the_brief(monkeypatc
         "brief built without the days a brief was sent (a weekly nudge may repeat)",
         "brief built without the quiet-deal batch (earlier batches unreadable)"}
 
+
+def test_archive_entries_that_are_not_deal_names_are_ignored(brief_client):
+    data = BriefData([deal("Quiet")], [], [], [])
+    data.last_contact = {"Quiet": 30}
+    data.resurfaced = [[{"deal": "x"}, 5, None, "Other"]]                         # an archive in another shape
+    assert [r["deal"] for r in build(brief_client(data))["payload"]["sections"][0]["resurfaced"]] == ["Quiet"]
+
+
+# ---- ingest and profile: an extra must never fail the step it rides on
 
 def test_one_unreadable_cancellation_notice_does_not_fail_the_mail_sync_or_the_other_notices(monkeypatch):
     from app import ingest
