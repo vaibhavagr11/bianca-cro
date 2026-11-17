@@ -370,3 +370,109 @@ def test_short_or_different_steps_are_never_merged():
     fourth = _step(4, 9, text="Send the contract to the legal team in Chile.")
     pairs = [first, second, third, fourth]
     assert len(proposal_content([r for r, _ in pairs], [i for _, i in pairs])[0]) == 4
+
+
+# ---- H-06: an emailed ask that Bianca already answered in the same thread is not suggested again
+
+from datetime import timedelta
+
+from app.review_content import answered_email_asks, is_email_ask
+
+INTERNAL = frozenset({"bianca-ai.com", "kellogg.northwestern.edu"})
+
+
+def mail(number, sender, to, *, hours=0, thread="thread-1", subject="Meeting next week", **overrides):
+    return {"id": f"record-{number}", "thread_id": thread, "occurred_at": NOW + timedelta(hours=hours),
+            "subject": subject, "participants": {"from": [{"address": sender}], "to": [{"address": a} for a in to]},
+            **overrides}
+
+
+def ask(**overrides):
+    return insight(**{"id": "ask-1", "source": "gmail", "origin_record_id": "record-1",
+                      "text": "Confirm a time on Wednesday morning.", "quote": "Does Wednesday morning work?", **overrides})
+
+
+CUSTOMER_EMAIL = mail(1, "ana@redbull.com", ["nico@bianca-ai.com"])
+OUR_REPLY = mail(2, "nico@bianca-ai.com", ["ana@redbull.com"], hours=3)
+
+
+def test_an_emailed_ask_is_answered_once_bianca_writes_back_in_the_same_thread():
+    assert is_email_ask(ask())
+    assert answered_email_asks([ask()], [CUSTOMER_EMAIL, OUR_REPLY], INTERNAL) == {"ask-1"}
+    # The Kellogg project team writes on Bianca's behalf, as in the brief.
+    team = mail(2, "gibb@kellogg.northwestern.edu", ["ana@redbull.com"], hours=3)
+    assert answered_email_asks([ask()], [CUSTOMER_EMAIL, team], INTERNAL) == {"ask-1"}
+    # Stored timestamps may arrive as text.
+    as_text = [{**m, "occurred_at": m["occurred_at"].isoformat()} for m in (CUSTOMER_EMAIL, OUR_REPLY)]
+    assert answered_email_asks([ask()], as_text, INTERNAL) == {"ask-1"}
+
+
+@pytest.mark.parametrize("later", [
+    [],                                                                               # nothing after the ask
+    [mail(2, "nico@bianca-ai.com", ["ana@redbull.com"], hours=-2)],                   # our email came before the ask
+    [mail(2, "nico@bianca-ai.com", ["ana@redbull.com"], hours=0)],                    # same instant proves nothing
+    [mail(2, "nico@bianca-ai.com", ["ana@redbull.com"], hours=3, thread="thread-2")],  # another conversation
+    [mail(2, "nico@bianca-ai.com", ["ramiro@bianca-ai.com"], hours=3)],               # an internal forward
+    [mail(2, "ana@redbull.com", ["nico@bianca-ai.com"], hours=3)],                    # the customer wrote again
+    [mail(2, "mailer-daemon@bianca-ai.com", ["ana@redbull.com"], hours=3)],           # a bounce
+    [mail(2, "nico@bianca-ai.com", ["ana@redbull.com"], hours=3, subject="Automatic reply: Meeting next week")],
+    [mail(2, "nico@bianca-ai.com", ["ana@redbull.com"], hours=3, occurred_at=None)],  # undated
+    [{**mail(2, "nico@bianca-ai.com", ["ana@redbull.com"], hours=3), "participants": None}],
+])
+def test_anything_short_of_a_later_reply_from_bianca_to_the_outside_keeps_the_ask(later):
+    assert answered_email_asks([ask()], [CUSTOMER_EMAIL, *later], INTERNAL) == frozenset()
+
+
+@pytest.mark.parametrize("change", [
+    {"type": "commitment"},                 # a promise is a deliverable, not a reply
+    {"owner_side": "customer"},             # something the customer owes
+    {"owner_side": None},
+    {"source": "notes"},                    # said in a meeting: an email does not prove it was done
+    {"origin_record_id": None},             # older items not tied to one message
+    {"origin_record_id": "record-9"},       # origin not among the thread's messages
+    {"type": "blocker"},
+])
+def test_only_next_steps_for_bianca_taken_from_one_customer_email_are_checked(change):
+    assert answered_email_asks([ask(**change)], [CUSTOMER_EMAIL, OUR_REPLY], INTERNAL) == frozenset()
+
+
+def test_an_ask_in_our_own_email_or_an_automatic_message_is_never_treated_as_answered():
+    ours = mail(1, "nico@bianca-ai.com", ["ana@redbull.com"])
+    assert answered_email_asks([ask()], [ours, OUR_REPLY], INTERNAL) == frozenset()
+    auto = mail(1, "noreply@redbull.com", ["nico@bianca-ai.com"])
+    assert answered_email_asks([ask()], [auto, OUR_REPLY], INTERNAL) == frozenset()
+    undated = {**CUSTOMER_EMAIL, "occurred_at": None}
+    assert answered_email_asks([ask()], [undated, OUR_REPLY], INTERNAL) == frozenset()
+
+
+def test_a_reply_that_is_only_about_delivery_work_does_not_answer_a_sales_ask():
+    assert answered_email_asks([ask()], [CUSTOMER_EMAIL, OUR_REPLY], INTERNAL, not_sales=frozenset({"record-2"})) == frozenset()
+    second = mail(3, "nico@bianca-ai.com", ["ana@redbull.com"], hours=5)
+    assert answered_email_asks([ask()], [CUSTOMER_EMAIL, OUR_REPLY, second], INTERNAL,
+                               not_sales=frozenset({"record-2"})) == {"ask-1"}
+
+
+def test_a_thread_marked_done_in_the_brief_answers_asks_up_to_that_click_only():
+    clicked = NOW + timedelta(hours=1)
+    assert answered_email_asks([ask()], [CUSTOMER_EMAIL], INTERNAL, thread_done={"thread-1": clicked}) == {"ask-1"}
+    assert answered_email_asks([ask()], [CUSTOMER_EMAIL], INTERNAL, thread_done={"thread-2": clicked}) == frozenset()
+    # A newer customer email after the click is a new ask.
+    newer = mail(3, "ana@redbull.com", ["nico@bianca-ai.com"], hours=4)
+    later_ask = ask(id="ask-2", origin_record_id="record-3")
+    assert answered_email_asks([ask(), later_ask], [CUSTOMER_EMAIL, newer], INTERNAL,
+                               thread_done={"thread-1": clicked}) == {"ask-1"}
+
+
+def test_an_answered_ask_leaves_the_card_and_everything_else_stays():
+    email = record(body="Does Wednesday morning work? We also need the store list.")
+    asks = [insight(id="ask-1", text="Confirm a time on Wednesday morning.", quote="Does Wednesday morning work?"),
+            insight(id="ask-2", text="Send the store list.", quote="We also need the store list."),
+            insight(id="need-1", type="need", text="Store-level reporting.", quote="We also need the store list.")]
+    (steps, context, sources, lineage), retired = reviewed_content([email], asks, answered=frozenset({"ask-1"}))
+    assert steps == ["Next step: Send the store list."]
+    assert context == ["Customer need: Store-level reporting."]
+    assert len(sources) == 1 and retired == []
+    assert validate_lineage(steps, context, sources, lineage)
+    # With no rule input the card is exactly what it was before this rule existed.
+    assert reviewed_content([email], asks)[0][0] == [
+        "Next step: Confirm a time on Wednesday morning.", "Next step: Send the store list."]

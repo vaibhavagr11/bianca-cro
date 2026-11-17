@@ -1492,3 +1492,222 @@ def test_saved_replace_approvals_are_recognised_as_replace():
               "request_hash": review._request_hash(PROPOSAL, "approve", 3, ["A"], [])}
     assert review._saved_next_step_mode(intent) == "replace"
     assert review._saved_next_step_mode({**intent, "request_hash": "unknown"}) == "replace"
+
+
+# ---- H-06: an emailed ask already answered in its thread is not suggested, at build and at approval alike
+
+ASK_RECORD = "66666666-6666-6666-6666-666666666666"
+REPLY_RECORD = "77777777-7777-7777-7777-777777777777"
+
+
+def customer_email(**overrides):
+    values = {"id": ASK_RECORD, "external_id": "message-ask", "thread_id": "thread-ask", "company_id": COMPANY,
+              "body": "Does Wednesday morning work for the meeting? We also need the store list.",
+              "participants": {"from": [{"address": "ana@redbull.com"}], "to": [{"address": "nico@bianca-ai.com"}]}}
+    return record(**{**values, **overrides})
+
+
+def our_reply(**overrides):
+    values = {"id": REPLY_RECORD, "external_id": "message-reply", "thread_id": "thread-ask", "company_id": COMPANY,
+              "body": "Wednesday 11 AM works for us.", "occurred_at": NOW + timedelta(hours=2),
+              "participants": {"from": [{"address": "nico@bianca-ai.com"}], "to": [{"address": "ana@redbull.com"}]}}
+    return record(**{**values, **overrides})
+
+
+def email_asks():
+    base = dict(source="gmail", type="next_step", owner_side="bianca", owner_name=None, due_date=None,
+                source_record_ids=[ASK_RECORD], origin_record_id=ASK_RECORD, action_scope="deal_progression")
+    return [insight(id="ask-meeting", text="Confirm a time on Wednesday morning.",
+                    quote="Does Wednesday morning work for the meeting?", **base),
+            insight(id="ask-stores", text="Send the store list.", quote="We also need the store list.",
+                    **{**base, "type": "commitment"})]
+
+
+class Mail:
+    """What the answered-ask check reads: the company's mail, later insights, brief clicks, the cycle start."""
+    def __init__(self, messages, *, cycle_started_at=NOW + timedelta(days=1), clicks=(), insights=(), has_clicks_table=True):
+        self.messages, self.cycle_started_at, self.clicks = list(messages), cycle_started_at, list(clicks)
+        self.insights, self.has_clicks_table, self.queries = list(insights), has_clicks_table, []
+
+    def answer(self, q, params):
+        if q.startswith("select cycle_started_at from review_queue_state"):
+            return Result([{"cycle_started_at": self.cycle_started_at}])
+        if q.startswith("select id, thread_id, occurred_at, subject, participants from source_records"):
+            assert "created_at <= %s" in q and "status = 'classified'" in q and "is_commercial" in q
+            workspace, company, cutoff, _, origins = params
+            threads = {m["thread_id"] for m in self.messages if m["id"] in origins}
+            found = [m for m in self.messages if m["thread_id"] in threads and m.get("company_id", company) == company
+                     and review._instant(m["created_at"]) <= cutoff]
+            self.queries.append(("mail", cutoff))
+            return Result(copy.deepcopy(sorted(found, key=lambda m: m["occurred_at"])))
+        if q.startswith("select internal_domains from workspaces"):
+            return Result([{"internal_domains": ["bianca-ai.com"]}])
+        if q.startswith("select origin_record_id, action_scope from insights"):
+            return Result([i for i in self.insights if i["origin_record_id"] in params[1]])
+        if q.startswith("select to_regclass('brief_actions')"):
+            return Result([{"found": "brief_actions" if self.has_clicks_table else None}])
+        if q.startswith("select distinct on (ref) ref, action, created_at from brief_actions"):
+            latest = {}
+            for click in sorted(self.clicks, key=lambda c: c["created_at"]):
+                if click["ref"] in params[1] and click["created_at"] <= params[2]:
+                    latest[click["ref"]] = click
+            return Result(list(latest.values()))
+        return None
+
+
+class MailBuild(BuildConnection):
+    def __init__(self, mail_data):
+        super().__init__(1)
+        self.mail = mail_data
+
+    def execute(self, sql, params=()):
+        return self.mail.answer(" ".join(sql.split()), params) or super().execute(sql, params)
+
+
+def build_settings(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20, project_team_domains=["kellogg.northwestern.edu"]))
+
+
+def ask_build(messages, **mail_options):
+    conn = MailBuild(Mail(messages, **mail_options))
+    conn.records = {"company-0": [customer_email(company_id="company-0")]}
+    conn.insights = email_asks()
+    return conn
+
+
+def test_builder_drops_an_emailed_ask_bianca_already_answered_and_keeps_the_rest_of_the_card(monkeypatch):
+    build_settings(monkeypatch)
+    unanswered = ask_build([customer_email(company_id="company-0")])
+    review.build_proposals(unanswered, WORKSPACE)
+    assert unanswered.proposals["company-0"]["next_step_bullets"] == [
+        "Next step: Confirm a time on Wednesday morning.", "We owe: Send the store list."]
+    answered = ask_build([customer_email(company_id="company-0"), our_reply(company_id="company-0")])
+    review.build_proposals(answered, WORKSPACE)
+    card = answered.proposals["company-0"]
+    # The reply answers the question; the promised store list is a deliverable and stays.
+    assert card["next_step_bullets"] == ["We owe: Send the store list."]
+    assert review.validate_lineage(card["next_step_bullets"], card["client_context_bullets"], card["sources"], card["bullet_lineage"])
+    # The build judges from what was stored when its cycle started.
+    assert answered.mail.queries == [("mail", answered.queue_state["cycle_started_at"])]
+
+
+def test_builder_makes_no_card_when_the_only_suggestion_was_already_answered(monkeypatch):
+    build_settings(monkeypatch)
+    conn = ask_build([customer_email(company_id="company-0"), our_reply(company_id="company-0")])
+    conn.insights = email_asks()[:1]
+    assert review.build_proposals(conn, WORKSPACE)["created"] == 0 and not conn.proposals
+    # A later build withdraws a pending card whose only step has since been answered.
+    pending = ask_build([customer_email(company_id="company-0")])
+    pending.insights = email_asks()[:1]
+    review.build_proposals(pending, WORKSPACE)
+    pending.mail.messages.append(our_reply(company_id="company-0"))
+    pending.now = NOW + timedelta(days=1, hours=1)
+    assert review.build_proposals(pending, WORKSPACE)["updated"] == 1
+    assert pending.proposals["company-0"]["status"] == "superseded" and not pending.receipts
+
+
+def test_reply_stored_after_the_cycle_started_waits_for_the_next_build(monkeypatch):
+    build_settings(monkeypatch)
+    late = our_reply(company_id="company-0", created_at=NOW + timedelta(hours=6))
+    conn = ask_build([customer_email(company_id="company-0"), late])
+    review.build_proposals(conn, WORKSPACE)
+    assert len(conn.proposals["company-0"]["next_step_bullets"]) == 2
+    conn.now = NOW + timedelta(days=1)
+    review.build_proposals(conn, WORKSPACE)
+    assert conn.proposals["company-0"]["next_step_bullets"] == ["We owe: Send the store list."]
+
+
+def test_brief_done_click_on_the_thread_answers_the_ask_and_an_undo_reopens_it(monkeypatch):
+    build_settings(monkeypatch)
+    done = {"ref": "thread-ask", "action": "done", "created_at": NOW + timedelta(hours=1)}
+    conn = ask_build([customer_email(company_id="company-0")], clicks=[done])
+    review.build_proposals(conn, WORKSPACE)
+    # A click made after this cycle started is picked up by the next build, like any newer evidence.
+    assert len(conn.proposals["company-0"]["next_step_bullets"]) == 2
+    conn.now = NOW + timedelta(days=1)
+    review.build_proposals(conn, WORKSPACE)
+    assert conn.proposals["company-0"]["next_step_bullets"] == ["We owe: Send the store list."]
+    undone = ask_build([customer_email(company_id="company-0")],
+                       clicks=[done, {"ref": "thread-ask", "action": "undone", "created_at": NOW + timedelta(hours=2)}])
+    undone.now = NOW + timedelta(days=1)
+    review.build_proposals(undone, WORKSPACE)
+    assert len(undone.proposals["company-0"]["next_step_bullets"]) == 2
+    no_table = ask_build([customer_email(company_id="company-0")], clicks=[done], has_clicks_table=False)
+    no_table.now = NOW + timedelta(days=1)
+    review.build_proposals(no_table, WORKSPACE)
+    assert len(no_table.proposals["company-0"]["next_step_bullets"]) == 2
+
+
+def test_a_reply_about_delivery_work_only_or_from_another_company_does_not_answer(monkeypatch):
+    build_settings(monkeypatch)
+    delivery = [{"origin_record_id": REPLY_RECORD, "action_scope": "delivery"}]
+    conn = ask_build([customer_email(company_id="company-0"), our_reply(company_id="company-0")], insights=delivery)
+    review.build_proposals(conn, WORKSPACE)
+    assert len(conn.proposals["company-0"]["next_step_bullets"]) == 2
+    other = ask_build([customer_email(company_id="company-0"), our_reply(company_id="another-company")])
+    review.build_proposals(other, WORKSPACE)
+    assert len(other.proposals["company-0"]["next_step_bullets"]) == 2
+
+
+class MailStore(Store):
+    """The decision store, plus the mail the answered-ask check reads."""
+    def __init__(self, mail_data):
+        self.mail = mail_data
+        self.source_record = customer_email()
+        self.insights = email_asks()
+        answered = review.answered_email_asks(self.insights, [m for m in mail_data.messages
+                                                              if m["created_at"] <= mail_data.cycle_started_at],
+                                              frozenset({"bianca-ai.com"}))
+        (steps, context, sources, lineage), versions = review.reviewed_content([self.source_record], self.insights, answered=answered)
+        super().__init__(proposal(bullets=steps + context, next_step_bullets=steps, client_context_bullets=context,
+                                  sources=sources, bullet_lineage=lineage,
+                                  source_versions=[review.source_version(self.source_record)],
+                                  observed_source_versions=[review.source_version(self.source_record)]))
+        self.source_record, self.insights = customer_email(), email_asks()
+
+    def connect(self):
+        store = self
+
+        class Connection(DecisionConnection):
+            def execute(self, sql, params=()):
+                return store.mail.answer(" ".join(sql.split()), params) or super().execute(sql, params)
+        return Connection(self)
+
+
+@pytest.fixture
+def mail_service(monkeypatch):
+    def make(mail_data):
+        store = MailStore(mail_data)
+        sheets = FakeSheets(store)
+        monkeypatch.setattr(review, "settings", SimpleNamespace(
+            review_spreadsheet_id="14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw", review_sheet_tab="Pipeline",
+            review_sheet_id=1869050409, review_client_context_mode="append", review_build_batch=20,
+            project_team_domains=["kellogg.northwestern.edu"]))
+        monkeypatch.setattr(review.db, "connect", store.connect)
+        monkeypatch.setattr(review, "SheetsClient", lambda: sheets)
+        monkeypatch.setattr(review, "_mirror_approval", lambda *args: True)
+        return store, sheets
+    return make
+
+
+def test_approval_recheck_applies_the_same_answered_rule_as_the_build(mail_service):
+    store, sheets = mail_service(Mail([customer_email(), our_reply()], cycle_started_at=NOW + timedelta(days=1)))
+    assert store.data["proposal"]["next_step_bullets"] == ["We owe: Send the store list."]
+    assert approve()["status"] == "approved"
+    assert sheets.next_step == "- We owe: Send the store list."
+
+
+def test_a_reply_that_arrives_after_the_build_does_not_block_the_card_until_the_next_cycle(mail_service):
+    late = our_reply(created_at=NOW + timedelta(days=2))
+    store, sheets = mail_service(Mail([customer_email(), late], cycle_started_at=NOW + timedelta(days=1)))
+    assert len(store.data["proposal"]["next_step_bullets"]) == 2
+    assert approve()["status"] == "approved"  # same cycle start as the build: the late reply is not read yet
+
+
+def test_card_built_before_a_newer_cycle_saw_the_reply_is_refused_until_rebuilt(mail_service):
+    store, sheets = mail_service(Mail([customer_email(), our_reply()], cycle_started_at=NOW - timedelta(days=1)))
+    assert len(store.data["proposal"]["next_step_bullets"]) == 2   # built before the reply was stored
+    store.mail.cycle_started_at = NOW + timedelta(days=1)          # a newer cycle now counts the reply
+    with pytest.raises(review.ReviewConflict, match="sales evidence changed"):
+        approve()
+    assert not sheets.calls and not store.data["intents"]

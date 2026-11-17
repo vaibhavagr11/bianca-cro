@@ -10,11 +10,13 @@ import copy
 import hashlib
 import json
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
 from app import extractor
+from app.brief_v2 import is_automated
+from app.gmail import domain
 from app.review_deadlines import normalize_deadline
 
 
@@ -102,6 +104,75 @@ def _supporting_record(insight: dict, passage: str, records: dict[str, dict]) ->
     return matches[0] if len(matches) == 1 else None
 
 
+def _when(value: Any) -> datetime | None:
+    """A source time as a UTC instant; anything unreadable cannot prove an order of events."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+
+
+def is_email_ask(insight: dict) -> bool:
+    """A next step for Bianca taken from one email message - what the daily brief lists as "Customer asked"."""
+    return (insight.get("type") == "next_step" and insight.get("owner_side") == "bianca"
+            and insight.get("source") == "gmail" and insight.get("origin_record_id") is not None)
+
+
+def _mail_direction(message: dict, internal_domains: frozenset[str]) -> str:
+    """Who wrote an email: the customer ("inbound"), Bianca to someone outside ("outbound"), or neither."""
+    people = message.get("participants") or {}
+    senders = [str(p.get("address") or "").lower() for p in people.get("from") or [] if p.get("address")]
+    recipients = [str(p.get("address") or "").lower() for field in ("to", "cc") for p in people.get(field) or []
+                  if p.get("address")]
+    if not senders or is_automated(senders, message.get("subject")):
+        return "other"  # an out-of-office or a bounce answers nothing
+    if all(domain(address) not in internal_domains for address in senders):
+        return "inbound"
+    if (all(domain(address) in internal_domains for address in senders)
+            and any(domain(address) not in internal_domains for address in recipients)):
+        return "outbound"
+    return "other"
+
+
+def answered_email_asks(insights: list[dict], messages: list[dict], internal_domains: frozenset[str], *,
+                        thread_done: dict[str, Any] | None = None,
+                        not_sales: frozenset[str] = frozenset()) -> frozenset[str]:
+    """Ids of emailed asks to Bianca that their own thread shows were already answered.
+
+    The daily brief lists what a customer asked by email only while the customer wrote last in that thread.
+    Once Bianca has written back there, or a founder marked the thread done in the brief, the ask leaves the
+    brief. The hub applies the same rule so it does not suggest a reply that was already sent:
+
+    - the step is a next step for Bianca taken from a customer's email (never a meeting note or our own email);
+    - and a later email in the same thread was sent by Bianca to someone outside Bianca, or a founder marked
+      that thread done in the brief at or after the customer's email.
+
+    Automatic replies, internal forwards and emails whose extracted items are all outside sales (`not_sales`)
+    do not count as an answer. Anything this cannot prove stays on the card.
+    """
+    internal = frozenset(value.lower() for value in internal_domains)
+    by_id = {str(message["id"]): message for message in messages}
+    done = thread_done or {}
+    answered = set()
+    for insight in insights:
+        origin = by_id.get(str(insight.get("origin_record_id"))) if is_email_ask(insight) else None
+        asked_at = _when(origin.get("occurred_at")) if origin else None
+        thread = origin.get("thread_id") if origin else None
+        if asked_at is None or not thread or _mail_direction(origin, internal) != "inbound":
+            continue
+        closed_at = _when(done.get(thread))
+        replied = any(message.get("thread_id") == thread and str(message["id"]) not in not_sales
+                      and (sent_at := _when(message.get("occurred_at"))) is not None and sent_at > asked_at
+                      and _mail_direction(message, internal) == "outbound" for message in messages)
+        if replied or (closed_at is not None and closed_at >= asked_at):
+            answered.add(str(insight["id"]))
+    return frozenset(answered)
+
+
 _OWNER_ORDER = {"bianca": 0, None: 1, "customer": 2}
 _BLOCKER_ORDER = 3
 _WORD = re.compile(r"[^\W_]+", re.UNICODE)
@@ -120,13 +191,16 @@ def _same_step(left: frozenset[str], right: frozenset[str]) -> bool:
 
 
 def reviewed_content(records: list[dict], insights: list[dict], *, max_next_steps: int | None = None,
-                     max_context: int | None = None) -> tuple[Content, list[dict]]:
+                     max_context: int | None = None,
+                     answered: frozenset[str] = frozenset()) -> tuple[Content, list[dict]]:
     """Build the review bullets, and name the source versions whose only bullets were left off the card.
 
     Next Step leads with Bianca's own actions, newest first; customer-owed items and blockers follow.
     Two wordings of the same step become one bullet with both sources. When a limit is set, the newest
     bullets stay. Sources that supported only removed bullets are returned separately so a decision on
     the card can also retire them, instead of the old bullets returning on the next build.
+    `answered` holds the ids of emailed asks already answered in their thread (`answered_email_asks`);
+    like items marked done, they are not suggested.
     """
     by_id = {str(record["id"]): record for record in records}
     candidates: dict[str, list[dict]] = {destination: [] for destination in DESTINATIONS}
@@ -140,6 +214,8 @@ def reviewed_content(records: list[dict], insights: list[dict], *, max_next_step
         if kind not in ACTION_TYPES | CONTEXT_TYPES or insight.get("action_scope") not in extractor.SALES_SCOPES:
             continue
         if not text or insight.get("status") in ("done", "dismissed", "possibly_done"):
+            continue
+        if str(insight.get("id")) in answered:
             continue
         passage = insight.get("quote") or ""
         if not (record := _supporting_record(insight, passage, by_id)):

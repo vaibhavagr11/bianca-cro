@@ -21,10 +21,12 @@ from psycopg.errors import UniqueViolation
 
 from app import db
 from app.config import settings
+from app.extractor import SALES_SCOPES
 from app.pipeline import PipelineRow, TRACKED_FIELDS, is_working_client, normalize_name
 from app.review_sheets import SheetsClient, SheetConflict, SheetError, SheetWorkingClient, SheetWriteUncertain
 from app.review_content import (
-    Content, approved_lineage, proposal_content, reviewed_content, review_next_step_bullets, source_id, source_version, validate_lineage,
+    Content, answered_email_asks, approved_lineage, is_email_ask, proposal_content, reviewed_content,
+    review_next_step_bullets, source_id, source_version, validate_lineage,
 )
 
 
@@ -225,18 +227,68 @@ def _card_limit(name: str) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
-def _current_content(conn, workspace_id, deal: dict, records: list[dict]) -> tuple[Content, list[dict]]:
+def _answered_asks(conn, workspace_id, company_id, insights: list[dict], cutoff) -> frozenset[str]:
+    """Emailed asks on this card that Bianca already answered in the same thread (see `answered_email_asks`).
+
+    Only mail and brief Done clicks stored by `cutoff` - the start of the review cycle that built the card -
+    are read, so the approval re-check sees exactly what the build saw. Without a cutoff the queue's current
+    cycle start is used.
+    """
+    origins = [i["origin_record_id"] for i in insights if is_email_ask(i)]
+    if not origins:
+        return frozenset()
+    if cutoff is None:
+        state = conn.execute("select cycle_started_at from review_queue_state where workspace_id = %s",
+                             (workspace_id,)).fetchone()
+        cutoff = state["cycle_started_at"] if state else None
+        if cutoff is None:
+            return frozenset()
+    messages = conn.execute(
+        "select id, thread_id, occurred_at, subject, participants from source_records where workspace_id = %s"
+        " and company_id = %s and source = 'gmail' and status = 'classified'"
+        " and classification->>'is_commercial' = 'true' and occurred_at is not null and created_at <= %s"
+        " and thread_id in (select thread_id from source_records where workspace_id = %s and id = any(%s::uuid[])"
+        " and source = 'gmail' and thread_id is not null) order by occurred_at, id",
+        (workspace_id, company_id, cutoff, workspace_id, origins)).fetchall()
+    threads = sorted({m["thread_id"] for m in messages})
+    if not threads:
+        return frozenset()
+    workspace = conn.execute("select internal_domains from workspaces where id = %s", (workspace_id,)).fetchone()
+    internal = frozenset({d.lower() for d in (workspace or {}).get("internal_domains") or []}
+                         | {d.lower() for d in getattr(settings, "project_team_domains", None) or []})
+    # As in the brief: an email whose extracted items are all outside sales is not an answer to a sales ask.
+    scopes: dict[str, set] = {}
+    for row in conn.execute("select origin_record_id, action_scope from insights where workspace_id = %s"
+                            " and origin_record_id = any(%s::uuid[])", (workspace_id, [m["id"] for m in messages])):
+        scopes.setdefault(str(row["origin_record_id"]), set()).add(row["action_scope"])
+    not_sales = frozenset(record_id for record_id, found in scopes.items() if not found & set(SALES_SCOPES))
+    # A founder's "Mark as complete" on the thread in the brief; an Undo after it reopens the ask.
+    # The table arrives with the brief's migrations; a workspace without it simply has no such clicks.
+    done = {}
+    if conn.execute("select to_regclass('brief_actions') as found").fetchone()["found"] is not None:
+        done = {row["ref"]: row["created_at"] for row in conn.execute(
+            "select distinct on (ref) ref, action, created_at from brief_actions where workspace_id = %s"
+            " and kind = 'thread' and ref = any(%s::text[]) and created_at <= %s order by ref, created_at desc",
+            (workspace_id, threads, cutoff)) if row["action"] == "done"}
+    return answered_email_asks(insights, messages, internal, thread_done=done, not_sales=not_sales)
+
+
+def _current_content(conn, workspace_id, deal: dict, records: list[dict], *,
+                     cutoff=None) -> tuple[Content, list[dict]]:
     """Current card content, plus the versions of every source the card accounts for.
 
     The versions include sources whose only bullets fell outside the card limits, so a decision retires them too.
+    `cutoff` is the review cycle start the build is working from; the approval re-check leaves it out and
+    reads the same value from the queue state.
     """
     insights = conn.execute(
         "select * from insights where workspace_id = %s and company_id = %s and opportunity_id = %s"
         " and source_record_ids && %s::uuid[] order by id",
         (workspace_id, deal["company_id"], deal["opportunity_id"], [r["id"] for r in records]),
     ).fetchall() if records else []
+    answered = _answered_asks(conn, workspace_id, deal["company_id"], insights, cutoff)
     content, retired = reviewed_content(records, insights, max_next_steps=_card_limit("review_max_next_steps"),
-                                        max_context=_card_limit("review_max_context"))
+                                        max_context=_card_limit("review_max_context"), answered=answered)
     return content, sorted(_content_versions(content[2]) + retired, key=_source_key)
 
 
@@ -287,7 +339,8 @@ def build_proposals(conn, workspace_id, *, force: bool = False) -> dict:
                    and _source_key(source_version(r)) + (str(deal["company_id"]),) not in receipts
                    and (state["bootstrap_completed"] or _in_bootstrap_window(r, state))]
         # Re-extraction can change an insight's scope without changing its source version.
-        (next_steps, context, sources, lineage), versions = _current_content(conn, workspace_id, deal, records)
+        (next_steps, context, sources, lineage), versions = _current_content(
+            conn, workspace_id, deal, records, cutoff=state["cycle_started_at"])
         if not existing and not (next_steps or context):
             counts["unchanged"] += 1
             continue
