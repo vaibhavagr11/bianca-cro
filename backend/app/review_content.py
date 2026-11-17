@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import re
+import unicodedata
 from datetime import date, datetime, timezone
 from typing import Any
 from urllib.parse import quote
@@ -173,7 +174,48 @@ def answered_email_asks(insights: list[dict], messages: list[dict], internal_dom
     return frozenset(answered)
 
 
+_SUBJECT = r"(?:\S+(?: \S+)? (?:to|should|must|will|needs? to|has to|have to) )?"
+_AGAIN = r"(?P<again>(?:keep(?: on)?|continu(?:e|ing)(?: to)?|still|seguir|continuar) )?"
+_NUDGE = (r"(?:follow(?:ing)?[ -]?up|check(?:ing)? (?:in|back)|circl(?:e|ing) back|(?:stay|keep)(?:ing)? in touch"
+          r"|(?:hacer|haciendo|dar|dando|con el|el) seguimiento)")
+_NUDGE_MAIL = (r"send(?:ing)? (?P<another>a|another|one more) (?:gentle |quick |short )?"
+               r"(?:follow[ -]?up|reminder|nudge)(?: (?:e-?mail|message|note))?")
+_RECIPIENT = r"(?: (?:with|to|a|con) (?P<who>[^.,;:]{1,60}?))?"
+_NO_NEWS = (r"(?: (?:again|periodically|regularly|consistently|as needed|if needed|for now"
+            r"|until (?:they|he|she|the (?:customer|client|team)) (?:repl(?:y|ies)|responds?|answers?|gets? back(?: to us)?)"
+            r"|for an? (?:response|reply|answer|update)))*")
+_VAGUE_FOLLOWUP = re.compile(rf"{_SUBJECT}(?:{_AGAIN}{_NUDGE}|{_NUDGE_MAIL})(?: again)?{_RECIPIENT}{_NO_NEWS}", re.IGNORECASE)
+_ANYONE = frozenset("them him her the their our customer client prospect contact contacts buyer team company account "
+                    "lead and y & ellos el la cliente equipo".split())
+
+
+def is_vague_followup(text: str) -> bool:
+    """True only for a step that says nothing beyond "keep following up".
+
+    Founders asked the hub not to show these (11/12/2026): the brief's "Waiting on their reply" section already
+    says how long a thread has been quiet. The whole step must be a nudge with no topic and no date:
+    "Keep following up with Andina", "Continue to follow up", "Send a follow-up", "Follow up with the customer".
+    Anything with a subject matter or a time ("Follow up on the pricing proposal", "Follow up next week",
+    "Follow up with Renzo about the walkthrough") is a real step and stays. A bare "Follow up with Renzo" also
+    stays, because it names who to write to; a named person is only ignored when the step is plainly a repeat
+    ("keep", "continue", "another").
+    """
+    plain = "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
+    plain = " ".join(plain.split()).lstrip("-•* ").rstrip(" .!")
+    match = _VAGUE_FOLLOWUP.fullmatch(plain)
+    if not match:
+        return False
+    words = (match["who"] or "").split()
+    if all(word.casefold() in _ANYONE for word in words):
+        return True
+    repeat = bool(match["again"]) or (match["another"] or "").casefold() in ("another", "one more") \
+        or bool(re.search(r"\bagain\b", plain, re.IGNORECASE))
+    return repeat and len(words) <= 4 and all(word.casefold() in _ANYONE or word[:1].isupper() for word in words)
+
+
 _OWNER_ORDER = {"bianca": 0, None: 1, "customer": 2}
+_SIDES = {0: "bianca", 1: "unassigned", 2: "customer", 3: "blocker"}
+WAITING_SIDES = frozenset({"customer", "blocker"})
 _BLOCKER_ORDER = 3
 _WORD = re.compile(r"[^\W_]+", re.UNICODE)
 _FILLER = frozenset("a an and are as at be by for from in is it of on or that the their them they this to was "
@@ -217,6 +259,9 @@ def reviewed_content(records: list[dict], insights: list[dict], *, max_next_step
             continue
         if str(insight.get("id")) in answered:
             continue
+        if (kind in ("commitment", "next_step") and insight.get("owner_side") != "customer"
+                and not insight.get("due_date") and is_vague_followup(text)):
+            continue  # "keep following up" with no topic or date tells a founder nothing
         passage = insight.get("quote") or ""
         if not (record := _supporting_record(insight, passage, by_id)):
             continue
@@ -292,8 +337,11 @@ def reviewed_content(records: list[dict], insights: list[dict], *, max_next_step
         for entry in candidates[destination]:
             identifiers = sorted({evidence(record, passage) for record, passage in entry["evidence"]})
             groups[destination].append(entry["text"])
-            lineage[destination].append({"bulletId": bullet_id(destination, entry["text"]), "text": entry["text"],
-                                         "sourceIds": identifiers})
+            node = {"bulletId": bullet_id(destination, entry["text"]), "text": entry["text"], "sourceIds": identifiers}
+            if destination == "nextStep":
+                # Who the step is with, known here from the insight's owner; the page never reads it from the wording.
+                node["side"] = _SIDES[entry["rank"]]
+            lineage[destination].append(node)
 
     retired: dict[str, dict] = {}
     for entry in removed:
@@ -302,6 +350,20 @@ def reviewed_content(records: list[dict], insights: list[dict], *, max_next_step
                 retired[source_id(record)] = source_version(record)
     content = groups["nextStep"], groups["clientContext"], list(sources.values()), lineage
     return content, sorted(retired.values(), key=lambda item: (item["source"], item["external_id"], item["version"]))
+
+
+def is_waiting_on_them(lineage: Any) -> bool | None:
+    """Whether a card is only waiting: every Next Step bullet is owed by the customer or is a blocker.
+
+    None when the card cannot say - no Next Step bullets, or it was built before bullets recorded their side.
+    """
+    nodes = lineage.get("nextStep") if isinstance(lineage, dict) else None
+    if not isinstance(nodes, list) or not nodes:
+        return None
+    sides = [node.get("side") if isinstance(node, dict) else None for node in nodes]
+    if any(side not in _SIDES.values() for side in sides):
+        return None
+    return all(side in WAITING_SIDES for side in sides)
 
 
 def _reverse(day: str) -> tuple[int, ...]:
@@ -444,7 +506,8 @@ def approved_lineage(proposal: dict, next_steps: list[str], context: list[str], 
             source_ids = list(previous["sourceIds"]) if previous else []
             if destination == "nextStep" and text in formatted_sources:
                 source_ids = _union(source_ids, formatted_sources[text])
-            result[destination].append({"bulletId": bullet_id(destination, text), "text": text,
-                                        "sourceIds": source_ids,
-                                        "origin": "source" if source_ids else "founder_edit"})
+            node = {"bulletId": bullet_id(destination, text), "text": text, "sourceIds": source_ids}
+            if previous and "side" in previous:
+                node["side"] = previous["side"]  # an unedited step keeps who it is with in the audit
+            result[destination].append({**node, "origin": "source" if source_ids else "founder_edit"})
     return result

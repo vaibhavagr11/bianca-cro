@@ -476,3 +476,118 @@ def test_an_answered_ask_leaves_the_card_and_everything_else_stays():
     # With no rule input the card is exactly what it was before this rule existed.
     assert reviewed_content([email], asks)[0][0] == [
         "Next step: Confirm a time on Wednesday morning.", "Next step: Send the store list."]
+
+
+# ---- B-10: a step that only says "keep following up" is not suggested; H-10: cards that are only waiting
+
+from app.brief_followups import is_followup_only
+from app.review_content import is_vague_followup, is_waiting_on_them
+
+VAGUE = [
+    "Keep following up.", "keep following up", "Continue to follow up", "Continue following up with the customer.",
+    "Keep following up with Andina", "Keep following up with Andina until they reply.",
+    "Bianca should keep following up with Chifles.", "The team should continue to follow up",
+    "Ramiro to keep following up with Arca Peru", "We need to keep following up with them",
+    "Follow up.", "Follow-up", "Follow up with the customer", "Follow up with them again",
+    "Follow up again with Renzo", "Send a follow-up", "Send a follow-up email.", "Send another follow-up to Juan",
+    "Send a reminder to the team", "Check in again", "Keep checking in with the client periodically",
+    "Stay in touch", "Keep in touch with them for now", "- Keep following up",
+    "Seguir haciendo seguimiento", "Continuar con el seguimiento con el cliente", "Dar seguimiento",
+]
+SPECIFIC = [
+    "Follow up with Renzo",                                         # names who to write to
+    "Follow up with Renzo about the FEMSA walkthrough",
+    "Follow up on the pricing proposal", "Follow up next week", "Follow up this week",
+    "Keep following up on the NDA", "Follow up by Nov 13", "Follow up with Juan on Monday",
+    "Follow up in two weeks if there is no reply", "Keep following up with the pricing proposal",
+    "Send a follow-up with the revised quote", "Send a follow-up email with three time slots",
+    "Send another follow-up to Juan about the store data", "Send the follow-up deck",
+    "Send Patricio a few bullet points on the idea", "Reconnect", "Email her Monday",
+    "Check on tax docs and onboarding", "Check in with Zach about the store data",
+    "Re-push Renzo for the 15-minute FEMSA walkthrough", "Chase Zach for the store data",
+    "Follow up to confirm the Wednesday 2 pm call", "Schedule a follow-up meeting",
+    "Follow up with the buyer to get the signed NDA", "Hold the follow-up call on Nov 6",
+    "Waiting for reply from their team in terms of when do we meet", "",
+]
+
+
+@pytest.mark.parametrize("text", VAGUE)
+def test_content_free_follow_ups_are_recognised(text):
+    assert is_vague_followup(text) is True
+
+
+@pytest.mark.parametrize("text", SPECIFIC)
+def test_a_step_with_a_topic_a_date_or_a_named_person_is_never_treated_as_vague(text):
+    assert is_vague_followup(text) is False
+
+
+def test_the_vague_filter_is_narrower_than_the_brief_nudge_check():
+    # The brief treats any nudge-only suggestion as a follow-up; the hub drops only the ones with no content.
+    for text in ("Follow up with Renzo about the FEMSA walkthrough", "Follow up on the pricing proposal"):
+        assert is_followup_only(text) and not is_vague_followup(text)
+    for text in ("Follow up.", "Follow up with the customer", "Send a follow-up", "Check in again"):
+        assert is_followup_only(text) and is_vague_followup(text)
+
+
+def test_vague_follow_ups_leave_the_card_but_dated_customer_owed_and_context_items_stay():
+    body = ("Keep following up. They will keep following up with us. Follow up on the pricing proposal. "
+            "Send a follow-up. We keep following up but they are slow.")
+    email = record(body=body)
+    def item(n, text, quote, **changes):
+        return insight(id=f"i-{n}", text=text, quote=quote, **changes)
+    insights = [
+        item(1, "Keep following up.", "Keep following up."),                                   # dropped
+        item(2, "Keep following up", "Keep following up.", type="commitment"),                 # dropped
+        item(3, "Keep following up", "They will keep following up with us.", owner_side="customer"),
+        item(4, "Follow up on the pricing proposal", "Follow up on the pricing proposal."),
+        item(5, "Send a follow-up", "Send a follow-up.", due_date="2026-11-20"),               # a date is content
+        item(6, "Keep following up", "We keep following up but they are slow.", type="objection"),
+        item(7, "Keep following up", "We keep following up but they are slow.", type="blocker"),
+    ]
+    (steps, context, sources, lineage), _ = reviewed_content([email], insights)
+    assert steps == ["Next step: Follow up on the pricing proposal", "Next step: Send a follow-up — requested by 2026-11-20",
+                     "Customer next step: Keep following up", "Blocker: Keep following up"]
+    assert context == ["Objection: Keep following up"]
+    assert validate_lineage(steps, context, sources, lineage)
+
+
+def test_a_card_with_only_a_vague_follow_up_has_no_content():
+    (steps, context, sources, _), retired = reviewed_content(
+        [record(body="Keep following up with Andina.")],
+        [insight(text="Keep following up with Andina", quote="Keep following up with Andina.")])
+    assert steps == context == sources == retired == []
+
+
+def test_each_next_step_bullet_records_who_it_is_with_and_the_card_knows_when_it_is_only_waiting():
+    email = record(body="We will send the deck. Ana will share the store list. Budget is frozen. Someone books the room. "
+                        "They want store-level reporting.")
+    def item(n, quote, **changes):
+        return insight(id=f"i-{n}", text=quote.rstrip("."), quote=quote, **changes)
+    ours = item(1, "We will send the deck.", type="commitment")
+    theirs = item(2, "Ana will share the store list.", type="commitment", owner_side="customer")
+    blocker = item(3, "Budget is frozen.", type="blocker")
+    unowned = item(4, "Someone books the room.", owner_side=None)
+    need = item(5, "They want store-level reporting.", type="need")
+    lineage = proposal_content([email], [ours, theirs, blocker, unowned, need])[3]
+    assert [node["side"] for node in lineage["nextStep"]] == ["bianca", "unassigned", "customer", "blocker"]
+    assert all("side" not in node for node in lineage["clientContext"])
+    assert is_waiting_on_them(lineage) is False
+    assert is_waiting_on_them(proposal_content([email], [theirs, blocker, need])[3]) is True
+    assert is_waiting_on_them(proposal_content([email], [theirs])[3]) is True
+    assert is_waiting_on_them(proposal_content([email], [blocker, unowned])[3]) is False   # an unowned step may be ours
+    # No Next Step bullets, or a card built before sides were recorded: the card cannot say.
+    assert is_waiting_on_them(proposal_content([email], [need])[3]) is None
+    old = proposal_content([email], [theirs])[3]
+    del old["nextStep"][0]["side"]
+    assert is_waiting_on_them(old) is None
+    for broken in (None, {}, {"nextStep": "x"}, {"nextStep": [None]}, {"nextStep": [{"side": "martian"}]}):
+        assert is_waiting_on_them(broken) is None
+
+
+def test_an_unedited_step_keeps_its_side_in_the_decision_lineage():
+    email = record(body="Ana will share the store list.")
+    theirs = insight(text="Share the store list", quote="Ana will share the store list.", type="commitment", owner_side="customer")
+    content = proposal_content([email], [theirs])
+    approved = approved_lineage(stored(content), [content[0][0], "A founder's own step"], [])
+    assert approved["nextStep"][0]["side"] == "customer" and approved["nextStep"][0]["origin"] == "source"
+    assert "side" not in approved["nextStep"][1] and approved["nextStep"][1]["origin"] == "founder_edit"

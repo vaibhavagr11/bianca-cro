@@ -954,5 +954,66 @@ test('The card shows the current Sheet status with a change control that starts 
   assert.deepEqual(json(sent),[[core.TOOLS.status,{row_id:'r-1',expected_status:'1. Opening',status:'0. Paused'}]]);
 });
 
+// ---- H-10 (11/17/2026): cards that only wait on the customer sit in a second agenda group
+function agendaSnapshot(flags){
+  const s=snapshot(),base=s.proposals[0];
+  s.proposals=Object.entries(flags).map(([company,[date,waiting]],i)=>({...json(base),id:'p-'+(i+1),company,sources:[{...base.sources[0],date}],...(waiting===undefined?{}:{waiting})}));
+  s.rows=s.proposals.map((p,i)=>({...json(s.rows[0]),id:'r-'+(i+1),company:p.company}));
+  return s;
+}
+function warRoomPage(s){
+  const page=fakePage({callTool:async()=>({structuredContent:s})});
+  page.context.document.body={dataset:{theme:'war-room'}};
+  return page;
+}
+const agendaOrder=html=>[...html.matchAll(/data-select="([^"]+)"/g)].map(m=>m[1]);
+
+test('The workspace keeps the waiting flag as a strict boolean and treats older data as needing action',()=>{
+  const s=agendaSnapshot({Alpha:['2026-11-10',true],Beta:['2026-11-10',false],Gamma:['2026-11-10'],Delta:['2026-11-10','yes']});
+  assert.deepEqual(core.workspace(s).proposals.map(p=>p.waiting),[true,false,false,false]);
+});
+
+test('The agenda lists cards needing action first and waiting cards in a second group, in the order Next and Prev follow',async()=>{
+  // Andina is the newest, but it is only waiting on the customer, so it goes below the two action cards.
+  const s=agendaSnapshot({Andina:['2026-11-16',true],Campari:['2026-11-12',false],Bimbo:['2026-11-14'],Chifles:['2026-11-01',true]});
+  const page=warRoomPage(s);
+  await new Promise(resolve=>setImmediate(resolve));
+  let list=page.get('#review-list').innerHTML;
+  assert.deepEqual(agendaOrder(list),['p-3','p-2','p-1','p-4']);
+  assert.ok(list.indexOf('<span>Needs your action</span><span>2</span>')<list.indexOf('data-select="p-3"'));
+  const waitingHeader=list.indexOf('<span>Waiting on them</span><span>2</span>');
+  assert.ok(waitingHeader>list.indexOf('data-select="p-2"')&&waitingHeader<list.indexOf('data-select="p-1"'));
+  // The first card shown is the first action card, and the counts keep their meaning: every pending card.
+  assert.ok(list.includes('Card 1 of 4 ·'));
+  assert.ok(list.includes('aria-labelledby="title-p-3"'));
+  assert.ok(list.includes('<span>4 to review</span>'));
+  assert.equal(page.get('#wr-strip-pending').textContent,4);
+  assert.equal(page.get('#pending-count').textContent,4);
+  assert.equal([...list.matchAll(/class="wr-row[^"]* wait"/g)].length,2);
+  // Opening a waiting card says so next to its position.
+  page.events.click({target:{closest:()=>({dataset:{action:'wr-select',select:'p-1'},closest:()=>null})}});
+  list=page.get('#review-list').innerHTML;
+  assert.ok(list.includes('Card 3 of 4 · waiting on them ·'));
+  assert.ok(list.includes('aria-labelledby="title-p-1"'));
+});
+
+test('Without waiting cards the agenda is one list with no group headings',async()=>{
+  const page=warRoomPage(agendaSnapshot({Andina:['2026-11-16'],Campari:['2026-11-12',false]}));
+  await new Promise(resolve=>setImmediate(resolve));
+  const list=page.get('#review-list').innerHTML;
+  assert.deepEqual(agendaOrder(list),['p-1','p-2']);
+  assert.equal(list.includes('Needs your action'),false);
+  assert.equal(list.includes('Waiting on them'),false);
+});
+
+test('When every card is waiting they are still listed and reviewable',async()=>{
+  const page=warRoomPage(agendaSnapshot({Andina:['2026-11-16',true]}));
+  await new Promise(resolve=>setImmediate(resolve));
+  const list=page.get('#review-list').innerHTML;
+  assert.deepEqual(agendaOrder(list),['p-1']);
+  assert.ok(list.includes('<span>Waiting on them</span><span>1</span>'));
+  assert.equal(list.includes('Needs your action'),false);
+  assert.ok(list.includes('data-action="approve"'));
+});
 
 (async()=>{for(const t of tests){try{await t.fn();passed++;process.stdout.write('PASS '+t.name+'\n');}catch(error){failed++;process.stdout.write('FAIL '+t.name+'\n  '+error.stack+'\n');}}process.stdout.write(`\n${passed} passed; ${failed} failed.\n`);process.exitCode=failed?1:0;})();

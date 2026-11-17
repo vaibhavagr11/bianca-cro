@@ -323,6 +323,13 @@ test('Keep + add in the demo adds below the current Next step and leaves Last pr
   assert.ok(html.includes('does not change Last progress'));
 });
 
+test('The demo marks one sample card as only waiting so the second agenda group can be seen',()=>{
+  const state=core.initial();
+  assert.deepEqual(json(state.proposals.filter(p=>p.waiting===true).map(p=>p.id)),['andina-chile']);
+  assert.equal(core.valid(state),true);
+  assert.ok(html.includes("group('Needs your action', acting) + group('Waiting on them', waiting)"));
+});
+
 test('Both groups empty or malformed cannot be approved',()=>{
   for(const update of [{nextStepBullets:[],clientContextBullets:[]},{nextStepBullets:['Valid'],clientContextBullets:[null]},{nextStepBullets:[],clientContextBullets:'Wrong'},{nextStepBullets:['x'.repeat(4001)],clientContextBullets:[]}]){
     assert.throws(()=>core.approve(core.initial(),'campari',update,at));

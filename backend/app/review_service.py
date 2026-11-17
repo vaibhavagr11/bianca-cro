@@ -25,7 +25,7 @@ from app.extractor import SALES_SCOPES
 from app.pipeline import PipelineRow, TRACKED_FIELDS, is_working_client, normalize_name
 from app.review_sheets import SheetsClient, SheetConflict, SheetError, SheetWorkingClient, SheetWriteUncertain
 from app.review_content import (
-    Content, answered_email_asks, approved_lineage, is_email_ask, proposal_content, reviewed_content,
+    Content, answered_email_asks, approved_lineage, is_email_ask, is_waiting_on_them, proposal_content, reviewed_content,
     review_next_step_bullets, source_id, source_version, validate_lineage,
 )
 
@@ -463,6 +463,10 @@ def workspace_view(conn, workspace_id) -> dict:
                 formatted = _review_next_steps(row, dated_source_ids)
                 if formatted != item["nextStepBullets"]:
                     item["reviewNextStepBullets"] = formatted
+                # H-10: the agenda lists cards that are only waiting on the customer below the ones needing action.
+                waiting = is_waiting_on_them(row.get("bullet_lineage"))
+                if waiting is not None:
+                    item["waiting"] = waiting
         proposals.append(item)
     rows = [{"id": str(r["id"]), "company": r["name"], "owner": r["owner_code"] or "", "stage": r["stage"] or "",
              "lastProgress": _cell(r["last_progress"]), "nextStep": _cell(r["next_step"]),

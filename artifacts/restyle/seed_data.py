@@ -21,7 +21,7 @@ SEED = [
       sources=[dict(type="Email", date="2026-10-29", subject="Tomás shared the raw sell-out data; it needs cross-referencing against Bianca's own numbers.", quote="Tomás: te paso el excel de sell-out crudo; hay solapamiento entre distribuidores en el interior."),
                dict(type="Calendar", date="2026-11-04", subject="Meeting with Pernod on Wednesday Nov 4.", quote="Pernod Ricard <> Bianca - Wed Nov 4.")],
       edges=dict(nextStep=[[0,1]], clientContext=[[0],[0]])),
- dict(id="andina-chile", company="Andina Chile", owner="RG", stage="2. In Talks", country="CHI",
+ dict(id="andina-chile", company="Andina Chile", owner="RG", stage="2. In Talks", country="CHI", waiting=True,
       lastProgress="", nextStep="-pusheado por mail 2 de Nov", clientContext="",
       nextStepBullets=["Waiting on Juan for the 15-minute catch-up; re-push on Nov 13 if still silent."],
       clientContextBullets=["Objection: no response since the last push - interest level unclear."],
@@ -100,6 +100,8 @@ def to_js():
     rows = []
     for p in SEED:
         q = {k: p[k] for k in ("id","company","owner","stage","country","lastProgress","nextStep","clientContext","nextStepBullets","clientContextBullets","sources")}
+        if p.get("waiting"):
+            q = {**{k: q[k] for k in ("id","company","owner","stage","country")}, "waiting": True, **q}  # only waiting on the customer
         rows.append(json.dumps(q, ensure_ascii=False))
     edges = {p["id"]: p["edges"] for p in SEED}
     return "const seed = [\n    " + ",\n    ".join(rows) + "\n  ];", "const seedEdges=" + json.dumps(edges, ensure_ascii=False) + ";"

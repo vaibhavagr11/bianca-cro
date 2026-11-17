@@ -65,3 +65,6 @@ The backend follow-up from 11/09 is done (`next_step_mode: "append"` on the appr
 (preview of what Keep + add will really add) in place of `merged`; `paintDialogMode` also rewrites the
 "What will happen" rows per mode. The page scripts pass `nextStepMode` through `BiancaLive.groups` / `decide`
 (live) and `BiancaCore.approve` (demo, in the browser only).
+
+`shell()` in `WR_JS` also splits the agenda into "Needs your action" and "Waiting on them" from the `waiting` flag
+the service sets per card (the demo seed marks Andina Chile); the row order in the page is the order J / K walk.

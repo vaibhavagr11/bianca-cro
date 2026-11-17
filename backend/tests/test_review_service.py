@@ -933,6 +933,15 @@ def test_workspace_recovery_exposes_exact_split_payload_and_not_legacy_or_redire
     ]
     assert pending["bulletLineage"] == store.data["proposal"]["bullet_lineage"]
     assert not sheets.calls
+    # H-10: the view says whether a card is only waiting on the customer; a card built earlier cannot say.
+    assert pending["waiting"] is False
+    ours = copy.deepcopy(store.data["proposal"]["bullet_lineage"])
+    for side, expected in (("customer", True), ("blocker", True), ("unassigned", False)):
+        store.data["proposal"]["bullet_lineage"]["nextStep"][0]["side"] = side
+        assert review.workspace_view(WorkspaceConnection(), WORKSPACE)["proposals"][0]["waiting"] is expected
+    del store.data["proposal"]["bullet_lineage"]["nextStep"][0]["side"]
+    assert "waiting" not in review.workspace_view(WorkspaceConnection(), WORKSPACE)["proposals"][0]
+    store.data["proposal"]["bullet_lineage"] = ours
 
     store.source_record["meta"]["date_inferred"] = True
     estimated = review.workspace_view(WorkspaceConnection(), WORKSPACE)["proposals"][0]
