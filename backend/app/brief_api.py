@@ -14,14 +14,14 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
-from app import actions, brief, brief_review, brief_v2, db, extractor, resolution, timeline
+from app import actions, brief, brief_review, brief_sheet_steps, brief_v2, db, extractor, resolution, timeline
 from app.brief_delivery import DeliveryGate, VerificationPending, create_gate
 from app.brief_review import ActionSource
 from app.brief_text import prepare_table_text
 from app.config import settings
 from app.gmail import domain
 from app.ingest import _workspace_id, require_token
-from app.pipeline import is_working_client, normalize_name
+from app.pipeline import is_paused, is_working_client, normalize_name
 from app.pipeline_freshness import check_fresh_pipeline, require_fresh_pipeline
 from app.process import _claude
 
@@ -42,7 +42,8 @@ def _sales_deals(conn, workspace_id) -> tuple[dict[str, dict], dict[str, str]]:
     active = {}
     working_clients = {}
     for deal in conn.execute(
-            "select o.id, o.company_id, c.name, o.stage, o.stage_rank, o.owner_code, o.removed_at from opportunities o"
+            "select o.id, o.company_id, c.name, o.stage, o.stage_rank, o.owner_code, o.removed_at, o.next_step"
+            " from opportunities o"
             " join companies c on c.id = o.company_id where o.workspace_id = %s order by o.id",
             (workspace_id,)):
         company_id = str(deal["company_id"])
@@ -226,6 +227,58 @@ def _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, em
                                       deal["name"] if deal else None, deal["stage"] if deal else None, codes,
                                       context=prep.get(str(m["id"]), ""), guests=guests, matched_by=matched_by))
     return meetings
+
+
+def _apply_sheet_dates(deals: dict[str, dict], views: dict[str, brief_v2.DealView], items: list[brief_v2.Item],
+                       insight_rows: list[dict], closed: dict, today) -> list[brief_v2.Item]:
+    """Read "(complete by <date>)" notes from each deal's Sheet Next step and return the items still to show.
+
+    Every dated bullet of a deal that is not Paused becomes a SheetDue on its view. When the same step also exists
+    as an open extracted item, the Sheet date wins: before the date the item is held back (the founder said when to
+    look at it), and from the date on the Sheet row stands in for it, so one step is never listed twice. A bullet
+    whose matching item was already closed, or that a founder marked Done, is not raised again.
+    """
+    overdue_days = settings.brief_sheet_step_overdue_days
+    actions_by_deal: dict[str, list[dict]] = {}
+    for r in insight_rows:
+        if r["type"] in ("commitment", "next_step"):
+            actions_by_deal.setdefault(str(r["opportunity_id"]), []).append(r)
+    open_ids = {i.id for i in items}
+    taken: set[str] = set()
+    for d in deals.values():
+        view = views[d["name"]]
+        view.sheet_next = brief_sheet_steps.first_bullet(d.get("next_step"))
+        if is_paused(d["stage"]):
+            continue
+        kept_keys, deal_taken = [], set()
+        for step in brief_sheet_steps.parse_cell(d.get("next_step"), today):
+            ref = _recommendation_ref(d["id"], f"sheet step: {step.key} {step.due.isoformat()}")
+            if closed.get(("rec", ref), ("",))[0] == "done":
+                continue
+            same = [r for r in actions_by_deal.get(str(d["id"]), [])
+                    if brief_sheet_steps.same_step(step.key, brief_sheet_steps.match_key(r["text"]))]
+            matched = [str(r["id"]) for r in same if str(r["id"]) in open_ids]
+            if same and not matched and any(r["status"] in ("done", "dismissed", "possibly_done") for r in same):
+                continue                # the step itself was closed; the Sheet text is just not updated yet
+            late = (today - step.due).days
+            current = late <= overdue_days
+            if current:                 # not yet due (held) or due now (the Sheet row replaces the item)
+                deal_taken.update(matched)
+                kept_keys.append(step.key)
+                view.held += len(matched) if late < 0 else 0
+            view.sheet_steps.append(brief_v2.SheetDue(step.text, step.due, ref,
+                                                      matched[0] if matched and 0 <= late and current else None))
+        if kept_keys:
+            def repeats(note: brief_v2.Note) -> bool:
+                return bool(note.evidence and note.evidence <= deal_taken) or any(
+                    brief_sheet_steps.same_step(key, brief_sheet_steps.match_key(note.text)) for key in kept_keys)
+            view.recommendations = [n for n in view.recommendations if not repeats(n)]
+            if view.recommendation and repeats(view.recommendation):
+                view.recommendation = next(iter(view.recommendations), None)
+            if view.unanswered and view.unanswered.item_id in deal_taken:
+                view.unanswered = None
+        taken |= deal_taken
+    return [i for i in items if i.id not in taken]
 
 
 class BuildSyncReceipts(BaseModel):
@@ -845,6 +898,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             _link_for(r["source"], r["unit_id"], r["meta"]),
             brief_v2.bucket(r["due_date"], recorded, today, t1, t2), kind))
 
+    items = _apply_sheet_dates(deals, views, items, ins_rows, closed, today)
+
     # ---- classify every newly extracted insight by the event time of the record its quote comes from
     lookback = settings.brief_late_lookback_days
     records_by_id = {str(rec["id"]): rec for rec in new_records}
@@ -873,7 +928,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         sections.append(brief_v2.build_section(
             code, full, short, views, items, [(m, m.context) for m in meetings if code in m.attendees], today, display,
             0 if gate else hidden.get(code, 0), settings.brief_critical_ahead_days, settings.brief_in_talks_target,
-            waiting=shown, more_waiting=more, waiting_candidates=waiting_candidates))
+            waiting=shown, more_waiting=more, waiting_candidates=waiting_candidates,
+            sheet_overdue_days=settings.brief_sheet_step_overdue_days))
 
     ndl = [brief_v2.TodayRow(i.deal, views[i.deal].stage, "Due now", i.text, f"due {i.due:%b} {i.due.day}", "Nico DL",
                              i.link, i.id, i.source, f"insight:{i.id}")
@@ -882,7 +938,10 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                               f"received {v.unanswered.days}d ago", "Nico DL", v.unanswered.link, v.unanswered.item_id,
                               v.unanswered.source, v.unanswered.completion_ref)
             for v in views.values() if v.owner == "NDL" and v.unanswered and brief_v2.reply_label(v.unanswered) == "reply_needed"]
-    ndl = ndl[:brief.MAX_NDL]
+    for v in views.values():
+        if v.owner == "NDL":
+            ndl += brief_v2.sheet_rows(v, today, settings.brief_sheet_step_overdue_days, "Nico DL (Sheet)")[0]
+    ndl = brief_v2.sort_today(ndl)[:brief.MAX_NDL]
     ndl_review = brief_review.verify_v2(sections, ndl, {d["name"]: key for key, d in deals.items()}, sources, gate) \
         if gate else None
     # Prep is written last, from the rows that survived the check above, so it never revives a closed action.

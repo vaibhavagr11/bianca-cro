@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     brief_critical_ahead_days: int = 3
     # Preferred number of active In Talks deals among the four shown per founder (not a quota).
     brief_in_talks_target: int = 2
+    # A "(complete by <date>)" note in the Sheet's Next step shows in "Needs you today" from its date until it is
+    # this many days late; after that it moves to a one-line reminder to update the Sheet.
+    brief_sheet_step_overdue_days: int = Field(default=14, ge=0)
     # Turn on after n8n is configured to provide receipts and check ready_to_send.
     brief_verification_required: bool = False
     brief_verification_feeds: list[str] = ["gmail:RG", "gmail:NC", "calendar:RG", "calendar:NC", "notes", "pipeline"]

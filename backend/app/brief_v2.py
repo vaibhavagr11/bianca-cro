@@ -89,6 +89,15 @@ class Unanswered:
         return f"thread:{self.thread_id}" if self.thread_id else None
 
 
+@dataclass(frozen=True)
+class SheetDue:
+    """A Next step bullet the founders dated in the Sheet with "(complete by <date>)"."""
+    text: str
+    due: date
+    ref: str                        # stable id of this bullet and date, so "Done" can close it
+    item_id: str | None = None      # the open extracted item that is the same step, if there is one
+
+
 @dataclass
 class DealView:
     deal: str
@@ -104,6 +113,9 @@ class DealView:
     unanswered: Unanswered | None = None
     developments: int = 0           # new or late-recorded developments since the last brief
     recommendations: list[Note] = field(default_factory=list)  # all of the profile's suggested moves
+    sheet_steps: list[SheetDue] = field(default_factory=list)  # dated Next step bullets from the Sheet
+    held: int = 0                   # extracted items held back until the date the founder set for them in the Sheet
+    sheet_next: str = ""            # first line of the Sheet's Next step cell, for context lines
 
 
 @dataclass
@@ -123,7 +135,7 @@ class Move:
 class TodayRow:
     deal: str
     stage: str | None
-    tag: str                        # Due now | Reply needed
+    tag: str                        # Due now | Sheet date | Reply needed
     text: str
     when: str
     owner: str
@@ -131,6 +143,7 @@ class TodayRow:
     item_id: str | None = None
     source: str = ""
     done: str | None = None
+    verify: bool = True             # False: a founder's own dated note in the Sheet; mail cannot confirm or close it
 
 
 @dataclass
@@ -394,6 +407,38 @@ def _date(d: date) -> str:
     return f"{d:%b} {d.day}"
 
 
+SHEET_SOURCE = "Sheet next step"
+TODAY_ORDER = {"Due now": 0, "Sheet date": 1, "Reply needed": 2}
+
+
+def sort_today(rows: list[TodayRow]) -> list[TodayRow]:
+    """Promises due first, then the founders' own Sheet dates, then replies; stable inside each group."""
+    return sorted(rows, key=lambda r: (TODAY_ORDER.get(r.tag, 3), r.when))
+
+
+def sheet_rows(v: DealView, today: date, overdue_days: int, owner: str) -> tuple[list[TodayRow], list[SheetDue], list[SheetDue]]:
+    """(rows for "Needs you today", steps not yet due, steps too long past) for one deal's dated Sheet bullets.
+
+    A dated bullet shows on its date and stays, marked late, for overdue_days. Before its date it is not shown;
+    long after it, it becomes a reminder to update the Sheet rather than a daily row. If the same step also exists
+    as an extracted item, the row closes that item (so "Done" and the pre-send check work) and is the only row
+    shown for it.
+    """
+    rows, later, stale = [], [], []
+    for step in v.sheet_steps:
+        late = (today - step.due).days
+        if late < 0:
+            later.append(step)
+        elif late > overdue_days:
+            stale.append(step)
+        else:
+            when = "due today" if late == 0 else f"due {_date(step.due)}, {late}d late"
+            rows.append(TodayRow(v.deal, v.stage, "Sheet date", step.text, when, owner, None, step.item_id,
+                                 SHEET_SOURCE, f"insight:{step.item_id}" if step.item_id else f"rec:{step.ref}",
+                                 verify=step.item_id is not None))
+    return rows, later, stale
+
+
 def addresses(evidence: frozenset, blocker: Note) -> bool:
     """A move addresses a blocker when it rests on the same source evidence (shared cited insights)."""
     return bool(evidence & blocker.evidence)
@@ -644,6 +689,9 @@ class Section:
     waiting: list[Waiting] = field(default_factory=list)  # we wrote last, no answer yet
     more_waiting: int = 0
     verification: VerificationNotes | None = None
+    sheet_later: list[tuple[str, date]] = field(default_factory=list)   # (deal, date) of dated Sheet steps not yet due
+    sheet_stale: list[tuple[str, date]] = field(default_factory=list)   # (deal, date) of Sheet dates long past
+    held: int = 0                   # extracted items waiting for the Sheet date a founder gave them
 
 
 def _without_waiting_action(view: DealView, waiting: Waiting) -> DealView:
@@ -728,7 +776,7 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                   meetings: list[tuple[Meeting, str]], today: date, display: dict[str, str],
                   hidden: int = 0, critical_ahead: int = 3, in_talks_target: int = 2, *,
                   waiting: list[Waiting] | None = None, more_waiting: int = 0,
-                  waiting_candidates: list[Waiting] | None = None) -> Section:
+                  waiting_candidates: list[Waiting] | None = None, sheet_overdue_days: int = 14) -> Section:
     mine: dict[str, DealView] = {}
 
     def view(deal: str) -> DealView:
@@ -739,7 +787,9 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                                   blocker=src.blocker if own else None, recommendation=src.recommendation if own else None,
                                   summary=src.summary if own else None, unanswered=src.unanswered if own else None,
                                   developments=src.developments if own else 0,
-                                  recommendations=src.recommendations if own else [])
+                                  recommendations=src.recommendations if own else [],
+                                  sheet_steps=src.sheet_steps if own else [], held=src.held if own else 0,
+                                  sheet_next=src.sheet_next)
         return mine[deal]
 
     routed = [i for i in items if i.route == code]
@@ -767,7 +817,15 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                                        u.completion_ref))
             if u.item_id:
                 used.add(u.item_id)
-    today_rows.sort(key=lambda r: (r.tag != "Due now", r.when))
+    sheet_later: list[tuple[str, date]] = []
+    sheet_stale: list[tuple[str, date]] = []
+    for v in mine.values():         # the dates the founders set themselves in the Sheet's Next step
+        rows, later, stale = sheet_rows(v, today, sheet_overdue_days, display.get(code, code) + " (Sheet)")
+        today_rows += rows
+        used.update(r.item_id for r in rows if r.item_id)
+        sheet_later += [(v.deal, step.due) for step in later]
+        sheet_stale += [(v.deal, step.due) for step in stale]
+    today_rows = sort_today(today_rows)
     in_today = {r.deal for r in today_rows}
 
     # Deals to move: prospects and pilots this founder owns, active or with something pressing.
@@ -791,6 +849,8 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
 
     highlight_views = []
     followup_only = set()
+    dated_only = set()
+    sheet_dated = {r.deal for r in today_rows if r.tag == "Sheet date"} | {deal for deal, _ in sheet_later}
     primary_moves = {}
     for original in eligible:
         v = action_views[original.deal]
@@ -801,6 +861,10 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
         if proposal_only or (has_reminder and move.tag in ("Confirm status", "Clarify next action")):
             followup_only.add(v.deal)
             continue
+        # The founder already dated this deal's next step in the Sheet: no "check where this stands" on top of it.
+        if move.tag == "Confirm status" and v.deal in sheet_dated:
+            dated_only.add(v.deal)
+            continue
         primary_moves[v.deal] = move
         highlight_views.append(v)
 
@@ -809,6 +873,9 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
         if v.deal in followup_only:
             audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
                                          "not eligible: waiting or follow-up with no separate next move"))
+        elif v.deal in dated_only:
+            audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
+                                         "not eligible: its next step is dated in the Sheet and nothing else is open"))
         elif v.rank in PROSPECT_RANKS and v not in eligible:
             status = deal_status(v, today)
             audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
@@ -845,9 +912,10 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
     used |= {m.item_id for m in follow_shown if m.item_id}
 
     # Status to confirm: owned prospects/pilots not shown whose last record is 15-45 days old (or missing).
-    unclear = sorted((v for v in owned if v.rank in PROSPECT_RANKS and v.deal not in shown
+    unclear = sorted((v for v in owned if v.rank in PROSPECT_RANKS and v.deal not in shown and v.deal not in sheet_dated
                       and deal_status(v, today) == "unclear"), key=lambda v: (-(v.rank or 0), v.deal))
-    dormant = sum(1 for v in owned if v.rank in PROSPECT_RANKS and v.deal not in shown and deal_status(v, today) == "dormant")
+    dormant = sum(1 for v in owned if v.rank in PROSPECT_RANKS and v.deal not in shown and v.deal not in sheet_dated
+                  and deal_status(v, today) == "dormant")
 
     # Backlog: everything else still open, summarized; individual items only for promised deadlines to active deals.
     rest = [i for v in mine.values() for i in v.items if i.id not in used and i.bucket in ("stale", "old_undated")]
@@ -864,7 +932,10 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
     return Section(code, name, short, today_rows, highlights, [r.deal for r in audit if r.position is None
                                                                 and not r.reason.startswith("not eligible")],
                    meetings, follow_shown, [], len(follow) - len(follow_shown), unclear, dormant, b,
-                   hidden, routed, audit, waiting=waiting, more_waiting=more_waiting)
+                   hidden, routed, audit, waiting=waiting, more_waiting=more_waiting,
+                   sheet_later=sorted(sheet_later, key=lambda pair: pair[1]),
+                   sheet_stale=sorted(sheet_stale, key=lambda pair: pair[1]),
+                   held=sum(v.held for v in mine.values()))
 
 
 # ---------------------------------------------------------------- meeting prep (pure)
@@ -926,6 +997,8 @@ def meeting_prep(meeting: Meeting, section: "Section", view: DealView | None, to
             context = f"Open issue: {view.blocker.text}"
         elif view.recommendation and view.recommendation.verified and not checked:
             context = f"Suggested: {view.recommendation.text}"
+        elif view.sheet_next:
+            context = f"Sheet next step: {view.sheet_next}"
         elif view.summary and view.summary.verified:
             context = split_sentences(view.summary.text)[0]
     if not context:
@@ -940,7 +1013,7 @@ def meeting_prep(meeting: Meeting, section: "Section", view: DealView | None, to
 
 # ---------------------------------------------------------------- rendering
 
-TAG_COLOR = {"Due now": RED, "Reply needed": BLUE, "We owe": INK, "Customer asked": BLUE,
+TAG_COLOR = {"Due now": RED, "Sheet date": RED, "Reply needed": BLUE, "We owe": INK, "Customer asked": BLUE,
              "Next step noted": BLUE, "AI recommendation": PURPLE, "Follow up": AMBER, "Confirm status": MUTED,
              "Clarify next action": AMBER}
 
@@ -1126,9 +1199,23 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, 
         notes.append(f"{b.delegated} item(s) on your deals name someone else (delegated).")
     if s.hidden:
         notes.append(f"{s.hidden} item(s) hidden: later emails/notes suggest they were done.")
+    if s.sheet_stale:
+        names = ", ".join(f"{deal} ({_date(due)})" for deal, due in s.sheet_stale[:MAX_NAMES])
+        more = f" +{len(s.sheet_stale) - MAX_NAMES} more" if len(s.sheet_stale) > MAX_NAMES else ""
+        notes.append(f"<b>Sheet dates long past:</b> {_e(names + more)} - update the Next step in the Sheet "
+                     f"or move the deal to Paused.")
+    if s.sheet_later:
+        deal, due = s.sheet_later[0]
+        held = f" ({s.held} matching item(s) held back until then)" if s.held else ""
+        notes.append(f"{len(s.sheet_later)} dated Sheet step(s) not due yet{held}; next: {_e(deal)}, "
+                     f"{_e(_long_date(due, today))}. Each comes back in Needs you today on its date.")
     if notes:
         out.append("".join(f'<p style="margin:6px 0 0;font:12px/1.5 {FONT};color:{MUTED}">{n}</p>' for n in notes))
     return "".join(out) + verification_html(s.verification)
+
+
+def _long_date(d: date, today: date) -> str:
+    return _date(d) if d.year == today.year else f"{_date(d)}, {d.year}"
 
 
 def change_label(c: ChangeRow) -> str:
@@ -1226,7 +1313,10 @@ def to_payload(sections: list[Section], ndl_rows: list[TodayRow], changes: list[
         return {"tag": m.tag, "text": m.text, "when": m.when, "item_id": m.item_id}
     return {"version": "v2", "sections": [{
         "owner": s.code,
-        "today": [{"deal": r.deal, "tag": r.tag, "text": r.text, "when": r.when, "item_id": r.item_id} for r in s.today],
+        "today": [{"deal": r.deal, "tag": r.tag, "text": r.text, "when": r.when, "item_id": r.item_id,
+                   "source": r.source} for r in s.today],
+        "sheet_later": [{"deal": deal, "due": due} for deal, due in s.sheet_later],
+        "sheet_stale": [{"deal": deal, "due": due} for deal, due in s.sheet_stale],
         "highlights": [{"deal": v.deal, "stage": v.stage, "situation": sit.text if sit else None, "move": move(m)}
                        for v, m, sit in s.highlights],
         "selection_audit": [{"deal": r.deal, "stage": r.stage, "selected": r.selected, "position": r.position,
