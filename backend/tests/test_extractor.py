@@ -1,8 +1,10 @@
 from datetime import date
+from unittest.mock import Mock
 
+import pytest
 from fastapi.testclient import TestClient
 
-from app.extractor import ExtractedInsight, Extraction, build_system_prompt, parse_due, validate
+from app.extractor import ExtractedInsight, Extraction, build_system_prompt, extract, parse_due, validate
 from app.main import app
 
 TEXT = "Meeting note dated 2026-10-06\n\nNext steps\nMANDAR MAIL NEXT STEPS\nNo quieren trabajar precios, es   sensible"
@@ -73,6 +75,39 @@ def test_parse_due_rejects_vague_or_bad_dates():
 def test_system_prompt_names_team_and_nico_rule():
     prompt = build_system_prompt([{"full_name": "Nicolás Casaux", "owner_code": "NC", "email": "n@bianca-ai.com"}])
     assert "Nicolás Casaux (NC)" in prompt and '"Nico" alone means Nicolás Casaux' in prompt
+
+
+@pytest.mark.parametrize(("stage", "new_refs", "uses_pilot_scope"), [
+    ("4. Pilot", ["M2"], True),
+    (" PILOT ", ["M2"], True),
+    ("4. Pilot", [], False),
+    ("4. Pilot Completed", ["M2"], False),
+    ("3. Proposal", ["M2"], False),
+    (None, ["M2"], False),
+])
+def test_extraction_uses_pilot_scope_only_for_new_sources_at_pilot_stage(stage, new_refs, uses_pilot_scope):
+    client = Mock()
+    client.messages.parse.return_value.parsed_output = Extraction(insights=[])
+    base = build_system_prompt([])
+    # A stage mention inside the source cannot enable tighter scope for a non-Pilot deal.
+    item_text = "M1: Pilot kickoff was last week.\nM2: Can you fix the dashboard by Friday?"
+    extract(client, "model", base, {"company": "Acme", "stage": stage, "owner_code": "RG"},
+            item_text, new_source_refs=new_refs)
+
+    call = client.messages.parse.call_args.kwargs
+    system = call["system"][0]["text"]
+    request = call["messages"][0]["content"]
+    assert request.split("<text>")[1].strip() == f"{item_text}\n</text>"
+    if uses_pilot_scope:
+        assert '"Can you fix the dashboard by Friday?" is a delivery request.' in system
+        assert "deal_progression blocker about the rollout decision" in system
+        assert '"Please add 20 more dashboard users" is a delivery request.' in system
+        assert "is a deal_progression next_step, a request for pricing" in system
+        assert "only to insights sourced from: M2." in request.split("<text>")[0]
+        assert "Use the normal scope rules for those records." in request
+    else:
+        assert system == base
+        assert "Apply the new Pilot rules" not in request
 
 
 def test_extract_endpoint_requires_token():

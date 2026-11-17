@@ -1,7 +1,10 @@
+from unittest.mock import Mock
+
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.profiler import Action, Commitment, Profile, Stakeholder, Statement, check, render_inputs
+from app.profiler import Action, Commitment, Profile, Stakeholder, Statement, SYSTEM_PROMPT, check, generate, render_inputs
 
 
 def st(text, *ev, basis="confirmed"):
@@ -55,6 +58,21 @@ def test_check_accepts_fact_citations():
     data, dropped = check(profile(summary=st("Agreed to become recurring.", "P1"),
                                   momentum_reason=st("No meeting scheduled.", "A1")), {"I1", "I2", "I3", "I4", "P1", "A1"})
     assert data["summary"]["evidence"] == ["P1"] and "unsupported" not in data["summary"]
+
+
+@pytest.mark.parametrize(("stage", "uses_pilot_scope"), [("4. Pilot", True), ("3. Proposal", False)])
+def test_generated_recommendations_use_pilot_scope_only_at_pilot_stage(stage, uses_pilot_scope):
+    client = Mock()
+    client.messages.parse.return_value.parsed_output = profile()
+    generate(client, "model", "Pilot dashboard and paid rollout discussion.", stage=stage)
+
+    system = client.messages.parse.call_args.kwargs["system"][0]["text"]
+    if uses_pilot_scope:
+        assert '"Can you fix the dashboard by Friday?" supports no sales recommendation.' in system
+        assert "recommend confirming the decision or its criteria" in system
+        assert '"send pricing for 20 additional seats" as a commercial request' in system
+    else:
+        assert system == SYSTEM_PROMPT
 
 
 def test_profile_endpoints_require_token():
