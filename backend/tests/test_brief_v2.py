@@ -796,3 +796,33 @@ def test_waiting_list_renders_with_a_done_button():
     assert "Waiting on their reply" in html and "out-of-office received" in html and "r=thread:t-Andina Chile" in html
     assert "We asked for the pilot approval date." in html
     assert "thread:t-Andina Chile" in completable([s], [])
+
+
+# ---- finding 15 (11/09 evals): "Delta: Customer replied" was a Zendesk update from Delta's data vendor
+
+from app.brief_v2 import helpdesk_host, reply_origin  # noqa: E402
+
+
+@pytest.mark.parametrize("senders,subject", [
+    (["support@vtinfo.zendesk.com"], "[VIP Help Center] Request #48213: Delta store file"),
+    (["agent@vendor.com"], "Re: [Acme Help Center] Request #48213 has been updated"),
+    (["helpdesk@vendor.com"], "Ticket #9917 updated: data refresh"),
+    (["soporte@proveedor.com.ar"], "[Mesa de Ayuda] Solicitud N° 4410"),
+])
+def test_help_desk_ticket_notices_are_not_people(senders, subject):
+    assert is_automated(senders, subject)
+
+
+@pytest.mark.parametrize("subject", ["Re: Request for pricing", "Pilot support plan", "Business case 2 for the pilot"])
+def test_ordinary_subjects_are_not_ticket_notices(subject):
+    assert not is_automated(["juan@andina.cl"], subject)
+
+
+def test_customer_replied_is_only_said_for_the_customers_own_senders():
+    own = {"delta.com"}
+    assert reply_origin(["ana@delta.com"], own, set()) is None
+    assert reply_origin(["ana@gmail.com"], own, {"ana@gmail.com"}) is None           # a known contact on free mail
+    assert reply_origin(["ana@newdeal.com"], None, set()) is None                    # nothing learned yet: no claim
+    assert reply_origin(["agent@vtinfo.com"], own, set()) == "vtinfo.com"            # the data vendor copied in
+    assert reply_origin(["support@vtinfo.zendesk.com"], None, set()) == "vtinfo.zendesk.com"
+    assert helpdesk_host("support@vtinfo.zendesk.com") and not helpdesk_host("ana@delta.com")

@@ -256,11 +256,44 @@ AUTO_SUBJECT_RE = re.compile(
 AUTO_SENDER_RE = re.compile(
     r"(no-?reply|do-?not-?reply|^mailer-daemon@|^postmaster@|^bounces?[+@-]|^gemini-notes@|^calendar-notification@"
     r"|@([^@]*\.)?notifications?\.)", re.I)
+# A help-desk ticket update ("[Acme Help Center] Request #48213", "Ticket #991 updated") is a system notice from
+# whoever runs the ticket, usually a vendor. It is never the customer answering us.
+TICKET_SUBJECT_RE = re.compile(
+    r"\[[^\]]{0,80}\b(help ?cent(?:er|re)|help ?desk|service ?desk|support (?:cent(?:er|re)|portal|team)|"
+    r"centro de ayuda|mesa de ayuda|soporte)\b[^\]]{0,40}\]"
+    r"|\b(?:request|ticket|solicitud|incidente?)\s*(?:#|n[°ºo]\.?\s*)\s*\d{2,}", re.I)
+# Hosts that send mail for another company's support desk. An address there is never a customer's own domain.
+HELPDESK_HOSTS = ("zendesk.com", "freshdesk.com", "helpscout.net", "helpscoutapp.com", "intercom-mail.com",
+                  "intercom.io", "atlassian.net", "service-now.com", "servicenow.com", "zohodesk.com", "hubspot.com",
+                  "salesforce.com", "kayako.com", "gorgias.com", "frontapp.com")
 WAITING_DAYS = (7, 60)      # whole elapsed days since our latest real outbound message
 
 
 def is_automated(senders: list[str], subject: str | None) -> bool:
-    return bool(AUTO_SUBJECT_RE.match(subject or "")) or any(AUTO_SENDER_RE.search(a or "") for a in senders)
+    return (bool(AUTO_SUBJECT_RE.match(subject or "")) or bool(TICKET_SUBJECT_RE.search(subject or ""))
+            or any(AUTO_SENDER_RE.search(a or "") for a in senders))
+
+
+def helpdesk_host(address: str | None) -> bool:
+    host = (address or "").rsplit("@", 1)[-1].lower()
+    return any(host == h or host.endswith("." + h) for h in HELPDESK_HOSTS)
+
+
+def reply_origin(senders: list[str], own_domains: set[str] | None, own_contacts: set[str]) -> str | None:
+    """None when the customer wrote; otherwise the sender's domain, so the row names it instead of the customer.
+
+    own_domains are the deal company's own email domains (None when we have learned none yet: then only a help-desk
+    host is ruled out). own_contacts are addresses already tied to that company, for people on free-mail domains.
+    """
+    for address in senders:
+        address = (address or "").lower()
+        host = address.rsplit("@", 1)[-1]
+        if helpdesk_host(address):
+            return host
+        if address in own_contacts or own_domains is None or host in own_domains:
+            continue
+        return host
+    return None
 
 
 @dataclass

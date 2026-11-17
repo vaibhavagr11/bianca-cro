@@ -57,15 +57,21 @@ class Result(list):
 
 
 class BriefData:
-    def __init__(self, deals, messages, insights, profiles, *, meetings=(), changes=()):
+    def __init__(self, deals, messages, insights, profiles, *, meetings=(), changes=(), domains=(), contacts=()):
         self.deals = deals
         self.messages = messages
         self.insights = insights
         self.profiles = profiles
         self.meetings = meetings
         self.changes = changes
+        self.domains = domains
+        self.contacts = contacts
 
     def execute(self, query, params=()):
+        if "from company_domains" in query:
+            return Result(self.domains)
+        if "from contacts" in query:
+            return Result(self.contacts)
         if "from workspaces" in query:
             return Result([{"timezone": "UTC", "internal_domains": ["bianca.example"]}])
         if "from team_members" in query:
@@ -396,3 +402,34 @@ def test_profile_followup_stays_out_of_deals_to_move(brief_client, with_next_mov
         assert body.count(wording) == 1
         assert body.index("Follow-ups that may be needed") < body.index(wording)
         assert (next_move in body) == with_next_move
+
+
+# ---- finding 15 (11/09 evals): a vendor's support ticket was reported as "Delta: Customer replied"
+
+def test_vendor_ticket_or_help_desk_mail_is_never_reported_as_a_customer_reply(brief_client):
+    delta = deal("delta")
+    reply = email("Re: store list", "delta", "Thanks, received.", days=0)
+    ticket = email("[VIP Help Center] Request #48213: store file", "delta", "Your request was updated.", days=0)
+    ticket["participants"]["from"] = [{"address": "support@vtinfo.zendesk.com", "name": "VIP Support"}]
+    agent = email("Re: VIP data access", "delta", "We reset the access.", days=0)
+    agent["participants"]["from"] = [{"address": "support@vtinfo.zendesk.com", "name": "VIP Support"}]
+    vendor = email("Data feed timing", "delta", "The feed runs on Mondays.", days=0)
+    vendor["participants"]["from"] = [{"address": "ops@vtinfo.com", "name": "Vendor Ops"}]
+    domains = [{"domain": "delta.example", "company_id": "delta", "evidence_count": 9, "origin": "learned"},
+               {"domain": "vtinfo.com", "company_id": "delta", "evidence_count": 2, "origin": "learned"}]
+    for message in (ticket, agent, vendor):          # one record per thread, so each can produce a change row
+        client = brief_client(BriefData([delta], [message], [], [], domains=domains))
+        result = client.post("/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"}).json()
+        assert "Customer replied" not in result["html"]
+        changes = [c["text"] for c in result["payload"]["changes"]]
+        if message is ticket:
+            assert changes == []                     # a ticket notice is not a development at all
+        else:
+            sender = message["participants"]["from"][0]["address"].split("@")[1]
+            assert changes == [f"Email from {sender} on this deal (nothing new extracted): {message['subject']}"]
+    client = brief_client(BriefData([delta], [reply], [], [], domains=domains))
+    result = client.post("/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"}).json()
+    assert [c["text"] for c in result["payload"]["changes"]] == ["Customer replied (nothing new extracted): Re: store list"]
+    v1 = brief_client(BriefData([delta], [ticket], [], [])).post(
+        "/brief/build?dry_run=true&version=v1", headers={"X-Ingest-Token": "test-token"}).json()
+    assert "Customer replied" not in v1["html"]

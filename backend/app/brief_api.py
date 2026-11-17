@@ -14,7 +14,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
-from app import actions, brief, brief_review, brief_v2, db, extractor, timeline
+from app import actions, brief, brief_review, brief_v2, db, extractor, resolution, timeline
 from app.brief_delivery import DeliveryGate, VerificationPending, create_gate
 from app.brief_review import ActionSource
 from app.brief_text import prepare_table_text
@@ -55,6 +55,30 @@ def _sales_deals(conn, workspace_id) -> tuple[dict[str, dict], set[str]]:
 def _working_client_record(record: dict, working_clients: set[str]) -> bool:
     # A rules link can identify the company even when the primary link is absent or disputed.
     return str(record["company_id"]) in working_clients or str(record.get("rules_company_id")) in working_clients
+
+
+def _company_addresses(conn, workspace_id, names: dict[str, str]) -> tuple[dict[str, set[str]], dict[str, str], dict[str, str]]:
+    """What entity resolution has learned: (company -> its own domains, domain -> company, contact email -> company).
+
+    A company's own domains are those carrying its name plus the one with the most linked records. A second domain
+    seen on its threads may be a vendor or partner copied in, so it is not assumed to be the customer.
+    """
+    rows = conn.execute("select domain, company_id, evidence_count, origin from company_domains"
+                        " where workspace_id = %s", (workspace_id,)).fetchall()
+    by_company: dict[str, list[dict]] = {}
+    for row in rows:
+        if not brief_v2.helpdesk_host(row["domain"]):
+            by_company.setdefault(str(row["company_id"]), []).append(row)
+    own: dict[str, set[str]] = {}
+    for company_id, found in by_company.items():
+        most = max(r["evidence_count"] or 0 for r in found)
+        own[company_id] = {r["domain"].lower() for r in found
+                           if (r["evidence_count"] or 0) == most or r.get("origin") == "manual"
+                           or resolution._name_in_domain(names.get(company_id, ""), r["domain"].lower())}
+    domain_company = {r["domain"].lower(): str(r["company_id"]) for r in rows if not brief_v2.helpdesk_host(r["domain"])}
+    contacts = {r["email"].lower(): str(r["company_id"]) for r in conn.execute(
+        "select email, company_id from contacts where workspace_id = %s and company_id is not null", (workspace_id,))}
+    return own, domain_company, contacts
 
 
 def _insight_rows(conn, workspace_id) -> list[dict]:
@@ -388,7 +412,9 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
                 continue
             if r["source"] == "gmail":
                 senders = [p["address"] for p in (r["participants"] or {}).get("from") or []]
-                if senders and all(domain(s) not in internal for s in senders):
+                if (senders and all(domain(s) not in internal for s in senders)
+                        and not brief_v2.is_automated(senders, r["subject"])
+                        and not any(brief_v2.helpdesk_host(s) for s in senders)):
                     changes.append(brief.Change(d["name"], f"Customer replied: {r['subject'] or '(no subject)'}",
                                                 d["owner_code"], timeline.GMAIL_THREAD_URL.format(r["thread_id"])))
             elif r["source"] == "notes":
@@ -509,6 +535,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         since = since or (last["created_at"] if last else now - timedelta(hours=24))
 
         deals, working_clients = _sales_deals(conn, workspace_id)
+        own_domains, domain_company, contact_company = _company_addresses(
+            conn, workspace_id, {company_id: d["name"] for company_id, d in deals.items()})
         profiles = {str(r["opportunity_id"]): r for r in conn.execute(
             "select distinct on (opportunity_id) opportunity_id, profile, generated_at, profiler_version"
             " from opportunity_profiles"
@@ -855,7 +883,11 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             senders = [x["address"] for x in (rec["participants"] or {}).get("from") or []]
             if not senders or any(domain(a) in internal for a in senders) or brief_v2.is_automated(senders, rec["subject"]):
                 continue  # ours, or an out-of-office/notification: nobody replied
-            text = f"Customer replied (nothing new extracted): {rec['subject'] or '(no subject)'}"
+            company_id = str(rec["company_id"])
+            other = brief_v2.reply_origin(senders, own_domains.get(company_id),
+                                          {a for a, c in contact_company.items() if c == company_id})
+            who = f"Email from {other} on this deal" if other else "Customer replied"
+            text = f"{who} (nothing new extracted): {rec['subject'] or '(no subject)'}"
         else:
             text = f"Meeting notes added (nothing new extracted): {rec['subject'] or '(no subject)'}"
         changes.append(brief_v2.ChangeRow(d["name"], d["stage_rank"], text, SOURCE_LABEL[rec["source"]],
