@@ -501,11 +501,12 @@ def change_status(workspace_id, row_id: str, actor: str, expected_status: str, n
     new_status = new_status.strip()
     with db.connect() as conn:
         conn.row_factory = dict_row
-        row = conn.execute(
-            "select o.*, c.name, c.country from opportunities o join companies c on c.id = o.company_id"
-            " where o.workspace_id = %s and o.id::text = %s for update of o", (workspace_id, row_id)).fetchone()
+        lookup = ("select o.*, c.name, c.country from opportunities o join companies c on c.id = o.company_id"
+                  " where o.workspace_id = %s and o.id::text = %s")
+        row = conn.execute(lookup, (workspace_id, row_id)).fetchone()
         if not row or row["removed_at"] is not None:
             raise ReviewNotFound("This company is not in the active Pipeline sheet.")
+        conn.commit()  # hold no database lock while the Sheet is read and written
         try:
             sheets = SheetsClient()
             options = status_options(sheets.read_company_statuses())
@@ -518,8 +519,12 @@ def change_status(workspace_id, row_id: str, actor: str, expected_status: str, n
             raise ReviewUnavailable(str(exc)) from exc
         except SheetError as exc:
             raise ReviewUnavailable("The Sheet could not be reached. Refresh to check the Status before trying again.") from exc
+        # The Sheet now holds the new status. Bring the pipeline cache in step unless a sync moved it meanwhile.
+        company = row["name"]
+        row = conn.execute(lookup + " for update of o", (workspace_id, row_id)).fetchone() or {"name": company}
         previous = _cell(row.get("stage"))
-        mirror_refreshed = previous.strip() in (expected_status.strip(), new_status)
+        mirror_refreshed = (row.get("id") is not None and row.get("removed_at") is None
+                            and previous.strip() in (expected_status.strip(), new_status))
         if mirror_refreshed and previous.strip() != new_status:
             # Keep the pipeline cache and its history in step, exactly as the next full sync would record it.
             fields = {k: (str(row[k]).strip() or None) if row.get(k) is not None else None for k in TRACKED_FIELDS}
@@ -535,7 +540,7 @@ def change_status(workspace_id, row_id: str, actor: str, expected_status: str, n
                 "insert into opportunity_changes (workspace_id, opportunity_id, sync_run_id, field, old_value, new_value)"
                 " values (%s, %s, %s, 'stage', %s, %s)", (workspace_id, row["id"], run["id"], row.get("stage"), new_status))
         conn.commit()
-        return {"rowId": str(row["id"]), "company": row["name"], "previous": expected_status.strip(),
+        return {"rowId": row_id, "company": company, "previous": expected_status.strip(),
                 "status": live.status, "actor": actor, "mirror_refreshed": mirror_refreshed,
                 "inSalesPipeline": not is_working_client(live.status)}
 
