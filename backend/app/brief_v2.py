@@ -444,7 +444,9 @@ def waiting_text(w: Waiting) -> str:
 
 def _waiting_status(w: Waiting) -> str:
     """How the silence stands, then what to do about it: Paused after too many emails, else the weekly nudge."""
-    suggest_pause = w.pause_after is not None and w.nudges >= w.pause_after
+    # The Paused suggestion follows the weekly cadence and takes the nudge's place on that day; on other days the
+    # row only states the silence.
+    suggest_pause = w.nudge and w.pause_after is not None and w.nudges >= w.pause_after
     if suggest_pause:
         bits = [pause_text(w.nudges)]
     elif w.replied_before:
@@ -840,8 +842,10 @@ def _nudge(view: DealView, today: date, cadence: Cadence, about: str, basis: dat
     if view.last_reply and view.last_outbound and view.last_reply > view.last_outbound:
         return None
     if view.unanswered_emails >= cadence.pause_after:
-        last = f"last email {_date(view.last_outbound)}" if view.last_outbound else _last(view, today)
-        return f"{view.deal}: {pause_text(view.unanswered_emails)}.", last
+        # Once per cadence.every days since our last email, on the day the nudge would have shown, and instead of it.
+        if not view.last_outbound or not (force or cadence.due(view.last_outbound, today)):
+            return None
+        return f"{view.deal}: {pause_text(view.unanswered_emails)}.", f"last email {_date(view.last_outbound)}"
     if basis is None or basis == date.min or not (force or cadence.due(basis, today)):
         return None                 # date.min: the source has no date at all, so "N weeks since" cannot be said
     days = (today - basis).days
