@@ -28,6 +28,41 @@ def build(client):
 
 # ---- 1. Needs you today shows every row
 
+def test_left_out_names_lists_eight_deals_then_counts_the_rest():
+    assert left_out_names(["Andina Chile", "Arca Peru", "Chifles", "Arca Peru", None, ""]) == "Andina Chile, Arca Peru, Chifles"
+    many = [f"Deal {n}" for n in range(1, 12)]
+    assert left_out_names(many) == "Deal 1, Deal 2, Deal 3, Deal 4, Deal 5, Deal 6, Deal 7, Deal 8 and 3 more"
+    assert more_line(3, "in the Sheet", ["Andina Chile", "Arca Peru", "Chifles"]) == (
+        "+ 3 more in the Sheet: Andina Chile, Arca Peru, Chifles")
+    assert more_line(2, "on record", []) == "+ 2 more on record"
+
+
+def test_every_capped_table_names_what_it_left_out_in_html_and_text(brief_client):
+    names = [f"Deal {n:02d}" for n in range(1, 18)]
+    waits = [email(f"ask-{name}", name, "Can you approve the proposal?", days=8, outgoing=True) for name in names[:9]]
+    steps = [insight(f"step-{name}", name, f"Prepare the rollout plan for {name}", SALES, type_="next_step", dated=False)
+             for name in names[9:]]
+    replies = [email(f"new-{name}", name, "Thanks, received.", days=0) for name in names[:9]]
+    meetings = [_meeting(f"Call {n}", name, hours=n) for n, name in enumerate(names[:9], start=1)]
+    data = BriefData([deal(name) for name in names], [*waits, *replies], steps, [], meetings=meetings)
+    result = build(brief_client(data))
+    page, text = html.unescape(result["html"]), result["text"]
+    section = result["payload"]["sections"][0]
+    assert len(section["highlights"]) <= 7 and len(section["meetings"]) == 7 and len(result["payload"]["changes"]) == 7
+    for body in (page, text):
+        assert "+ 2 more on your calendar: Deal 08, Deal 09" in body
+        assert f"+ {len(section['also_active'])} more active in the Sheet: " in body
+        if section["more_followups"]:
+            assert f"+ {section['more_followups']} more on record: Deal " in body
+    shown = {c["deal"] for c in result["payload"]["changes"]}
+    [left] = [l for l in page.split("<") if "more changes on record, not shown: " in l]
+    assert set(left.split(": ")[1].strip().split(", ")) == set(names[:9]) - shown and left.split(">")[1].startswith("+ 2 more")
+    left = [l for l in text.splitlines() if l.startswith("+ ")]
+    assert all(": " in line for line in left)                     # no bare count anywhere
+
+
+# ---- 5. the plain-text part carries the Sheet-date footers and the quiet-batch note
+
 def test_plain_text_carries_the_sheet_date_footers_and_the_quiet_batch_note(brief_client):
     deals = [{**deal("Long Past"), "next_step": "- Send the case study (complete by Oct 1, 2026)"},
              {**deal("Months Out"), "next_step": "- Share the plan (complete by Feb 17, 2027)"}, deal("Quiet")]

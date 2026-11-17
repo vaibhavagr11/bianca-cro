@@ -1045,7 +1045,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             return brief_v2.build_section(
                 code, full, short, views, items, [(m, m.context) for m in meetings if code in m.attendees], today,
                 display, 0 if gate else hidden.get(code, 0), settings.brief_critical_ahead_days,
-                settings.brief_in_talks_target, waiting=shown, more_waiting=more, waiting_candidates=waiting_candidates,
+                settings.brief_in_talks_target, waiting=shown, more_waiting=more,
+                left_waiting=brief_v2.waiting_left_out(waits, code, shown), waiting_candidates=waiting_candidates,
                 sheet_overdue_days=settings.brief_sheet_step_overdue_days, cadence=cadence, max_rows=max_rows,
                 resurface=resurface, resurfaced_recently=resurfaced_recently)
         try:
@@ -1142,9 +1143,10 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                                           _link_for(rec["source"], rec["thread_id"], rec["meta"]), kind,
                                           _event_day(rec, tz), title_only=True,
                                           from_customer=rec["source"] == "gmail" and not other))
-    all_changes = len(changes)
+    every_change = changes
     changes = brief_v2.select_changes(changes, max_rows)
-    more_changes = all_changes - len(changes)
+    more_changes = len(every_change) - len(changes)
+    left_changes = [c.deal for c in every_change if all(c is not shown for shown in changes)]
     backfill_events = [(r, rec) for r, rec, kind in events if kind == "backfill"]
     undated = sorted({deals[str(r["company_id"])]["name"] for r, _, kind in events if kind == "undated"})
     undated_events = sum(1 for _, _, kind in events if kind == "undated")
@@ -1167,7 +1169,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
     client = None if gate else _claude()   # verified builds keep wording stable: deterministic cut only
     display = prepare_table_text(brief_v2.table_text_fields(sections, ndl, changes), client, settings.anthropic_model)
     html_body = brief_v2.render(sections, ndl, changes, today, len(deals), coverage, not NICO_INBOX_CONNECTED,
-                                backfill, action_url, ndl_review, display=display, more_changes=more_changes)
+                                backfill, action_url, ndl_review, display=display, more_changes=more_changes,
+                                left_changes=left_changes)
     text_body = brief_v2.plain_text(sections, today, ndl_review, display=display)
     subj = brief_v2.subject(sections, today)
     to = settings.brief_to or [t["email"] for t in team if t["receives_brief"]]
