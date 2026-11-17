@@ -673,3 +673,31 @@ def test_quiet_in_talks_deals_come_back_three_a_day_longest_untouched_first(monk
     monkeypatch.setattr(brief_api.settings, "brief_resurface_per_day", 0)
     result, founder = build()
     assert founder["resurfaced"] == [] and "Quiet In Talks deals" not in result["html"]
+
+
+# ---- B-07 (11/12): pilots stay in the funnel under a stricter sales-only filter (the Smearcase card)
+
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_pilot_deal_shows_only_items_classified_as_deal_progression(monkeypatch, brief_client, version):
+    product_work = ["Add the store-level export to the dashboard", "Fix the SKU mapping for the pilot stores",
+                    "Build the weekly out-of-stock report"]
+    pricing = "Send pricing for the paid rollout"
+    pilot = {**deal("Smearcase"), "stage": "4. Pilot", "stage_rank": 4}
+    talks = deal("Prospect")
+    insights = [insight(f"legacy-{n}", "Smearcase", text, None) for n, text in enumerate(product_work)]
+    insights += [insight("pricing", "Smearcase", pricing, SALES),
+                 insight("delivery", "Smearcase", "Reset the pilot users' passwords", DELIVERY),
+                 insight("legacy-prospect", "Prospect", "Share the onboarding checklist", None)]
+    profiles = [{"opportunity_id": pilot["id"], "generated_at": NOW, "profile": {
+        "refs": {"I1": "legacy-0"}, "recommended_actions": [
+            {"action": "Ship the export before the pilot review", "evidence": ["I1"], "action_scope": SALES}]}}]
+    client = brief_client(BriefData([pilot, talks], [], insights, profiles))
+    result = client.post(f"/brief/build?dry_run=true&version={version}", headers={"X-Ingest-Token": "test-token"}).json()
+    assert pricing in result["html"] and "Smearcase" in result["html"]          # the pilot is still in the funnel
+    for text in (*product_work, "Reset the pilot users", "Ship the export before the pilot review"):
+        assert text not in result["html"] and text not in result["text"]
+    assert "Share the onboarding checklist" in result["html"]                   # other stages keep legacy items
+
+    monkeypatch.setattr(brief_api.settings, "brief_pilot_strict_scope", False)
+    relaxed = client.post(f"/brief/build?dry_run=true&version={version}", headers={"X-Ingest-Token": "test-token"}).json()
+    assert product_work[0] in relaxed["html"]

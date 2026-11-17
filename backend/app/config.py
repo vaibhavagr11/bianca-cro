@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     brief_critical_ahead_days: int = 3
     # Preferred number of active In Talks deals among the four shown per founder (not a quota).
     brief_in_talks_target: int = 2
+    # Pilot deals show only items the extractor classified as deal progression. Items from before that
+    # classification existed (blank scope) are shown on other deals until re-extracted, but not on Pilots.
+    brief_pilot_strict_scope: bool = True
     # Quiet In Talks deals (no recorded contact in 2+ weeks, nothing else open) come back a few per founder per day,
     # longest-untouched first, and one that was listed is not listed again for the cooldown. 0 turns this off.
     brief_resurface_per_day: int = Field(default=3, ge=0)

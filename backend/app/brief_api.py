@@ -21,7 +21,7 @@ from app.brief_text import prepare_table_text
 from app.config import settings
 from app.gmail import domain
 from app.ingest import _workspace_id, require_token
-from app.pipeline import is_paused, is_working_client, normalize_name
+from app.pipeline import is_paused, is_pilot, is_working_client, normalize_name
 from app.pipeline_freshness import check_fresh_pipeline, require_fresh_pipeline
 from app.process import _claude
 
@@ -96,10 +96,16 @@ def _insight_rows(conn, workspace_id) -> list[dict]:
 
 
 def _scoped_rows(rows: list[dict], deals: dict[str, dict]) -> list[dict]:
-    """Sales items, plus not-yet-scoped ones; only delivery and out-of-scope work is hidden."""
+    """Sales items, plus not-yet-scoped ones; only delivery and out-of-scope work is hidden.
+
+    Pilots are stricter (founders, 11/12: "only truly sales-related items; a missed feature request is fine"):
+    on a Pilot deal a not-yet-scoped item is hidden too, because most of what a pilot generates is product work.
+    """
+    strict = settings.brief_pilot_strict_scope
     return [r for r in rows if r["action_scope"] in extractor.SALES_SCOPES
             and (deal := deals.get(str(r["company_id"]))) is not None
-            and str(deal["id"]) == str(r["opportunity_id"])]
+            and str(deal["id"]) == str(r["opportunity_id"])
+            and not (strict and r["action_scope"] is None and is_pilot(deal["stage"]))]
 
 
 def _email_asks(rows: list[dict]) -> dict[tuple[str, str, str], list[dict]]:
