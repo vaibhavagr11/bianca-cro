@@ -200,20 +200,25 @@ def apply_cancellation_notices(conn: psycopg.Connection, workspace_id, notices: 
     """Mark a stored meeting cancelled when Google's "Canceled event" mail for it arrived after the calendar fetch.
 
     The meeting must have the same title and fall on the same local day. A notice sent before the latest calendar
-    sync is ignored: that sync already read the calendar's own, newer state.
+    sync is ignored: that sync already read the calendar's own, newer state. Each notice runs in its own savepoint:
+    one we cannot apply (a sent time the database cannot read) is logged and skipped, the others still count.
     """
     cancelled = 0
     for title, day, sent_at in notices:
-        cancelled += conn.execute(
-            "update source_records r set meta = r.meta || %s where r.workspace_id = %s and r.source = 'calendar'"
-            " and lower(btrim(r.subject)) = lower(%s)"
-            " and (r.occurred_at at time zone (select timezone from workspaces where id = %s))::date = %s"
-            " and r.meta->>'status' is distinct from 'cancelled'"
-            " and %s::timestamptz > coalesce((select max(started_at) from sync_runs where workspace_id = %s"
-            " and source = 'calendar' and status = 'succeeded'), '-infinity'::timestamptz)",
-            (Jsonb({"status": "cancelled", "cancelled_by": "mail notice", "cancelled_at": sent_at}), workspace_id,
-             title, workspace_id, day, sent_at, workspace_id),
-        ).rowcount
+        try:
+            with conn.transaction():
+                cancelled += conn.execute(
+                    "update source_records r set meta = r.meta || %s where r.workspace_id = %s and r.source = 'calendar'"
+                    " and lower(btrim(r.subject)) = lower(%s)"
+                    " and (r.occurred_at at time zone (select timezone from workspaces where id = %s))::date = %s"
+                    " and r.meta->>'status' is distinct from 'cancelled'"
+                    " and %s::timestamptz > coalesce((select max(started_at) from sync_runs where workspace_id = %s"
+                    " and source = 'calendar' and status = 'succeeded'), '-infinity'::timestamptz)",
+                    (Jsonb({"status": "cancelled", "cancelled_by": "mail notice", "cancelled_at": sent_at}),
+                     workspace_id, title, workspace_id, day, sent_at, workspace_id),
+                ).rowcount
+        except Exception:
+            log.exception("cancellation notice for %s skipped", day)
     return cancelled
 
 
@@ -250,8 +255,13 @@ def ingest_gmail(payload: GmailPayload, x_ingest_token: str | None = Header(defa
                 created, updated, duplicates = store_gmail(conn, workspace_id, kept, payload.mailbox.upper())
                 if duplicates:
                     skipped["already_stored_from_other_inbox"] = duplicates
-                notices = gmail.cancellation_notices(payload.messages)
-                meetings_cancelled = apply_cancellation_notices(conn, workspace_id, notices) if notices else 0
+                meetings_cancelled = 0
+                try:                    # an extra: a notice we cannot read must never fail the mail sync itself
+                    with conn.transaction():
+                        notices = gmail.cancellation_notices(payload.messages)
+                        meetings_cancelled = apply_cancellation_notices(conn, workspace_id, notices) if notices else 0
+                except Exception:
+                    log.exception("gmail sync %s: cancellation notices skipped", run_id)
                 counts = {
                     "created": created,
                     "updated": updated,

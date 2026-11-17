@@ -89,3 +89,41 @@ def _fixture_for_isolation():
 
 def _boom(*_, **__):
     raise RuntimeError("injected failure")
+
+
+def test_one_unreadable_cancellation_notice_does_not_fail_the_mail_sync_or_the_other_notices(monkeypatch):
+    from app import ingest
+    from app.main import app
+    from test_gmail import msg
+
+    class Connection:
+        rowcount = 1
+
+        def execute(self, sql, params=()):
+            if sql.startswith("update source_records r set meta") and params[2] == "Bad time":
+                raise ValueError("invalid input syntax for type timestamp with time zone")
+            return self
+
+        def fetchone(self):
+            return (["bianca-ai.com"],)
+
+        def commit(self):
+            pass
+
+        def transaction(self):
+            return nullcontext()
+
+    monkeypatch.setattr(ingest.db, "connect", lambda: nullcontext(Connection()))
+    monkeypatch.setattr(ingest, "_workspace_id", lambda conn: "workspace")
+    monkeypatch.setattr(ingest, "_start_sync", lambda *args, **kwargs: "run")
+    bad = msg(id="n1", subject="Canceled event: Bad time @ Wed Nov 11, 2026 3pm - 3:30pm (ART) (r@bianca-ai.com)")
+    good = msg(id="n2", subject="Canceled event: Bianca <> Campari @ Wed Nov 11, 2026 3pm - 3:30pm (ART) (r@bianca-ai.com)")
+    response = TestClient(app).post("/ingest/gmail", json={"messages": [bad, good, msg(id="m3")], "mailbox": "RG"},
+                                    headers=HEADERS)
+    assert response.status_code == 200
+    assert response.json()["meetings_cancelled"] == 1 and response.json()["created"] == 1
+
+    monkeypatch.setattr(ingest.gmail, "cancellation_notices", _boom)                # even the reader itself failing
+    response = TestClient(app).post("/ingest/gmail", json={"messages": [good, msg(id="m4")], "mailbox": "RG"},
+                                    headers=HEADERS)
+    assert response.status_code == 200 and response.json()["meetings_cancelled"] == 0

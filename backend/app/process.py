@@ -522,7 +522,10 @@ def build_profiles(payload: ExtractRequest, x_ingest_token: str | None = Header(
             earlier = conn.execute(
                 "select profile from opportunity_profiles where workspace_id = %s and opportunity_id::text = %s"
                 " order by generated_at desc limit 1", (workspace_id, opportunity_id)).fetchone()
-            profiler.keep_wording(data, earlier[0] if earlier else None)
+            try:
+                profiler.keep_wording(data, earlier[0] if earlier else None)
+            except Exception:           # an extra: an odd earlier profile must not cost the deal its new one
+                log.exception("profile wording not carried over for %s", opportunity_id)
             conn.execute(
                 "insert into opportunity_profiles (workspace_id, opportunity_id, profile, insight_ids,"
                 " profiler_version, model) values (%s, %s, %s, %s, %s, %s)",
