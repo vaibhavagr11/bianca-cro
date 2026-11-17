@@ -235,10 +235,11 @@ def test_gmail_ingest_marks_the_stored_meeting_cancelled_only_for_a_notice_newer
                 assert "max(started_at) from sync_runs" in sql and "source = 'calendar'" in sql
                 assert "lower(btrim(r.subject)) = lower(%s)" in sql and sql.count("%s") == len(params)
                 updates.append(params)
+            self.counting = sql.startswith("select count(*) from source_records r")
             return self
 
         def fetchone(self):
-            return (["bianca-ai.com"],)
+            return (1,) if self.counting else (["bianca-ai.com"],)     # one stored meeting has that title and day
 
         def commit(self):
             pass

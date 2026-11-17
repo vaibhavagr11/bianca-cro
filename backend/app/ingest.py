@@ -202,16 +202,26 @@ def apply_cancellation_notices(conn: psycopg.Connection, workspace_id, notices: 
     The meeting must have the same title and fall on the same local day. A notice sent before the latest calendar
     sync is ignored: that sync already read the calendar's own, newer state. Each notice runs in its own savepoint:
     one we cannot apply (a sent time the database cannot read) is logged and skipped, the others still count.
+
+    A notice only names a title and a day. When more than one stored meeting that is still on has that title on
+    that day (two "30 Minute Call" bookings), we cannot tell which one was called off, so none is cancelled: the
+    next calendar fetch settles it. Hiding a meeting that is still on is worse than listing one that is not.
     """
     cancelled = 0
+    same_meeting = ("r.workspace_id = %s and r.source = 'calendar' and lower(btrim(r.subject)) = lower(%s)"
+                    " and (r.occurred_at at time zone (select timezone from workspaces where id = %s))::date = %s"
+                    " and r.meta->>'status' is distinct from 'cancelled'")
     for title, day, sent_at in notices:
         try:
             with conn.transaction():
+                matches = conn.execute(f"select count(*) from source_records r where {same_meeting}",
+                                       (workspace_id, title, workspace_id, day)).fetchone()[0]
+                if matches > 1:
+                    log.warning("cancellation notice for %s matches %s meetings with the same title; none cancelled,"
+                                " waiting for the next calendar fetch", day, matches)
+                    continue
                 cancelled += conn.execute(
-                    "update source_records r set meta = r.meta || %s where r.workspace_id = %s and r.source = 'calendar'"
-                    " and lower(btrim(r.subject)) = lower(%s)"
-                    " and (r.occurred_at at time zone (select timezone from workspaces where id = %s))::date = %s"
-                    " and r.meta->>'status' is distinct from 'cancelled'"
+                    f"update source_records r set meta = r.meta || %s where {same_meeting}"
                     " and %s::timestamptz > coalesce((select max(started_at) from sync_runs where workspace_id = %s"
                     " and source = 'calendar' and status = 'succeeded'), '-infinity'::timestamptz)",
                     (Jsonb({"status": "cancelled", "cancelled_by": "mail notice", "cancelled_at": sent_at}),

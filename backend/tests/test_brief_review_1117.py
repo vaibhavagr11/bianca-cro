@@ -270,10 +270,11 @@ def test_one_unreadable_cancellation_notice_does_not_fail_the_mail_sync_or_the_o
         def execute(self, sql, params=()):
             if sql.startswith("update source_records r set meta") and params[2] == "Bad time":
                 raise ValueError("invalid input syntax for type timestamp with time zone")
+            self.counting = sql.startswith("select count(*) from source_records r")
             return self
 
         def fetchone(self):
-            return (["bianca-ai.com"],)
+            return (1,) if self.counting else (["bianca-ai.com"],)
 
         def commit(self):
             pass
