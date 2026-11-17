@@ -656,7 +656,7 @@ def test_quiet_in_talks_deals_come_back_three_a_day_longest_untouched_first(monk
     assert "last contact Aug 27 (10 weeks ago) · Sheet next step: Reconnect after their reorg" in page
     assert "no email, meeting or note on record" in page
     assert "A few each day, longest-untouched first." in page
-    assert "• Quiet 1 — last contact Aug 27 (10 weeks ago) · Sheet next step: Reconnect after their reorg" in result["text"]
+    assert "• Quiet 1 - last contact Aug 27 (10 weeks ago) · Sheet next step: Reconnect after their reorg" in result["text"]
     for name in ("Quiet 3", "Quiet 4", "Quiet 5"):
         assert f"<b>{name}</b>" not in page
 

@@ -1509,7 +1509,7 @@ def plain_text(sections: list[Section], today: date, ndl_review: VerificationNot
             lines += [f"• [{m.tag}] {display(_move_text(m))} ({m.when})" for m in s.followups]
         if s.resurfaced:
             lines.append(f"Quiet In Talks deals to revisit ({len(s.resurfaced)} of {s.quiet_in_talks})")
-            lines += [f"• {v.deal} — {quiet_line(v, today)}" for v in s.resurfaced]
+            lines += [f"• {v.deal} - {quiet_line(v, today)}" for v in s.resurfaced]
         lines.extend(verification_text(s.verification))
     if ndl_review and (ndl_review.waiting or ndl_review.unclear):
         lines += ["\nNICO DE LEÓN", *verification_text(ndl_review)]
