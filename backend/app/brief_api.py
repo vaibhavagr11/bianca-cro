@@ -840,7 +840,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             sources[f"rec:{ref}"] = brief_review.profile_source(prof, entry, ins_by_id)
         return brief_v2.Note(text, entry.get("why") if with_why else None, verified, entry.get("basis"),
                              link if verified else None, frozenset(str(x["id"]) for x in resolved), source, ref,
-                             followup_only=with_why and entry.get("followup_only") is True)
+                             followup_only=with_why and entry.get("followup_only") is True,
+                             on=when.date() if when else None)
 
     views: dict[str, brief_v2.DealView] = {}
     for company_id, d in deals.items():
@@ -1012,7 +1013,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         changes.append(brief_v2.ChangeRow(d["name"], d["stage_rank"], text,
                                           f"{SOURCE_LABEL.get(r['source'], r['source'])} · {event:%b} {event.day}",
                                           _link_for(r["source"], r["unit_id"], r["meta"]), kind, event,
-                                          title_only=title_only))
+                                          title_only=title_only, from_customer=spk == "customer"))
     seen: set[tuple[str, str]] = set()
     for rec in reversed(new_records):  # plain facts only where nothing was extracted, dated the same way
         key, d = (rec["source"], rec["thread_id"]), deals.get(str(rec["company_id"]))
@@ -1033,11 +1034,15 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             who = f"Email from {other} on this deal" if other else "Customer replied"
             text = f"{who} (nothing new extracted): {rec['subject'] or '(no subject)'}"
         else:
+            other = None
             text = f"Meeting notes added (nothing new extracted): {rec['subject'] or '(no subject)'}"
         changes.append(brief_v2.ChangeRow(d["name"], d["stage_rank"], text, SOURCE_LABEL[rec["source"]],
                                           _link_for(rec["source"], rec["thread_id"], rec["meta"]), kind,
-                                          _event_day(rec, tz), title_only=True))
-    changes = brief_v2.select_changes(changes)
+                                          _event_day(rec, tz), title_only=True,
+                                          from_customer=rec["source"] == "gmail" and not other))
+    all_changes = len(changes)
+    changes = brief_v2.select_changes(changes, max_rows)
+    more_changes = all_changes - len(changes)
     backfill_events = [(r, rec) for r, rec, kind in events if kind == "backfill"]
     undated_events = sum(1 for _, _, kind in events if kind == "undated")
     backfill = None
@@ -1058,7 +1063,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
     client = None if gate else _claude()   # verified builds keep wording stable: deterministic cut only
     display = prepare_table_text(brief_v2.table_text_fields(sections, ndl, changes), client, settings.anthropic_model)
     html_body = brief_v2.render(sections, ndl, changes, today, len(deals), coverage, not NICO_INBOX_CONNECTED,
-                                backfill, action_url, ndl_review, display=display)
+                                backfill, action_url, ndl_review, display=display, more_changes=more_changes)
     text_body = brief_v2.plain_text(sections, today, ndl_review, display=display)
     subj = brief_v2.subject(sections, today)
     to = settings.brief_to or [t["email"] for t in team if t["receives_brief"]]
@@ -1070,6 +1075,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                                 "event": _event_day(rec, tz).isoformat(),
                                 "stored": rec["created_at"].astimezone(tz).isoformat(), "class": kind}
                                for r, rec, kind in events]
+    payload["more_changes"] = more_changes
     payload["change_cutoff"] = since.astimezone(tz).isoformat()
     log.info("brief v2 built for %s: items=%s changes=%s dry_run=%s", today, len(items), len(changes), dry_run)
     response = {"subject": subj, "html": html_body, "text": text_body, "to": ",".join(to), "for_date": today.isoformat(),

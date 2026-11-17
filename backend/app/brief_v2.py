@@ -28,7 +28,6 @@ MAX_WAITING = 6
 MAX_TABLE_ROWS = 7            # founders (11/12): 4 to 7 things per table; more only makes them stop reading
 IN_TALKS_RANK = 2
 REQUEST_FRESH_DAYS = 21       # a customer request this recent still counts as outstanding
-CHANGE_QUOTA = {0: 3, 1: 2, 2: 0}  # what changed: prospects/pilots, customers, other
 PROSPECT_RANKS, CUSTOMER_RANK = (1, 2, 3, 4), 5
 CHANGE_TYPES = {"buying_signal": "Buying signal", "blocker": "New blocker", "objection": "Objection",
                 "commitment": "New commitment", "next_step": "Next step noted", "need": "New need"}
@@ -70,6 +69,7 @@ class Note:
     source: str = ""                # newest cited evidence, e.g. "Notes · Oct 20"
     ref: str | None = None          # stable id of a suggestion, so a founder can dismiss it
     followup_only: bool = False
+    on: date | None = None          # day of the newest evidence it cites
 
 
 @dataclass
@@ -160,6 +160,7 @@ class ChangeRow:
     kind: str = "new"               # new | late | sheet
     event: date | None = None       # when it happened (from the source, not when we stored it)
     title_only: bool = False        # only the subject/title is established, not what was agreed
+    from_customer: bool = False     # the customer wrote it: a reply is the first thing a founder wants to see
 
 
 @dataclass
@@ -529,6 +530,12 @@ def primary_move(d: DealView, today: date, used: set[str]) -> Move:
         for r in d.recommendations:
             if r.verified and addresses(r.evidence, b):
                 return note_move("AI recommendation", r.text, _last(d, today), r, r.link)
+        if d.last_reply and b.on and d.last_reply > b.on:
+            # The customer has written since this blocker was recorded; the profile was not rebuilt because nothing
+            # new was extracted from the reply, so do not present the old blocker as untouched.
+            return Move("Clarify next action", f"The customer replied on {_date(d.last_reply)}, after this blocker "
+                        f"was recorded - read the reply and check whether it still stands",
+                        _last(d, today), b.link, None, b.source)
         return Move("Clarify next action", "No recorded action or suggestion addresses this blocker yet",
                     _last(d, today), b.link, None, b.source)
     for i in sorted((i for i in open_items if i.kind == "owed" and i.bucket in ("overdue", "week")),
@@ -691,15 +698,16 @@ def change_group(rank: int | None) -> int:
     return 0 if rank in (2, 3, 4) else 1 if rank == CUSTOMER_RANK else 2
 
 
-def select_changes(changes: list[ChangeRow]) -> list[ChangeRow]:
-    """Keep input order inside each group; prospects and pilots first, with a reserved share for customers."""
-    out, used = [], {0: 0, 1: 0, 2: 0}
-    for c in sorted(changes, key=lambda c: (change_group(c.rank), c.kind != "new")):  # new before late in each group
-        g = change_group(c.rank)
-        if used[g] < CHANGE_QUOTA[g]:
-            out.append(c)
-            used[g] += 1
-    return out
+def select_changes(changes: list[ChangeRow], limit: int = MAX_TABLE_ROWS) -> list[ChangeRow]:
+    """The first `limit` changes: In Talks, Proposal and Pilot deals first, then customers, then Opening and Paused.
+
+    Inside each group: what happened since the last brief before what was recorded late, and what the customer
+    wrote before the rest, so a customer's reply is not pushed out by our own notes. The caller prints how many
+    were left out. (Until 11/17 this kept 3 + 2 + 0 rows per group, which dropped replies on busy days and every
+    change on an Opening deal.)
+    """
+    ranked = sorted(changes, key=lambda c: (change_group(c.rank), c.kind != "new", not c.from_customer))
+    return ranked[:limit]
 
 
 # ---------------------------------------------------------------- assembly (pure)
@@ -1410,7 +1418,7 @@ def completable(sections: list[Section], ndl_rows: list[TodayRow]) -> dict[str, 
 
 def render(sections: list[Section], ndl_rows: list[TodayRow], changes: list[ChangeRow], today: date,
            active_deals: int, coverage: str, nico_gap: bool, backfill: str | None = None, action_url=None,
-           ndl_review: VerificationNotes | None = None, *, display=read_table_text) -> str:
+           ndl_review: VerificationNotes | None = None, *, display=read_table_text, more_changes: int = 0) -> str:
     """action_url(ref) -> link for a row's "Mark as complete" button; None leaves the buttons out."""
     counts = " · ".join(f"{s.short}: {len(s.today) + s.more_today} today, {len(s.highlights)} deals" for s in sections)
     out = [_stage_css(), f'<div class="bianca-brief" style="max-width:760px;margin:0 auto;padding:8px 4px">',
@@ -1427,12 +1435,14 @@ def render(sections: list[Section], ndl_rows: list[TodayRow], changes: list[Chan
                                + _td(_muted(_e(r.when))) + _td(_src(r.source))
                                + (_td(_done(r.done, action_url)) if action_url else "") + "</tr>" for r in ndl_rows]))
         out.append(verification_html(ndl_review))
-    out.append(_h("What changed since the last brief", MUTED, len(changes)))
+    out.append(_h("What changed since the last brief", MUTED, len(changes) + more_changes))
     out.append(_table(_th("Deal", "20%") + _th("What changed (from the source)") + _th("Source", "12%"),
                       ["<tr>" + _td(f"<b>{_e(c.deal)}</b>")
                        + _td(f"{_e(display(_change_text(c)))} {_muted(_e(change_label(c)))}")
                        + _td(_src(f"{c.source} · {_date(c.event)}" if c.event else c.source)) + "</tr>" for c in changes])
                 if changes else _empty("No notable changes."))
+    if more_changes:
+        out.append(_left_out(f"+ {more_changes} more changes on record, not shown"))
     if backfill:
         out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">{_e(backfill)}</p>')
     out.append(f'<p style="font:11px {FONT};color:#98a2b3;margin-top:28px">{_e(coverage)} <b>We owe</b> = recorded '

@@ -259,10 +259,19 @@ def test_new_insight_requires_its_quote_in_a_newly_stored_record():
     assert not is_new_insight("old quote", "only new text")
 
 
-def test_changes_reserve_room_for_customers():
-    rows = [ChangeRow(f"P{n}", 3, "x", "Email", None) for n in range(9)] + [ChangeRow("Koala", 5, "Buying signal", "Notes", None)]
+def test_changes_show_up_to_seven_rows_prospects_first_and_customer_replies_before_our_own_notes():
+    # Until 11/17 this kept 3 prospect rows + 2 reserved for working clients (who are no longer in the brief at all)
+    # and none for Opening deals, so a customer's reply could vanish on a busy day (finding 14, Campari).
+    rows = [ChangeRow(f"P{n}", 3, "Next step noted: x", "Email", None) for n in range(6)]
+    rows += [ChangeRow("Opening Co", 1, "Customer replied: hello", "Email", None, from_customer=True),
+             ChangeRow("Campari", 4, "Customer replied (nothing new extracted): Re: pilot", "Email", None,
+                       from_customer=True),
+             ChangeRow("Late Co", 3, "Buying signal", "Notes", None, "late")]
     picked = select_changes(rows)
-    assert len(picked) == 4 and "Koala" in [c.deal for c in picked]
+    assert [c.deal for c in picked] == ["Campari", "P0", "P1", "P2", "P3", "P4", "P5"]
+    assert [c.deal for c in select_changes(rows, limit=9)][-2:] == ["Late Co", "Opening Co"]
+    html = render([], [], picked, TODAY, 0, "c", False, more_changes=2)
+    assert "What changed since the last brief (9)" in html and "+ 2 more changes on record, not shown" in html
 
 
 def test_subject_and_meetings():
@@ -923,3 +932,16 @@ def test_waiting_statement_or_no_reply_blocker_is_never_a_deal_to_move():
         "Campari: 7 days since your last email - follow up this week (re: the proposal)."]
     page = render([s], [], [], TODAY, 2, "c", False)
     assert "No reply since" not in page and "Wait for Franco" not in page and "has not replied" not in page
+
+
+# ---- finding 14 (11/09 evals): Campari replied Tue; Wed still said "no recorded action addresses this blocker"
+
+def test_blocker_older_than_the_customers_latest_reply_is_not_presented_as_untouched():
+    blocker = Note("Franco must confirm the On Premise data owner", verified=True, source="Email · Oct 21",
+                   on=date(2026, 10, 21))
+    stale = view("Campari", 4, owner="RG", blocker=blocker, last_reply=date(2026, 10, 27))
+    move = primary_move(stale, TODAY, set())
+    assert (move.tag, move.text) == ("Clarify next action", "The customer replied on Oct 27, after this blocker was "
+                                     "recorded - read the reply and check whether it still stands")
+    quiet = view("Campari", 4, owner="RG", blocker=blocker, last_reply=date(2026, 10, 20))
+    assert primary_move(quiet, TODAY, set()).text == "No recorded action or suggestion addresses this blocker yet"
