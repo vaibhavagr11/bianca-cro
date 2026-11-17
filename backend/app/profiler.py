@@ -4,6 +4,7 @@ Statements are 'confirmed' (directly stated in the cited insights) or 'inferred'
 Unknowns list what the evidence does not say. Code checks citations: a statement citing nothing real is dropped.
 """
 
+import re
 from typing import Literal
 
 import anthropic
@@ -183,3 +184,40 @@ def generate(client: anthropic.Anthropic, model: str, body: str, *, stage: str |
     if response.stop_reason == "refusal" or response.parsed_output is None:
         raise ValueError(f"no profile (stop_reason={response.stop_reason})")
     return response.parsed_output
+
+
+_WORDING_STOP = frozenset("the a an to of for and with on in at by from about their our this that them they "
+                          "bianca customer buyer el la los las de del para con y".split())
+
+
+def _meaning(text: str) -> set[str]:
+    return {w for w in re.findall(r"[^\W_]{3,}", text.casefold()) if w not in _WORDING_STOP}
+
+
+def keep_wording(data: dict, previous: dict | None) -> int:
+    """Reuse the previous profile's wording for a suggestion that is the same suggestion. Returns how many.
+
+    Every regeneration rewords recommended_actions, so the brief showed different text day to day for one
+    source, and a founder's "Done" (stored against the wording) stopped matching and the row came back. A
+    suggestion counts as the same when it cites exactly the same insights as one previous suggestion and shares
+    at least half of its meaningful words with it. A suggestion that cites the same insights but now says
+    something else (the next step moved on) keeps its new wording.
+    """
+    if not previous:
+        return 0
+    old_refs, new_refs = previous.get("refs") or {}, data.get("refs") or {}
+    earlier: dict[frozenset, list[dict]] = {}
+    for action in previous.get("recommended_actions") or []:
+        key = frozenset(str(old_refs.get(ref, ref)) for ref in action.get("evidence") or [])
+        earlier.setdefault(key, []).append(action)
+    kept = 0
+    for action in data.get("recommended_actions") or []:
+        key = frozenset(str(new_refs.get(ref, ref)) for ref in action.get("evidence") or [])
+        same = earlier.get(key) or []
+        if len(same) != 1 or not key:
+            continue
+        before, now = _meaning(same[0].get("action") or ""), _meaning(action.get("action") or "")
+        if before and now and len(before & now) * 2 >= len(before | now) and same[0]["action"] != action["action"]:
+            action["action"] = same[0]["action"]
+            kept += 1
+    return kept
