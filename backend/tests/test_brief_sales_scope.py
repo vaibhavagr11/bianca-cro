@@ -579,3 +579,46 @@ def test_waiting_deal_with_only_waiting_statements_has_no_deals_to_move_row(monk
         assert body.count("farmater") == 1               # one row: the Waiting row
         for leak in ("No reply since", "Wait for the buyer", "Keep following up", "Check where this deal stands"):
             assert leak not in body
+
+
+# ---- B-09 (11/12): no table longer than 7 rows, and nothing left out silently
+
+@pytest.mark.parametrize("verification", ["off", "shadow"])
+def test_no_table_lists_more_than_seven_rows_and_says_how_many_were_left_out(monkeypatch, brief_client, verification):
+    monkeypatch.setattr(brief_api, "create_gate", lambda *_: PassingGate())
+    names = [f"Deal {n:02d}" for n in range(1, 10)]
+    deals = [deal(name) for name in names]
+    insights = [insight(f"promise-{name}", name, f"Send the proposal to {name}", SALES) for name in names]
+    waits = []
+    for name in names:
+        ask = email(f"ask-{name}", name, "Can you approve the proposal?", days=8, outgoing=True)
+        waits.append(ask)
+    meetings = [_meeting(f"Call {n}", name, hours=n) for n, name in enumerate(names, start=1)]
+    client = brief_client(BriefData(deals, waits, insights, [], meetings=meetings))
+    result = client.post(f"/brief/build?dry_run=true&version=v2&verification={verification}",
+                         headers={"X-Ingest-Token": "test-token"}).json()
+    founder = result["payload"]["sections"][0]
+    assert len(founder["today"]) == 7 and founder["more_today"] == 2
+    assert len(founder["highlights"]) <= 7 and len(founder["followups"]) <= 7
+    assert len(founder["meetings"]) == 7 and founder["more_meetings"] == 2
+    assert len(founder["waiting"]) <= 7
+    assert len(founder["waiting"]) + founder["more_waiting"] == (9 if verification == "off" else len(founder["waiting"]))
+    assert "Ramiro 9 today" in result["subject"]
+    page = html.unescape(result["html"])
+    assert "Needs you today (9)" in page and "+ 2 more need you today - left out to keep this table to 7 rows" in page
+    assert "+ 2 more on your calendar" in page
+    if verification == "off":
+        assert "+ 3 more in the Sheet waiting on a reply" in page
+    assert "+ 2 more need you today - left out to keep this table to 7 rows" in result["text"]
+    for table in page.split("<table")[1:]:
+        assert table.split("</table>")[0].count("<tr>") - 1 <= 7        # header row aside
+
+
+def test_table_limit_is_a_setting(monkeypatch, brief_client):
+    monkeypatch.setattr(brief_api.settings, "brief_max_table_rows", 4)
+    names = [f"Deal {n}" for n in range(1, 7)]
+    insights = [insight(f"promise-{name}", name, f"Send the proposal to {name}", SALES) for name in names]
+    result = brief_client(BriefData([deal(name) for name in names], [], insights, [])).post(
+        "/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"}).json()
+    founder = result["payload"]["sections"][0]
+    assert len(founder["today"]) == 4 and founder["more_today"] == 2 and len(founder["highlights"]) <= 4

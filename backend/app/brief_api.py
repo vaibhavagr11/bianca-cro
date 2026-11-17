@@ -929,7 +929,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
 
     names = {t["owner_code"]: t["full_name"] for t in team}
     waits = list(waiting.values())
-    picked_waits = {code: brief_v2.pick_waiting(waits, code) for code in FOUNDER_ORDER}
+    max_rows = settings.brief_max_table_rows
+    picked_waits = {code: brief_v2.pick_waiting(waits, code, max_rows) for code in FOUNDER_ORDER}
     sections = []
     for code in FOUNDER_ORDER:
         short, full = DISPLAY.get(code, (code, names.get(code, code)))
@@ -938,7 +939,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             code, full, short, views, items, [(m, m.context) for m in meetings if code in m.attendees], today, display,
             0 if gate else hidden.get(code, 0), settings.brief_critical_ahead_days, settings.brief_in_talks_target,
             waiting=shown, more_waiting=more, waiting_candidates=waiting_candidates,
-            sheet_overdue_days=settings.brief_sheet_step_overdue_days, cadence=cadence))
+            sheet_overdue_days=settings.brief_sheet_step_overdue_days, cadence=cadence, max_rows=max_rows))
 
     ndl = [brief_v2.TodayRow(i.deal, views[i.deal].stage, "Due now", i.text, f"due {i.due:%b} {i.due.day}", "Nico DL",
                              i.link, i.id, i.source, f"insight:{i.id}")
@@ -957,6 +958,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
     for s in sections:
         s.meetings = [(m, prep or brief_v2.meeting_prep(m, s, views.get(m.deal), today, checked=gate is not None))
                       for m, prep in s.meetings]
+        brief_v2.cap_tables(s, max_rows)    # after the check, so rows that passed it fill the tables
 
     changes: list[brief_v2.ChangeRow] = []
     for ch in stage_changes:

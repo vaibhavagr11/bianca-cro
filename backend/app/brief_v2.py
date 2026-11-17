@@ -25,6 +25,7 @@ PROPOSAL_FOLLOWUP_DAYS = (7, 30)   # our proposal with no reply after this many 
 UNDATED_WINDOW_DAYS = 45
 MAX_HIGHLIGHTS, MAX_FOLLOWUPS, MAX_EXCEPTIONS, MAX_NAMES = 6, 3, 1, 3
 MAX_WAITING = 6
+MAX_TABLE_ROWS = 7            # founders (11/12): 4 to 7 things per table; more only makes them stop reading
 IN_TALKS_RANK = 2
 REQUEST_FRESH_DAYS = 21       # a customer request this recent still counts as outstanding
 CHANGE_QUOTA = {0: 3, 1: 2, 2: 0}  # what changed: prospects/pilots, customers, other
@@ -414,10 +415,11 @@ def waiting_on_them(thread: list[dict], internal: set[str], now: datetime) -> di
             "auto_reply": any(m["automated"] and m["at"] > last["at"] for m in thread)}
 
 
-def pick_waiting(waiting: list[Waiting], code: str) -> tuple[list[Waiting], int]:
+def pick_waiting(waiting: list[Waiting], code: str, limit: int = MAX_TABLE_ROWS) -> tuple[list[Waiting], int]:
     """This founder's waits: prospects and pilots first, then the most recent silence (still worth a nudge)."""
     mine = sorted((w for w in waiting if w.owner == code), key=lambda w: (w.rank not in PROSPECT_RANKS, w.days, w.deal))
-    return mine[:MAX_WAITING], max(0, len(mine) - MAX_WAITING)
+    shown = min(MAX_WAITING, limit)
+    return mine[:shown], max(0, len(mine) - shown)
 
 
 def waiting_text(w: Waiting) -> str:
@@ -736,6 +738,21 @@ class Section:
     sheet_later: list[tuple[str, date]] = field(default_factory=list)   # (deal, date) of dated Sheet steps not yet due
     sheet_stale: list[tuple[str, date]] = field(default_factory=list)   # (deal, date) of Sheet dates long past
     held: int = 0                   # extracted items waiting for the Sheet date a founder gave them
+    more_today: int = 0             # rows that need the founder today but did not fit the table
+    more_meetings: int = 0
+
+
+def cap_tables(section: Section, limit: int = MAX_TABLE_ROWS) -> Section:
+    """Keep Needs you today and Meetings to `limit` rows each and count what was left out.
+
+    Nothing is dropped silently: the count is printed under the table. Run this after the pre-send check, so the
+    rows that survive it fill the table. The other tables are capped where they are built.
+    """
+    section.more_today += max(0, len(section.today) - limit)
+    section.today = section.today[:limit]
+    section.more_meetings += max(0, len(section.meetings) - limit)
+    section.meetings = section.meetings[:limit]
+    return section
 
 
 def _without_waiting_action(view: DealView, waiting: Waiting) -> DealView:
@@ -877,7 +894,7 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                   hidden: int = 0, critical_ahead: int = 3, in_talks_target: int = 2, *,
                   waiting: list[Waiting] | None = None, more_waiting: int = 0,
                   waiting_candidates: list[Waiting] | None = None, sheet_overdue_days: int = 14,
-                  cadence: Cadence = Cadence()) -> Section:
+                  cadence: Cadence = Cadence(), max_rows: int = MAX_TABLE_ROWS) -> Section:
     mine: dict[str, DealView] = {}
 
     def view(deal: str) -> DealView:
@@ -974,7 +991,8 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
         primary_moves[v.deal] = move
         highlight_views.append(v)
 
-    selected, audit = select_deals(highlight_views, today, in_today, critical_ahead, in_talks_target)
+    selected, audit = select_deals(highlight_views, today, in_today, critical_ahead, in_talks_target,
+                                   slots=min(MAX_HIGHLIGHTS, max_rows))
     for v in sorted(owned, key=lambda v: v.deal):  # the audit also explains prospects that were not eligible at all
         if v.deal in followup_only:
             audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
@@ -1014,7 +1032,7 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                     i.kind in ("customer_request", "next_step") and i.bucket not in ("stale", "old_undated")):
                 if not v.unanswered or i.id != v.unanswered.item_id:
                     follow.append(recorded_move(i, f"{v.deal}: {i.text}"))
-    follow_shown = follow[:MAX_FOLLOWUPS]
+    follow_shown = follow[:min(MAX_FOLLOWUPS, max_rows)]
     used |= {m.item_id for m in follow_shown if m.item_id}
 
     # Status to confirm: owned prospects/pilots not shown whose last record is 15-45 days old (or missing).
@@ -1183,6 +1201,11 @@ def _table(head: str, rows: list[str]) -> str:
             f"<tr>{head}</tr>{''.join(rows)}</table>")
 
 
+def _left_out(text: str) -> str:
+    """The line under a table that says how many rows it does not show."""
+    return f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">{_e(text)}</p>'
+
+
 def _src(source: str | None) -> str:
     """Where a row comes from and when, as plain text: "Email · Oct 6", "Notes · Sep 28"."""
     return f'<span style="white-space:nowrap">{_muted(_e(source))}</span>' if source else _muted("—")
@@ -1239,12 +1262,15 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, 
     done_td = (lambda ref: _td(_done(ref, action_url))) if action_url else (lambda ref: "")
     out = [f'<p style="margin:24px 0 0;padding:6px 10px;background:#f2f4f7;border-left:3px solid {BLUE};'
            f'font:600 14px {FONT};color:{INK}">{_e(s.name)}</p>']
-    out.append(_h("Needs you today", RED, len(s.today)))
+    out.append(_h("Needs you today", RED, len(s.today) + s.more_today))
     out.append(_table(_th("Deal", "20%") + _th("What") + _th("When", "13%") + _th("Source", "12%") + done_th,
                       ["<tr>" + _td(_deal_cell(r.deal, r.stage))
                        + _td(f"{_tag(r.tag)} {_e(display(_what_text(r)))}") + _td(_muted(_e(r.when))) + _td(_src(r.source))
                        + done_td(r.done) + "</tr>"
                        for r in s.today]) if s.today else _empty("Nothing due now or waiting on your reply."))
+    if s.more_today:
+        out.append(_left_out(f"+ {s.more_today} more need you today - left out to keep this table to "
+                             f"{len(s.today)} rows"))
 
     out.append(_h("Deals to Move", PURPLE))
     if s.highlights:
@@ -1260,7 +1286,7 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, 
     else:
         out.append(_empty("No active prospect or pilot needs attention."))
     if s.also_active:
-        out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">Also active: {_e(", ".join(s.also_active))}</p>')
+        out.append(_left_out(f"+ {len(s.also_active)} more active in the Sheet: {', '.join(s.also_active)}"))
 
     if s.waiting:
         out.append(_h("Waiting on their reply", AMBER, len(s.waiting) + s.more_waiting))
@@ -1269,10 +1295,12 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, 
                            + _td(_muted(_e(f"{w.days}d since {_date(w.sent)}"))) + _td(_src(w.source))
                            + done_td(f"thread:{w.thread_id}" if w.thread_id else None) + "</tr>" for w in s.waiting]))
         if s.more_waiting:
-            out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">+ {s.more_waiting} more on record</p>')
+            out.append(_left_out(f"+ {s.more_waiting} more in the Sheet waiting on a reply"))
 
-    out.append(_h("Meetings today & tomorrow", BLUE, len(s.meetings)))
+    out.append(_h("Meetings today & tomorrow", BLUE, len(s.meetings) + s.more_meetings))
     out.append(meetings_table(s.meetings, display=display) if s.meetings else _empty("No customer meetings today or tomorrow."))
+    if s.more_meetings:
+        out.append(_left_out(f"+ {s.more_meetings} more on your calendar"))
 
     if s.followups:
         out.append(_h("Follow-ups that may be needed", AMBER, len(s.followups) + s.more_followups))
@@ -1352,7 +1380,7 @@ def render(sections: list[Section], ndl_rows: list[TodayRow], changes: list[Chan
            active_deals: int, coverage: str, nico_gap: bool, backfill: str | None = None, action_url=None,
            ndl_review: VerificationNotes | None = None, *, display=read_table_text) -> str:
     """action_url(ref) -> link for a row's "Mark as complete" button; None leaves the buttons out."""
-    counts = " · ".join(f"{s.short}: {len(s.today)} today, {len(s.highlights)} deals" for s in sections)
+    counts = " · ".join(f"{s.short}: {len(s.today) + s.more_today} today, {len(s.highlights)} deals" for s in sections)
     out = [_stage_css(), f'<div class="bianca-brief" style="max-width:760px;margin:0 auto;padding:8px 4px">',
            f'<p style="font:600 18px {FONT};margin:0 0 2px;color:{INK}">Pipeline brief · {_e(f"{today:%a}, {today:%b} {today.day}")}</p>',
            f'<p style="font:13px {FONT};margin:0;color:{MUTED}">{_e(counts)} · {active_deals} deals in the Sheet</p>']
@@ -1381,7 +1409,7 @@ def render(sections: list[Section], ndl_rows: list[TodayRow], changes: list[Chan
 
 
 def subject(sections: list[Section], today: date) -> str:
-    bits = [f"{s.short} {len(s.today)} today, {len(s.highlights)} deals" for s in sections]
+    bits = [f"{s.short} {len(s.today) + s.more_today} today, {len(s.highlights)} deals" for s in sections]
     return f"Bianca pipeline · {today:%a}, {today:%b} {today.day} · " + " · ".join(bits)
 
 
@@ -1389,8 +1417,10 @@ def plain_text(sections: list[Section], today: date, ndl_review: VerificationNot
                display=read_table_text) -> str:
     lines = [f"Pipeline brief · {today:%a}, {today:%b} {today.day}"]
     for s in sections:
-        lines.append(f"\n{s.name.upper()}\nNeeds you today ({len(s.today)})")
+        lines.append(f"\n{s.name.upper()}\nNeeds you today ({len(s.today) + s.more_today})")
         lines += [f"• [{r.tag}] {r.deal} — {display(_what_text(r))} ({r.when})" for r in s.today]
+        if s.more_today:
+            lines.append(f"+ {s.more_today} more need you today - left out to keep this table to {len(s.today)} rows")
         lines.append("Deals to Move")
         lines += [f"• {v.deal} ({stage_short(v.stage)}): [{m.tag}] {display(_move_text(m))} ({m.when})"
                   for v, m, _ in s.highlights]
@@ -1400,6 +1430,8 @@ def plain_text(sections: list[Section], today: date, ndl_review: VerificationNot
         if s.meetings:
             lines.append("Meetings today & tomorrow")
             lines += [f"• {m.at:%a %H:%M} {title} — {prep}" for m, title, prep in meeting_text_rows(s.meetings, display)]
+            if s.more_meetings:
+                lines.append(f"+ {s.more_meetings} more on your calendar")
         if s.followups:
             lines.append(f"Follow-ups that may be needed ({len(s.followups) + s.more_followups})")
             lines += [f"• [{m.tag}] {display(_move_text(m))} ({m.when})" for m in s.followups]
@@ -1421,6 +1453,7 @@ def to_payload(sections: list[Section], ndl_rows: list[TodayRow], changes: list[
         "owner": s.code,
         "today": [{"deal": r.deal, "tag": r.tag, "text": r.text, "when": r.when, "item_id": r.item_id,
                    "source": r.source} for r in s.today],
+        "more_today": s.more_today, "more_meetings": s.more_meetings,
         "sheet_later": [{"deal": deal, "due": due} for deal, due in s.sheet_later],
         "sheet_stale": [{"deal": deal, "due": due} for deal, due in s.sheet_stale],
         "highlights": [{"deal": v.deal, "stage": v.stage, "situation": sit.text if sit else None, "move": move(m)}

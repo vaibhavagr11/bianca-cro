@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     brief_critical_ahead_days: int = 3
     # Preferred number of active In Talks deals among the four shown per founder (not a quota).
     brief_in_talks_target: int = 2
+    # No table in the brief lists more than this many rows; what is left out is counted on a line under the table.
+    brief_max_table_rows: int = Field(default=7, gt=0)
     # Follow-up cadence while a customer has not answered: one "follow up this week" nudge per deal every this many
     # days since our last email, and after this many of our emails in a row with no reply, suggest Paused instead.
     brief_nudge_every_days: int = Field(default=7, gt=0)
