@@ -370,6 +370,7 @@ def patch(src_html: str, demo: bool) -> str:
     s = s.replace('<h3>Current sheet context</h3><div class="rotation-row"><span class="rotation-name">Next Step</span>',
                   '<h3>What will happen in the Sheet copy</h3><div class="rotation-row"><span class="rotation-name" id="rotation-last-name">Last progress &#8592;</span><span class="rotation-content" id="rotation-last-progress">the current Next Step (when Next Step bullets are approved)</span></div><div class="rotation-row"><span class="rotation-name" id="rotation-next-name">Next Step (now, replaced)</span>', 1)
     s = s.replace('<span>Approve sends actions and blockers to “Next Step,” and needs, signals, and objections to “Client Context.”</span>', '<span>Approve or edit to update Pipeline Next Steps.</span>')
+    s = s.replace('<p class="rotation-explain">', '<p class="rotation-explain" id="rotation-explain">', 1)  # rewritten per write mode
     # 5b. Next Step editor: one row per step (text + date); the original textarea stays as the hidden value the page submits
     assert s.count('<textarea class="editor" id="edit-content"') == 1
     s = s.replace('<textarea class="editor" id="edit-content"', '<textarea class="editor" id="edit-content" hidden', 1)
