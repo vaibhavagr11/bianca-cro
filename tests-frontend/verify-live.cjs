@@ -240,7 +240,7 @@ test('Header and cards follow the connected Pipeline Sheet and clear invalid or 
   }
 });
 
-test('Company cards display escaped source labels in closed disclosures without exposing source quotes',async()=>{
+test('Company cards display escaped source labels as plain lines without exposing source quotes',async()=>{
   const s=snapshot();
   s.proposals[0].sources=[
     {id:'email-scope',type:'Meeting notes',date:'2026-09-28',subject:'Pilot notes',quote:'Notes quotation.'},
@@ -255,7 +255,8 @@ test('Company cards display escaped source labels in closed disclosures without 
     ['Pilot notes','Source: Notes, Sep 28'],
     ['Review request','Source: Email, Oct 6'],
     ['&lt;script&gt;Calendar','Source: Calendar, Oct 7']
-  ])assert.ok(card.includes(`<details><summary><span>${title}</span><span class="src">${label}</span></summary><div class="ctx">${title}</div></details>`),label);
+  ])assert.ok(card.includes(`<li class="plain"><span>${title}</span><span class="src">${label}</span></li>`),label);
+  assert.equal(card.includes('<div class="ctx">'),false,'A source with nothing more to show is a plain line, not an empty dropdown.');
   for(const source of s.proposals[0].sources)assert.equal(card.includes(source.quote),false);
   assert.equal(card.includes('Fourth excerpt.'),false);
   assert.equal(card.includes('<img src=x>'),false);
@@ -273,7 +274,7 @@ test('Current Next steps is a collapsed native dropdown using the latest matchin
   const details=card.match(/<details[^>]*class="current-next-steps"[^>]*>([\s\S]*?)<\/details>/);
   assert.ok(details,'Current Next steps uses a native details element.');
   assert.equal(/\sopen(?:[\s=>])/.test(details[0].slice(0,details[0].indexOf('>'))),false);
-  assert.ok(details[1].includes('<summary>Current Sheet cells</summary>'));
+  assert.ok(details[1].includes('<summary>Current Sheet cells<span class="cells-hint">Next step, Last progress and Client Context as they are now</span></summary>'));
   assert.ok(details[1].includes('<h4>Next step (now)</h4>'));
   assert.ok(details[1].includes('- Current action &amp; details.\n- &lt;img src=x&gt; Follow up.'));
   assert.equal(card.includes('Outdated proposal context'),false);
@@ -652,7 +653,7 @@ test('Cards show separate destination sections and read-only current Client Cont
   assert.ok(card.includes('Suggested next steps'));
   assert.ok(card.includes('data-destination="nextStep"'));
   assert.ok(card.includes('data-destination="clientContext"'));
-  assert.ok(card.includes('<summary>Current Sheet cells</summary>'));
+  assert.ok(card.includes('<summary>Current Sheet cells<span class="cells-hint">Next step, Last progress and Client Context as they are now</span></summary>'));
   assert.ok(card.includes('<h4>Client context (now)</h4>'));
   assert.ok(card.includes('- Current context &amp; details.\n- &lt;img src=x&gt; Escaped.'));
   assert.equal(card.includes('Older proposal context'),false);
@@ -772,11 +773,11 @@ test('The source-selection handler highlights only associated bullets without a 
   assert.equal(writes,0);
 });
 
-test('Same-date sources remain distinct native disclosures with descriptive summaries',async()=>{
+test('Same-date sources with different subjects remain distinct lines',async()=>{
   const page=fakePage({callTool:async()=>({structuredContent:tracedWorkspace()})});await new Promise(resolve=>setImmediate(resolve));
   const card=articleHtml(page);
-  assert.ok(card.includes('<details><summary><span>Revised store list</span><span class="src">Source: Email, Nov 2</span></summary>'));
-  assert.ok(card.includes('<details><summary><span>Launch confirmation</span><span class="src">Source: Email, Nov 2</span></summary>'));
+  assert.ok(card.includes('<li class="plain"><span>Revised store list</span><span class="src">Source: Email, Nov 2</span></li>'));
+  assert.ok(card.includes('<li class="plain"><span>Launch confirmation</span><span class="src">Source: Email, Nov 2</span></li>'));
   sourceClick(page,'p-1','email-b');
   const selected=articleHtml(page);
   assert.equal(highlighted(selected,'action-codes'),false);
@@ -1119,5 +1120,20 @@ test('Disconnecting while a save is in flight leaves no stuck saving state',asyn
   assert.equal(page.get('#save-approve').disabled,false);
   assert.equal(page.get('#save-approve').textContent,'Save & approve');
 });
+test('Messages of one thread on one day show as a single What\'s new line',async()=>{
+  const s=snapshot();
+  s.proposals[0].sources=[
+    {id:'m-1',type:'Email',date:'2026-11-16',subject:'Re: Ramiro <> Allison',quote:'First passage.'},
+    {id:'m-2',type:'Email',date:'2026-11-16',subject:'Re: Ramiro <> Allison',quote:'Second passage.'},
+    {id:'n-1',type:'Meeting notes',date:'2026-11-05',subject:'Freestyle Snacks',quote:'Notes passage.'}
+  ];
+  const page=fakePage({callTool:async()=>({structuredContent:s})});
+  await new Promise(resolve=>setImmediate(resolve));
+  const card=page.get('#review-list').innerHTML;
+  assert.equal(card.split('<span>Re: Ramiro &lt;&gt; Allison</span>').length-1,1);
+  assert.ok(card.includes('<li class="plain"><span>Freestyle Snacks</span><span class="src">Source: Notes, Nov 5</span></li>'));
+  for(const source of s.proposals[0].sources)assert.equal(card.includes(source.quote),false);
+});
+
 
 (async()=>{for(const t of tests){try{await t.fn();passed++;process.stdout.write('PASS '+t.name+'\n');}catch(error){failed++;process.stdout.write('FAIL '+t.name+'\n  '+error.stack+'\n');}}process.stdout.write(`\n${passed} passed; ${failed} failed.\n`);process.exitCode=failed?1:0;})();
