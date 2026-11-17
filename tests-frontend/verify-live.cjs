@@ -357,7 +357,7 @@ test('The pending card, editor and approval use the same loaded deadline',async(
   }
 });
 
-test('Appending keeps current Sheet bullets and writes one copy of matching normalized suggestions',async()=>{
+test('Keep + add sends only the new steps with the append mode and leaves the current Sheet bullets to the server',async()=>{
   const s=snapshot(),p=s.proposals[0],formatted='Confirm the scope. (complete by Nov 21, 2026)';
   s.rows[0].nextStep='- Received the previous proposal on Nov 8.';
   p.nextStepBullets=['Confirm the scope by Nov 21.','Confirm the scope on Nov 21.'];
@@ -375,7 +375,100 @@ test('Appending keeps current Sheet bullets and writes one copy of matching norm
   page.events.click({target:{closest:()=>button}});
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(writes.length,1);
-  assert.deepEqual(writes[0].next_step_bullets,['Received the previous proposal on Nov 8.',formatted]);
+  // H-16 (11/17/2026): the page used to re-send the current Sheet bullets; the server now appends, so only new steps go.
+  assert.deepEqual(writes[0].next_step_bullets,[formatted]);
+  assert.equal(writes[0].next_step_mode,'append');
+  assert.ok(page.get('#review-list').innerHTML.includes('Last progress does not change.'));
+});
+
+test('Replace stays the default and sends no mode field, so an older service accepts it',async()=>{
+  const s=snapshot(),writes=[];
+  const page=fakePage({callTool:async(name,args)=>{if(name===core.TOOLS.workspace)return {structuredContent:s};writes.push(json(args));return {structuredContent:{status:'approved'}};}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.ok(page.get('#review-list').innerHTML.includes('The old Next Step moves to Last progress.'));
+  const article={dataset:{id:'p-1'}},button={dataset:{action:'approve'},closest:()=>article};
+  page.events.click({target:{closest:()=>button}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(writes,[{proposal_id:'p-1',revision:2,idempotency_key:'new-key',next_step_bullets:['Confirm the scope.'],client_context_bullets:[]}]);
+});
+
+test('The write mode is part of the request: validated, kept on an uncertain retry and replayed from a saved approval',async()=>{
+  assert.throws(()=>core.groups({nextStepBullets:['A'],clientContextBullets:[],nextStepMode:'merge'}),/replace Next Step or add/);
+  assert.deepEqual(json(core.groups({nextStepBullets:['A'],clientContextBullets:[],nextStepMode:'append'})),{nextStepBullets:['A'],clientContextBullets:[],nextStepMode:'append'});
+  // Nothing to add means nothing to append: a context-only approval never carries the mode.
+  assert.deepEqual(json(core.groups({nextStepBullets:[],clientContextBullets:['C'],nextStepMode:'append'})),{nextStepBullets:[],clientContextBullets:['C']});
+  assert.deepEqual(json(core.groups({nextStepBullets:['A'],clientContextBullets:[],nextStepMode:'replace'})),{nextStepBullets:['A'],clientContextBullets:[]});
+  const s=snapshot(),writes=[];let fail=true;
+  const client=core.createClient(async(name,args)=>{if(name===core.TOOLS.workspace)return s;writes.push(json(args));if(fail){fail=false;throw new core.ReviewError('Sheet update not confirmed.',503);}return {status:'approved'};});
+  await client.refresh();
+  const update={nextStepBullets:['Send scope.'],clientContextBullets:[],nextStepMode:'append'};
+  await assert.rejects(client.decide('p-1','approve',update),/not confirmed/);
+  // The same founder decision cannot silently become a replace while its first request is unresolved.
+  await assert.rejects(client.decide('p-1','approve',{...update,nextStepMode:'replace'}),/may still be saving/);
+  await client.decide('p-1','approve',update);
+  assert.equal(writes.length,2);
+  assert.deepEqual(writes[0],writes[1]);
+  assert.equal(writes[0].next_step_mode,'append');
+  const saved=snapshot('applying');saved.proposals[0].retry={idempotency_key:'durable-key',revision:1,next_step_bullets:['Send scope.'],client_context_bullets:[],next_step_mode:'append'};
+  const replayed=[];
+  const later=core.createClient(async(name,args)=>{if(name===core.TOOLS.workspace)return saved;replayed.push(json(args));return {status:'approved'};});
+  await later.refresh();await later.decide('p-1','approve',undefined);
+  assert.deepEqual(replayed,[{proposal_id:'p-1',idempotency_key:'durable-key',revision:1,next_step_bullets:['Send scope.'],client_context_bullets:[],next_step_mode:'append'}]);
+  saved.proposals[0].retry.next_step_mode='merge';
+  await assert.rejects(core.createClient(async()=>saved).refresh(),/administrator to check/);
+});
+
+test('The REST route carries the append mode in the approve body',async()=>{
+  const calls=[];
+  const transport=core.restTransport(async(url,options)=>{calls.push({url,options});return {ok:true,status:200,json:async()=>({status:'approved'})};},()=> 'founder-access-secret');
+  await transport(core.TOOLS.approve,{proposal_id:'p-1',revision:3,idempotency_key:'intent-1',next_step_bullets:['One action'],client_context_bullets:[],next_step_mode:'append'});
+  assert.equal(calls[0].url,'/review/proposals/p-1/approve');
+  assert.deepEqual(JSON.parse(calls[0].options.body),{revision:3,idempotency_key:'intent-1',next_step_bullets:['One action'],client_context_bullets:[],next_step_mode:'append'});
+});
+
+test('The editor says what each mode will do in the Sheet and Save & approve sends the chosen mode',async()=>{
+  assert.equal(html.includes('Either way the previous Next Step is copied to Last progress'),false);
+  const s=snapshot(),p=s.proposals[0],writes=[];
+  s.rows[0].nextStep='* confirm the  SCOPE.\n-pusheado 2-nov';
+  p.nextStepBullets=['Confirm the scope.','Send the proposal.'];
+  p.bulletLineage.nextStep=p.nextStepBullets.map((text,i)=>({bulletId:'scope-'+i,text,sourceIds:['email-scope']}));
+  const page=fakePage({callTool:async(name,args)=>{if(name===core.TOOLS.workspace)return {structuredContent:s};writes.push(json(args));return {structuredContent:{status:'approved'}};}});
+  await new Promise(resolve=>setImmediate(resolve));
+  const article={dataset:{id:p.id}},button={dataset:{action:'edit'},closest:()=>article};
+  page.events.click({target:{closest:()=>button}});
+  assert.equal(page.get('#rotation-last-progress').textContent,'the current Next Step (when Next Step bullets are approved)');
+  assert.ok(page.get('#rotation-explain').textContent.includes('the previous Next Step replaces Last progress'));
+  assert.ok(page.get('#ns-preview').innerHTML.startsWith('<b>Written to Next Step</b>- Confirm the scope.'));
+  // The switch inside the editor has no card id of its own; it applies to the card being edited.
+  page.events.click({target:{closest:selector=>selector.includes('[data-mode-pick]')?{dataset:{modePick:'append'}}:null}});
+  assert.equal(page.get('#rotation-last-name').textContent,'Last progress');
+  assert.ok(page.get('#rotation-last-progress').textContent.startsWith('stays as it is'));
+  assert.ok(page.get('#rotation-explain').textContent.includes('Last progress does not change.'));
+  const preview=page.get('#ns-preview').innerHTML;
+  assert.ok(preview.startsWith('<b>Added to Next Step, below what is already in the Sheet</b>- Send the proposal.'));
+  assert.equal(preview.includes('- Confirm the scope.'),false);
+  assert.ok(preview.includes('1 step is already in the cell and will not be repeated.'));
+  page.get('#edit-form').handlers.submit({preventDefault(){}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(writes.length,1);
+  assert.deepEqual(writes[0].next_step_bullets,['Confirm the scope.','Send the proposal.']);
+  assert.equal(writes[0].next_step_mode,'append');
+});
+
+test('Keep + add with no steps left is a context-only approval without a mode',async()=>{
+  const s=snapshot();s.proposals[0].clientContextBullets=['Customer need: Reporting.'];s.proposals[0].bulletLineage.clientContext=[{bulletId:'context-original',text:'Customer need: Reporting.',sourceIds:['email-scope']}];
+  const writes=[];
+  const page=fakePage({callTool:async(name,args)=>{if(name===core.TOOLS.workspace)return {structuredContent:s};writes.push(json(args));return {structuredContent:{status:'approved'}};}});
+  await new Promise(resolve=>setImmediate(resolve));
+  page.events.click({target:{closest:selector=>selector.includes('[data-mode-pick]')?{dataset:{modePick:'append',modeFor:'p-1'}}:null}});
+  const article={dataset:{id:'p-1'}},button={dataset:{action:'edit'},closest:()=>article};
+  page.events.click({target:{closest:()=>button}});
+  page.get('#edit-content').value='';
+  page.get('#edit-form').handlers.submit({preventDefault(){}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(writes.length,1);
+  assert.deepEqual(writes[0].next_step_bullets,[]);
+  assert.equal('next_step_mode' in writes[0],false);
 });
 
 test('An invalid completion date in an older suggestion does not prefill the field',async()=>{

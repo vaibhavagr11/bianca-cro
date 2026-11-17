@@ -381,7 +381,8 @@ def workspace_view(conn, workspace_id) -> dict:
         if row["status"] == "applying":
             intent = conn.execute(
                 "select idempotency_key, revision, next_step_bullets, client_context_bullets, routing_version,"
-                " sheet_target, error, bullet_lineage, lineage_version from review_decisions where workspace_id = %s"
+                " sheet_target, error, bullet_lineage, lineage_version, proposal_id, request_hash"
+                " from review_decisions where workspace_id = %s"
                 " and proposal_id = %s and status = 'applying'", (workspace_id, row["id"])).fetchone()
             if intent and row.get("routing_version") == ROUTING_VERSION and intent.get("routing_version") == ROUTING_VERSION:
                 item["nextStepBullets"] = intent["next_step_bullets"]
@@ -392,6 +393,9 @@ def workspace_view(conn, workspace_id) -> dict:
                     item["retry"] = {"idempotency_key": intent["idempotency_key"], "revision": intent["revision"],
                                      "next_step_bullets": intent["next_step_bullets"],
                                      "client_context_bullets": intent["client_context_bullets"]}
+                    if _saved_next_step_mode(intent) == "append":
+                        # Older pages ignore this field; their retry is then refused, never applied as a replace.
+                        item["retry"]["next_step_mode"] = "append"
                     item["error"] = intent.get("error") or "Sheet update awaiting confirmation. Retry the same approval."
                 else:
                     item["error"] = "The saved approval targets a different Sheet configuration. An operator must reconcile it before retrying."
@@ -490,14 +494,38 @@ def _target_is_pinned(target: dict | None) -> bool:
             and bool(target["sheet_tab"]) and type(target.get("sheet_id")) is int and target["sheet_id"] >= 0)
 
 
-def _request_hash(proposal_id: str, action: str, revision: int, next_steps: list[str], context: list[str]) -> str:
-    return _hash({"proposal_id": str(proposal_id), "action": action, "revision": revision,
-                  "next_step_bullets": next_steps, "client_context_bullets": context,
-                  "routing_version": ROUTING_VERSION})
+NEXT_STEP_MODES = ("replace", "append")
+
+
+def _request_hash(proposal_id: str, action: str, revision: int, next_steps: list[str], context: list[str],
+                  next_step_mode: str = "replace") -> str:
+    """Identity of one decision. The write mode is part of it, so a key cannot be reused to switch modes.
+
+    Replace is hashed exactly as before the mode existed, so approvals saved earlier stay retryable.
+    """
+    identity = {"proposal_id": str(proposal_id), "action": action, "revision": revision,
+                "next_step_bullets": next_steps, "client_context_bullets": context,
+                "routing_version": ROUTING_VERSION}
+    if next_step_mode != "replace":
+        identity["next_step_mode"] = next_step_mode
+    return _hash(identity)
+
+
+def _saved_next_step_mode(intent: dict) -> str:
+    """The mode a saved approval was made with, recovered from its request hash (no column stores it)."""
+    for mode in NEXT_STEP_MODES:
+        if intent.get("request_hash") == _request_hash(intent.get("proposal_id"), "approve", intent.get("revision"),
+                                                       intent.get("next_step_bullets"),
+                                                       intent.get("client_context_bullets"), mode):
+            return mode
+    return "replace"
 
 
 def _append_context(existing: str, bullets: list[str]) -> str:
-    """Preserve existing bytes and append only genuinely new normalized bullet lines."""
+    """Preserve existing bytes and append only genuinely new normalized bullet lines.
+
+    Used for Client Context, and for Next step when the founder chose Keep current bullets + add these.
+    """
     seen = {_squash(_BULLET.sub("", line.strip())) for line in existing.splitlines() if line.strip()}
     additions = []
     for bullet in bullets:
@@ -589,7 +617,8 @@ def _require_live_sales_status(sheets: SheetsClient, company: str) -> None:
 
 def _prepare(conn, workspace_id, proposal_id: str, actor: str, action: str, revision: int,
              idempotency_key: str, next_step_bullets: list[str] | None,
-             client_context_bullets: list[str] | None, sheets: SheetsClient) -> tuple[dict, dict, bool]:
+             client_context_bullets: list[str] | None, sheets: SheetsClient,
+             next_step_mode: str = "replace") -> tuple[dict, dict, bool]:
     proposal = conn.execute(
         "select p.*, o.removed_at, o.stage as current_stage, c.name as current_company_name"
         " from review_proposals p join opportunities o on o.id = p.opportunity_id join companies c on c.id = o.company_id"
@@ -610,7 +639,7 @@ def _prepare(conn, workspace_id, proposal_id: str, actor: str, action: str, revi
                                allow_empty=True)
         if not next_steps and not context:
             raise ValueError("Provide at least one Next Step or Client Context bullet.")
-    request_hash = _request_hash(proposal_id, action, revision, next_steps, context)
+    request_hash = _request_hash(proposal_id, action, revision, next_steps, context, next_step_mode)
     intent = conn.execute(
         "select * from review_decisions where workspace_id = %s and idempotency_key = %s for update",
         (workspace_id, idempotency_key)).fetchone()
@@ -655,7 +684,12 @@ def _prepare(conn, workspace_id, proposal_id: str, actor: str, action: str, revi
         if not _same_cells(before, exact_live):
             raise ReviewConflict("The Sheet row changed since this card was generated. Resync the Pipeline sheet and reload before approving.")
         before, after = exact_live, dict(exact_live)
-        if next_steps:
+        if next_steps and next_step_mode == "append":
+            # Keep current bullets + add these: Last progress is not touched and nothing already there is rewritten.
+            after["nextStep"] = _append_context(before["nextStep"], next_steps)
+            if len(after["nextStep"]) > 50_000:
+                raise ValueError("The resulting Next step exceeds one Sheet cell. Shorten the steps or replace the cell instead.")
+        elif next_steps:
             after.update(lastProgress=before["nextStep"], nextStep="\n".join("- " + b for b in next_steps))
         if context:
             after["clientContext"] = (_append_context(before["clientContext"], context)
@@ -721,10 +755,17 @@ class _LazySheets:
 
 
 def decide(workspace_id, proposal_id: str, actor: str, action: str, revision: int, idempotency_key: str,
-           next_step_bullets: list[str] | None = None, client_context_bullets: list[str] | None = None) -> dict:
-    """An explicit founder decision. Fixed intents and locks make retries recoverable, not a second rotation."""
+           next_step_bullets: list[str] | None = None, client_context_bullets: list[str] | None = None,
+           next_step_mode: str = "replace") -> dict:
+    """An explicit founder decision. Fixed intents and locks make retries recoverable, not a second rotation.
+
+    ``next_step_mode`` is "replace" (approved steps become Next step, the old Next step moves to Last progress)
+    or "append" (approved steps are added below the existing Next step text; Last progress is left alone).
+    """
     if action not in ("approve", "ignore") or actor not in ("RG", "NC", "NDL"):
         raise ValueError("A valid founder and decision are required.")
+    if next_step_mode not in NEXT_STEP_MODES or (action == "ignore" and next_step_mode != "replace"):
+        raise ValueError("Choose whether to replace Next step or add to it.")
     if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
         raise ValueError("A valid proposal revision is required.")
     if not isinstance(idempotency_key, str) or not 8 <= len(idempotency_key) <= 128 or idempotency_key.strip() != idempotency_key:
@@ -740,7 +781,8 @@ def decide(workspace_id, proposal_id: str, actor: str, action: str, revision: in
         sheets = _LazySheets()
         try:
             proposal, intent, finished = _prepare(conn, workspace_id, proposal_id, actor, action, revision,
-                                                  idempotency_key, next_step_bullets, client_context_bullets, sheets)
+                                                  idempotency_key, next_step_bullets, client_context_bullets, sheets,
+                                                  next_step_mode)
         except SheetConflict as exc:
             raise ReviewConflict(str(exc)) from exc
         except SheetError as exc:

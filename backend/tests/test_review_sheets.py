@@ -462,3 +462,20 @@ def test_status_change_never_overwrites_a_formula_and_reports_unverified_writes(
     for bad in ("", "two\nlines", "x" * 101):
         with pytest.raises(SheetError):
             client()[0].set_status("Campari", "4. Pilot", bad)
+
+
+def test_keep_and_add_plan_writes_only_the_next_step_cell_and_still_checks_and_verifies():
+    """H-16: an append plan has the same Last progress before and after, so that cell is not in the batch."""
+    api, transport = client()
+    appended = "Previous next step\n- Added step"
+    row = api.apply_update("Campari", "Old progress", "Previous next step", "Old progress", appended,
+                           expected_client_context="", new_client_context="")
+    assert (row.last_progress, row.next_step) == ("Old progress", appended)
+    assert [call[0] for call in transport.calls] == ["GET", "POST", "GET"]
+    requests = transport.calls[1][3]["requests"]
+    assert len(requests) == 1 and requests[0]["updateCells"]["range"]["startColumnIndex"] == 3
+    # The same stale-row guard applies as for a replace.
+    with pytest.raises(SheetConflict):
+        api.apply_update("Campari", "Old progress", "Previous next step", "Old progress", appended + "\n- Again",
+                         expected_client_context="", new_client_context="")
+    assert [call[0] for call in transport.calls].count("POST") == 1

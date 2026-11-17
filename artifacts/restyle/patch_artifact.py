@@ -131,7 +131,7 @@ HEADER = '''<header class="site-header"><div class="header-inner"><a class="bran
 TOOLBAR = '''<div class="toolbar"><div class="seg" id="owner-seg" role="group" aria-label="Filter by owner"><button type="button" class="on" data-owner="all">All <span class="cnt" data-cnt="all">0</span></button><button type="button" class="rg" data-owner="RG"><span class="avatar">RG</span>Ramiro <span class="cnt" data-cnt="RG">0</span></button><button type="button" class="nc" data-owner="NC"><span class="avatar nc">NC</span>Nico <span class="cnt" data-cnt="NC">0</span></button><button type="button" class="ndl" data-owner="NDL"><span class="avatar ndl">NDL</span>Nicolás de León <span class="cnt" data-cnt="NDL">0</span></button></div><div class="tb-right">__LAYOUT_TOGGLE__</div><div class="search-wrap"><label class="sr-only" for="company-search">Search companies</label><input class="search" id="company-search" type="search" value="" autocomplete="off" tabindex="-1" aria-hidden="true"></div><label class="sr-only" for="owner-filter">Filter by owner</label><select class="owner-filter" id="owner-filter" tabindex="-1" aria-hidden="true"><option value="all">All founders</option><option value="RG">Ramiro · RG</option><option value="NC">Nico · NC</option><option value="NDL">Nicolás de León · NDL</option></select></div>'''
 LAYOUT_TOGGLE = '<div class="layout-toggle" role="group" aria-label="Layout"><button type="button" class="on" data-theme-pick="war-room">War room</button><button type="button" data-theme-pick="focus">Focus</button></div>'
 
-DIALOG_EXTRA = '''<div class="mode-row"><div class="mode" id="edit-mode" role="group" aria-label="Next Step write mode"><button type="button" class="on" data-mode-pick="replace" aria-pressed="true">Replace Next Step</button><button type="button" data-mode-pick="append" aria-pressed="false">Keep current bullets + add these</button></div></div><p class="field-help">Replace writes only these steps to Next Step. Keep + add leaves the bullets already in the Sheet and adds these below them. Either way the previous Next Step is copied to Last progress. The same switch is on the card.</p>'''
+DIALOG_EXTRA = '''<div class="mode-row"><div class="mode" id="edit-mode" role="group" aria-label="Next Step write mode"><button type="button" class="on" data-mode-pick="replace" aria-pressed="true">Replace Next Step</button><button type="button" data-mode-pick="append" aria-pressed="false">Keep current bullets + add these</button></div></div><p class="field-help">Replace writes only these steps to Next Step and moves the previous Next Step to Last progress. Keep + add leaves the Next Step text already in the Sheet as it is, adds these steps below it and does not change Last progress. The same switch is on the card.</p>'''
 ROWS_EDITOR = '''<div class="ns-head" aria-hidden="true"><span>Next step</span><span>Complete by (d/m/y)</span><span></span></div><div class="ns-rows" id="ns-rows"></div><button type="button" class="pill ns-add" data-action="ns-add">+ Add next step</button><div class="ns-preview" id="ns-preview" aria-live="polite"></div>'''
 ROWS_HELP = 'One row per next step, with an optional date typed day first (16/11/2026 or 16 Nov). The date is written into the Next Step cell after the step as "(complete by Nov 4, 2026)" - no new Sheet column. Leave every row empty to keep Next Step and Last progress unchanged.'
 
@@ -215,14 +215,14 @@ const BiancaWarRoom = (() => {
     return original;
   }
   const cellBullets = v => String(v || '').split(/\r?\n/).map(l => l.trim().replace(/^(?:[-*•]\s*)/, '').trim()).filter(Boolean);
-  function merged(id, bullets, currentCell){
-    const proposed = [...new Set(bullets)];
-    if(mode(id) !== 'append' || !proposed.length) return proposed;
-    const current = cellBullets(currentCell), seen = new Set(current);
-    return [...current, ...proposed.filter(bullet => !seen.has(bullet))];
-  }
-  function modeControl(id){ const m = mode(id); return `<div class="mode-row"><div class="mode" role="group" aria-label="Next Step write mode"><button type="button" class="${m==='replace'?'on':''}" data-mode-pick="replace" data-mode-for="${esc(id)}" aria-pressed="${m==='replace'}">Replace Next Step</button><button type="button" class="${m==='append'?'on':''}" data-mode-pick="append" data-mode-for="${esc(id)}" aria-pressed="${m==='append'}">Keep current bullets + add these</button></div><span class="mode-hint">${m==='append'?'Bullets already in the Sheet stay; these are added below.':'These replace what is in Next Step now.'}</span></div>`; }
-  function paintDialogMode(id){ const m = mode(id); document.querySelectorAll('#edit-mode [data-mode-pick]').forEach(x => { const on = x.dataset.modePick === m; x.classList.toggle('on', on); x.setAttribute('aria-pressed', String(on)); }); }
+  // What a card or the editor sends (11/17/2026): the reviewed steps and how to write them. In Keep + add the server
+  // adds them below the Next Step text already in the Sheet and leaves Last progress alone, so the page sends only the new steps.
+  function nextStepUpdate(id, bullets){ const proposed = [...new Set(bullets)]; return {nextStepBullets: proposed, nextStepMode: proposed.length ? mode(id) : 'replace'}; }
+  // Preview only: the steps Keep + add would really add, compared the way the server compares them (bullet mark, case and spacing ignored).
+  const cellKey = line => String(line || '').trim().replace(/^(?:[-*•]\s+|\d+[.)]\s+)/, '').trim().replace(/\s+/g, ' ').toLowerCase();
+  function additions(bullets, currentCell){ const seen = new Set(String(currentCell || '').split(/\r?\n/).map(cellKey).filter(Boolean)); return bullets.filter(b => { const k = cellKey(b); if(!k || seen.has(k)) return false; seen.add(k); return true; }); }
+  function modeControl(id){ const m = mode(id); return `<div class="mode-row"><div class="mode" role="group" aria-label="Next Step write mode"><button type="button" class="${m==='replace'?'on':''}" data-mode-pick="replace" data-mode-for="${esc(id)}" aria-pressed="${m==='replace'}">Replace Next Step</button><button type="button" class="${m==='append'?'on':''}" data-mode-pick="append" data-mode-for="${esc(id)}" aria-pressed="${m==='append'}">Keep current bullets + add these</button></div><span class="mode-hint">${m==='append'?'Next Step keeps what is in the Sheet and these are added below. Last progress does not change.':'These replace what is in Next Step now. The old Next Step moves to Last progress.'}</span></div>`; }
+  function paintDialogMode(id){ const m = mode(id); document.querySelectorAll('#edit-mode [data-mode-pick]').forEach(x => { const on = x.dataset.modePick === m; x.classList.toggle('on', on); x.setAttribute('aria-pressed', String(on)); }); const add = m === 'append', set = (sel, text) => { const el = $(sel); if(el) el.textContent = text; }; set('#rotation-last-name', add ? 'Last progress' : 'Last progress \u2190'); set('#rotation-last-progress', add ? 'stays as it is - Keep + add does not move anything into it' : 'the current Next Step (when Next Step bullets are approved)'); set('#rotation-next-name', add ? 'Next Step (kept, new steps added below)' : 'Next Step (now, replaced)'); set('#rotation-explain', add ? 'Keep + add leaves the Next Step text in the Sheet exactly as it is and adds the approved steps below it. A step that is already in the cell is not repeated. Last progress does not change.' : 'When Next Step bullets are approved, the previous Next Step replaces Last progress. Context-only approval leaves both of those cells unchanged.'); }
   function fmtDate(iso){
     if(!/^\d{4}-\d{2}-\d{2}$/.test(iso || '')) return '';
     const day = new Date(iso + 'T00:00:00Z');
@@ -285,22 +285,22 @@ const BiancaWarRoom = (() => {
   }
   document.addEventListener('change', e => { const pick = e.target.closest?.('.status-pick'); if(!pick) return; const save = pick.parentElement?.querySelector('.status-save'); if(save) save.disabled = pick.value === pick.dataset.statusCurrent; });
   const joinBullet = (text, date) => { const t = String(text || '').replace(/[\r\n]+/g, ' ').trim(); if(!t) return ''; const d = fmtDate(date); return d ? `${t} (complete by ${d})` : t; };
-  let rows = [], editingRows = null;
+  let rows = [], editingRows = null, editingCell = '';
   const blankRow = () => ({text:'', date:'', t0:null, d0:null});
   // An untouched row goes back exactly as suggested, so its source link survives.
   const rowBullet = r => (r.orig !== undefined && r.text === r.t0 && r.date === r.d0) ? r.orig : joinBullet(r.text, r.date);
   function drawRows(focusIndex){ const box = $('#ns-rows'); if(!box) return; box.innerHTML = rows.map((r, i) => `<div class="ns-row" data-row="${i}"><textarea class="ns-text" rows="2" maxlength="3900" placeholder="Next step" aria-label="Next step ${i+1}">${esc(r.text)}</textarea><input type="text" class="ns-date" autocomplete="off" spellcheck="false" placeholder="dd/mm/yyyy" value="${esc(r.dateText ?? dmy(r.date))}" aria-label="Complete by date, day/month/year, for next step ${i+1}"${r.dateError ? ' aria-invalid="true"' : ''}><button type="button" class="ns-del" data-action="ns-del" aria-label="Remove next step ${i+1}">&times;</button><p class="ns-date-err" role="alert"${r.dateError ? '' : ' hidden'}>${esc(r.dateError || '')}</p></div>`).join(''); if(focusIndex !== undefined) box.querySelectorAll('.ns-text')[focusIndex]?.focus(); drawPreview(); }
-  function drawPreview(){ const out = $('#ns-preview'); if(!out) return; const lines = rows.map(rowBullet).filter(Boolean); out.innerHTML = lines.length ? `<b>${mode(editingRows)==='append'?'Added to Next Step, below the current bullets':'Written to Next Step'}</b>${lines.map(l => esc('- ' + l)).join('\n')}` : '<b>Next Step</b>No rows - Next Step and Last progress stay as they are.'; }
+  function drawPreview(){ const out = $('#ns-preview'); if(!out) return; const all = rows.map(rowBullet).filter(Boolean), add = mode(editingRows) === 'append'; const lines = add ? additions(all, editingCell) : all, skipped = all.length - lines.length; out.innerHTML = all.length ? `<b>${add?'Added to Next Step, below what is already in the Sheet':'Written to Next Step'}</b>${lines.map(l => esc('- ' + l)).join('\n')}${add && skipped ? `${lines.length ? '\n' : ''}<i>${skipped === 1 ? '1 step is' : skipped + ' steps are'} already in the cell and will not be repeated.</i>` : ''}` : '<b>Next Step</b>No rows - Next Step and Last progress stay as they are.'; }
   function syncRows(){ const ta = $('#edit-content'); if(!ta) return; ta.value = rows.map(rowBullet).filter(Boolean).map(x => '- ' + x).join('\n'); ta.dispatchEvent(new Event('input', {bubbles:true})); drawPreview(); }
   // Called by the page right after it fills the hidden #edit-content textarea and opens the dialog.
-  function openRows(id){ try{ const ta = $('#edit-content'), box = $('#ns-rows'); if(!ta || !box) return; editingRows = id; rows = cellBullets(ta.value).map(x => { const p = splitBullet(x); return {orig:x, text:p.text, date:p.date, t0:p.text, d0:p.date}; }); if(!rows.length) rows = [blankRow()]; paintDialogMode(id); drawRows(0); }catch(_){ } }
+  function openRows(id, currentCell){ try{ const ta = $('#edit-content'), box = $('#ns-rows'); if(!ta || !box) return; editingRows = id; editingCell = String(currentCell || ''); rows = cellBullets(ta.value).map(x => { const p = splitBullet(x); return {orig:x, text:p.text, date:p.date, t0:p.text, d0:p.date}; }); if(!rows.length) rows = [blankRow()]; paintDialogMode(id); drawRows(0); }catch(_){ } }
   document.addEventListener('input', e => { const row = e.target.closest?.('.ns-row'); if(!row) return; const r = rows[Number(row.dataset.row)]; if(!r) return; if(e.target.classList.contains('ns-text')) r.text = e.target.value; else if(e.target.classList.contains('ns-date')){ const day = parseDay(e.target.value); r.dateText = e.target.value; r.dateError = day.error || ''; r.date = day.iso; const note = row.querySelector?.('.ns-date-err'); if(note){ note.textContent = r.dateError; note.hidden = !r.dateError; } if(r.dateError) e.target.setAttribute?.('aria-invalid', 'true'); else e.target.removeAttribute?.('aria-invalid'); } syncRows(); });
   // Leaving a valid date shows it back day-first, so 16 nov and 16/11 both read 16/11/2026.
   document.addEventListener('change', e => { if(!e.target.classList?.contains('ns-date')) return; const r = rows[Number(e.target.closest?.('.ns-row')?.dataset.row)]; if(r && !r.dateError && r.date){ r.dateText = dmy(r.date); e.target.value = r.dateText; } });
   // A row with an impossible date never reaches the page's own save handler.
   document.addEventListener('submit', e => { if(e.target?.id !== 'edit-form') return; const bad = rows.findIndex(r => r.dateError); if(bad < 0) return; e.preventDefault(); e.stopImmediatePropagation(); const note = $('#edit-error'); if(note){ note.textContent = `Next step ${bad + 1}: ${rows[bad].dateError}`; note.hidden = false; } document.querySelectorAll('#ns-rows .ns-date')[bad]?.focus(); }, true);
   document.addEventListener('keydown', e => { if(e.key === 'Enter' && !e.shiftKey && e.target.closest?.('.ns-row') && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')){ e.preventDefault(); rows.push(blankRow()); drawRows(rows.length - 1); } });
-  return {shell, avatar, ownerName, stageClass, shortDate, esc, mode, merged, modeControl, openRows, suggestedNextSteps, statusControl, parseDay, get selected(){ return selected; }};
+  return {shell, avatar, ownerName, stageClass, shortDate, esc, mode, nextStepUpdate, additions, modeControl, openRows, suggestedNextSteps, statusControl, parseDay, get selected(){ return selected; }};
 })();
 """
 
@@ -345,7 +345,7 @@ def patch(src_html: str, demo: bool) -> str:
     s = s.replace('<p class="validation" id="edit-error" role="alert" hidden></p><div class="rotation-preview">',
                   DIALOG_EXTRA + '<p class="validation" id="edit-error" role="alert" hidden></p><div class="rotation-preview">', 1)
     s = s.replace('<h3>Current sheet context</h3><div class="rotation-row"><span class="rotation-name">Next Step</span>',
-                  '<h3>What will happen in the Sheet copy</h3><div class="rotation-row"><span class="rotation-name">Last progress &#8592;</span><span class="rotation-content">the current Next Step (when Next Step bullets are approved)</span></div><div class="rotation-row"><span class="rotation-name">Next Step (now)</span>', 1)
+                  '<h3>What will happen in the Sheet copy</h3><div class="rotation-row"><span class="rotation-name" id="rotation-last-name">Last progress &#8592;</span><span class="rotation-content" id="rotation-last-progress">the current Next Step (when Next Step bullets are approved)</span></div><div class="rotation-row"><span class="rotation-name" id="rotation-next-name">Next Step (now, replaced)</span>', 1)
     s = s.replace('<span>Approve sends actions and blockers to “Next Step,” and needs, signals, and objections to “Client Context.”</span>', '<span>Approve or edit to update Pipeline Next Steps.</span>')
     # 5b. Next Step editor: one row per step (text + date); the original textarea stays as the hidden value the page submits
     assert s.count('<textarea class="editor" id="edit-content"') == 1
@@ -354,7 +354,7 @@ def patch(src_html: str, demo: bool) -> str:
                   'aria-describedby="edit-help edit-error"></textarea>' + ROWS_EDITOR + '<p id="edit-help" class="field-help">' + ROWS_HELP + '</p>', 1)
     assert 'id="ns-rows"' in s, "edit-help anchor not found"
     assert s.count("$('#edit-dialog').showModal();$('#edit-content').focus();}") == 1
-    s = s.replace("$('#edit-dialog').showModal();$('#edit-content').focus();}", "$('#edit-dialog').showModal();$('#edit-content').focus();BiancaWarRoom.openRows(id);}", 1)
+    s = s.replace("$('#edit-dialog').showModal();$('#edit-content').focus();}", "$('#edit-dialog').showModal();$('#edit-content').focus();BiancaWarRoom.openRows(id," + ("r.nextStep" if demo else "currentNextStep(p)") + ");}", 1)
     assert s.count("$('#edit-content').value=p.nextStepBullets.map") == 1
     s = s.replace("$('#edit-content').value=p.nextStepBullets.map",
                   "$('#edit-content').value=BiancaWarRoom.suggestedNextSteps(p).map", 1)
@@ -362,14 +362,14 @@ def patch(src_html: str, demo: bool) -> str:
     if demo:
         cur = "state.rows.find(r=>r.id===ID)?.nextStep"
         a_old = "if(action==='approve')approve(id,state.proposals.find(p=>p.id===id));"
-        a_new = "if(action==='approve'){const p=state.proposals.find(p=>p.id===id);if(p?.status==='pending')approve(id,{nextStepBullets:BiancaWarRoom.merged(id,BiancaWarRoom.suggestedNextSteps(p)," + cur.replace('ID','id') + "),clientContextBullets:p.clientContextBullets});}"
+        a_new = "if(action==='approve'){const p=state.proposals.find(p=>p.id===id);if(p?.status==='pending')approve(id,{...BiancaWarRoom.nextStepUpdate(id,BiancaWarRoom.suggestedNextSteps(p)),clientContextBullets:p.clientContextBullets});}"
         s_old = "nextStepBullets:BiancaCore.parseBullets($('#edit-content').value)"
-        s_new = "nextStepBullets:BiancaWarRoom.merged(editingId,BiancaCore.parseBullets($('#edit-content').value)," + cur.replace('ID','editingId') + ")"
+        s_new = "...BiancaWarRoom.nextStepUpdate(editingId,BiancaCore.parseBullets($('#edit-content').value))"
     else:
         a_old = "if(action==='approve')decide(id,'approve',state.proposals.find(p=>p.id===id));"
-        a_new = "if(action==='approve'){const p=state.proposals.find(p=>p.id===id);if(p?.status==='pending')decide(id,'approve',{nextStepBullets:BiancaWarRoom.merged(id,BiancaWarRoom.suggestedNextSteps(p),currentNextStep(p)),clientContextBullets:p.clientContextBullets});}"
+        a_new = "if(action==='approve'){const p=state.proposals.find(p=>p.id===id);if(p?.status==='pending')decide(id,'approve',{...BiancaWarRoom.nextStepUpdate(id,BiancaWarRoom.suggestedNextSteps(p)),clientContextBullets:p.clientContextBullets});}"
         s_old = "nextStepBullets:BiancaLive.parseBullets($('#edit-content').value)"
-        s_new = "nextStepBullets:BiancaWarRoom.merged(editingId,BiancaLive.parseBullets($('#edit-content').value),currentNextStep(state.proposals.find(p=>p.id===editingId)||{}))"
+        s_new = "...BiancaWarRoom.nextStepUpdate(editingId,BiancaLive.parseBullets($('#edit-content').value))"
     assert s.count(a_old) == 1 and s.count(s_old) == 1, "approve / submit anchors not found"
     s = s.replace(a_old, a_new, 1).replace(s_old, s_new, 1)
     # 6. footer copy

@@ -951,6 +951,13 @@ def test_workspace_recovery_exposes_exact_split_payload_and_not_legacy_or_redire
                                        "client_context_bullets": ["Customer need: Updated context."]}
     assert proposal_view["nextStepBullets"] == [edited_action]
     assert proposal_view["clientContextBullets"] == ["Customer need: Updated context."]
+    # H-16: a saved Keep + add approval tells the page its mode, so the retry keeps the same request identity.
+    saved = store.data["intents"][0]
+    replace_hash = saved["request_hash"]
+    saved["request_hash"] = review._request_hash(PROPOSAL, "approve", 1, saved["next_step_bullets"],
+                                                  saved["client_context_bullets"], "append")
+    assert review.workspace_view(WorkspaceConnection(), WORKSPACE)["proposals"][0]["retry"]["next_step_mode"] == "append"
+    saved["request_hash"] = replace_hash
     assert "reviewNextStepBullets" not in proposal_view
     assert "bullets" not in proposal_view
     assert view["routingVersion"] == 1
@@ -1395,3 +1402,93 @@ def test_moving_a_deal_to_working_client_reports_that_it_left_the_sales_pipeline
     assert result["inSalesPipeline"] is False
     assert review.status_options({"a": "4. Pilot", "b": None, "c": " 4. Pilot ", "d": "0. Paused", "e": ""}) == [
         "0. Paused", "4. Pilot"]
+
+
+# ---- H-16: Keep current bullets + add these (next_step_mode="append")
+
+def test_append_mode_leaves_last_progress_alone_and_adds_below_the_existing_next_step(service):
+    store, sheets = service
+    sheets.next_step = store.data["proposal"]["snapshot_next_step"] = "  -pusheado 2-nov\r\n* Ask for the signed agreement.  "
+    old_last, old_next = sheets.last_progress, sheets.next_step
+    result = approve(["ask for the  signed agreement.", "Send the revised scope."], next_step_mode="append")
+    assert sheets.last_progress == old_last
+    assert sheets.next_step == old_next + "\n- Send the revised scope."
+    assert result["activity"]["before"] == {"lastProgress": old_last, "nextStep": old_next, "clientContext": ""}
+    assert result["activity"]["after"] == {"lastProgress": old_last, "nextStep": sheets.next_step, "clientContext": ""}
+    # The same durable intent and write path as a replace: one planned three-cell write, sources consumed.
+    assert sheets.calls == [("Pernod Ricard", old_last, old_next, old_last, sheets.next_step, "", "")]
+    assert store.data["intents"][0]["next_step_bullets"] == ["ask for the  signed agreement.", "Send the revised scope."]
+    assert store.data["proposal"]["status"] == "approved" and len(store.data["receipts"]) == 1
+    assert store.events.index("commit", 1) < store.events.index("sheet-write")
+
+
+def test_append_mode_on_an_empty_next_step_writes_the_bullets_without_rotating(service):
+    store, sheets = service
+    sheets.next_step = store.data["proposal"]["snapshot_next_step"] = ""
+    approve(["Send scope.", "Book the review."], next_step_mode="append", client_context_bullets=["Customer need: Reporting."])
+    assert sheets.last_progress == "Pilot terms agreed."
+    assert sheets.next_step == "- Send scope.\n- Book the review."
+    assert sheets.client_context == "- Customer need: Reporting."
+
+
+def test_default_mode_is_still_replace_and_the_mode_is_part_of_the_request_identity(service):
+    store, sheets = service
+    assert review._request_hash(PROPOSAL, "approve", 1, ["Send scope."], []) == review._request_hash(
+        PROPOSAL, "approve", 1, ["Send scope."], [], "replace")
+    assert review._request_hash(PROPOSAL, "approve", 1, ["Send scope."], [], "append") != review._request_hash(
+        PROPOSAL, "approve", 1, ["Send scope."], [])
+    old_next = sheets.next_step
+    result = approve(["Send scope."], next_step_mode="append")
+    assert sheets.next_step == old_next + "\n- Send scope."
+    # The same key cannot be reused to turn the saved append into a replace, or the reverse.
+    with pytest.raises(review.ReviewConflict, match="different decision"):
+        approve(["Send scope."])
+    assert approve(["Send scope."], next_step_mode="append")["activity"] == result["activity"]
+    assert len(sheets.calls) == 1
+    for invalid in ("merge", "", None):
+        with pytest.raises(ValueError):
+            approve(["Send scope."], next_step_mode=invalid)
+    with pytest.raises(ValueError):
+        review.decide(WORKSPACE, PROPOSAL, "NDL", "ignore", 1, "ignore-key-1", next_step_mode="append")
+
+
+def test_uncertain_append_is_retried_from_the_saved_plan_and_never_appends_twice(service):
+    store, sheets = service
+    old_last, old_next = sheets.last_progress, sheets.next_step
+    sheets.uncertain = True
+    with pytest.raises(review.ReviewUnavailable):
+        approve(["Send scope."], next_step_mode="append")
+    assert store.data["proposal"]["status"] == "applying"
+    intent = store.data["intents"][0]
+    assert review._saved_next_step_mode(intent) == "append"
+    with pytest.raises(review.ReviewConflict, match="different decision"):
+        approve(["Send scope."])  # A retry that lost the mode is refused, never applied as a replace.
+    assert approve(["Send scope."], next_step_mode="append")["status"] == "approved"
+    assert (sheets.last_progress, sheets.next_step) == (old_last, old_next + "\n- Send scope.")
+    assert sheets.calls[0] == sheets.calls[1] and intent["after_cells"]["lastProgress"] == old_last
+
+
+def test_append_of_steps_already_in_the_cell_changes_nothing_but_still_closes_the_card(service):
+    store, sheets = service
+    before = (sheets.last_progress, sheets.next_step, sheets.client_context)
+    result = approve(["Ask for the signed agreement."], next_step_mode="append")
+    assert (sheets.last_progress, sheets.next_step, sheets.client_context) == before
+    assert result["status"] == "approved" and result["activity"]["before"] == result["activity"]["after"]
+
+
+def test_append_checks_the_live_row_first_and_an_oversized_result_is_refused_before_any_intent(service):
+    store, sheets = service
+    sheets.next_step = "Edited by a founder in the Sheet."
+    with pytest.raises(review.ReviewConflict, match="Sheet row changed"):
+        approve(["Send scope."], next_step_mode="append")
+    sheets.next_step = store.data["proposal"]["snapshot_next_step"] = "x" * 49_990
+    with pytest.raises(ValueError, match="exceeds one Sheet cell"):
+        approve(["Send the revised scope."], next_step_mode="append")
+    assert not store.data["intents"] and not sheets.calls
+
+
+def test_saved_replace_approvals_are_recognised_as_replace():
+    intent = {"proposal_id": PROPOSAL, "revision": 3, "next_step_bullets": ["A"], "client_context_bullets": [],
+              "request_hash": review._request_hash(PROPOSAL, "approve", 3, ["A"], [])}
+    assert review._saved_next_step_mode(intent) == "replace"
+    assert review._saved_next_step_mode({**intent, "request_hash": "unknown"}) == "replace"

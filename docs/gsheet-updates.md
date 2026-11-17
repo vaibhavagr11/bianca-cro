@@ -20,6 +20,10 @@ Nico Casaux (`NC`), and Nico de León (`NDL`). One card holds the context and ne
 - **Dates.** The editor's Complete by field is plain text read day first (`16/11/2026`, `16/11`, `16 Nov`, `16 de noviembre`), independent of the browser language. An impossible date shows why and blocks Save & approve. The Sheet text stays `(complete by Nov 16, 2026)`.
 - **After deploying this change** run `/review/build?force=true` until `done=true`: pending cards built before it hold the old order and are refused at approval with "The sales evidence changed" until rebuilt.
 
+### Hub fixes from the 11/12 founder session (11/17/2026)
+
+- **Keep current bullets + add these (H-16).** The approve payload takes an optional `next_step_mode`: `"replace"` (default, unchanged: approved steps become `Next step` and the old `Next step` moves to `Last progress`) or `"append"`. In append the server leaves `Last progress` untouched and adds the approved steps below the existing `Next step` text, which is kept byte for byte; a step already in the cell (bullet mark, case and spacing ignored) is not repeated. It is the same rule Client Context append uses. The plan goes through the same live-row check, saved before/after values, single batch write and read-back as a replace. The mode is part of the request identity, so one approval key cannot be reused to switch modes; a saved approval reports its mode in `retry.next_step_mode` (recovered from the request hash, no new column). REST and `bianca_approve_update` both accept the field; a page that never sends it gets replace. The page now sends only the new steps in Keep + add (it used to re-send the Sheet's current bullets), and the card hint and the editor's "What will happen in the Pipeline Sheet" box describe the selected mode.
+
 `artifacts/sales-pipeline-updates.html` is the live app. It starts without company data and requires a configured connector
 or authenticated access on the hosted backend. `sales-pipeline-updates-demo.html` is the separate fictional-data preview.
 Real company data and credentials are never written to browser storage. Server records are shared by all reviewers.

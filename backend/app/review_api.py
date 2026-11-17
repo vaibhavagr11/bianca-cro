@@ -79,6 +79,10 @@ class ApproveRequest(IgnoreRequest):
     # send customer context to the action column after the routing upgrade.
     next_step_bullets: list[Bullet] = Field(max_length=200)
     client_context_bullets: list[Bullet] = Field(max_length=200)
+    # "replace": approved steps become Next step and the old Next step moves to Last progress (the default,
+    # and what a page that never sends this field gets). "append": approved steps are added below the existing
+    # Next step text and Last progress is left untouched.
+    next_step_mode: Literal["replace", "append"] = "replace"
 
     @model_validator(mode="after")
     def cell_size(self):
@@ -156,11 +160,15 @@ def _daily_ready() -> None:
 def _decision(proposal_id: str, actor: str, action: str, payload: IgnoreRequest) -> dict:
     with db.connect() as conn:
         workspace_id = _workspace_id(conn)
+    # Replace is the service default; only an explicit Keep current bullets + add these is passed on.
+    mode = ({"next_step_mode": "append"}
+            if isinstance(payload, ApproveRequest) and payload.next_step_mode == "append" else {})
     try:
         return review_service.decide(workspace_id, proposal_id, actor, action,
                                      payload.revision, payload.idempotency_key,
                                      payload.next_step_bullets if isinstance(payload, ApproveRequest) else None,
-                                     payload.client_context_bullets if isinstance(payload, ApproveRequest) else None)
+                                     payload.client_context_bullets if isinstance(payload, ApproveRequest) else None,
+                                     **mode)
     except review_service.ReviewNotFound as exc:
         raise HTTPException(404, str(exc)) from exc
     except review_service.ReviewConflict as exc:
@@ -259,7 +267,7 @@ def _tools() -> list[dict]:
         {"name": "bianca_review_workspace", "description": "Read pending company sales updates and the review activity. Never approve an update without the founder's explicit decision.",
          "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
          "annotations": {"readOnlyHint": True, "openWorldHint": False}},
-        {"name": "bianca_approve_update", "description": "On the founder's Approve or Save & approve action, write next steps, commitments, and blockers to Next step, rotating its previous value into Last progress only when action bullets are approved. Write customer needs, buying signals, and objections to Client Context using the configured context policy. Empty sections leave their cells unchanged. Retry using the same idempotency key and both bullet lists.",
+        {"name": "bianca_approve_update", "description": "On the founder's Approve or Save & approve action, write next steps, commitments, and blockers to Next step, rotating its previous value into Last progress only when action bullets are approved. With next_step_mode append (the founder chose Keep current bullets + add these) the approved steps are instead added below the existing Next step text, steps already there are not repeated, and Last progress is left unchanged. Write customer needs, buying signals, and objections to Client Context using the configured context policy. Empty sections leave their cells unchanged. Retry using the same idempotency key, both bullet lists and the same next_step_mode.",
          "inputSchema": ApproveTool.model_json_schema(),
          "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False}},
         {"name": "bianca_ignore_update", "description": "On the founder's Ignore action, dismiss this proposal without changing any Google Sheet cell.",

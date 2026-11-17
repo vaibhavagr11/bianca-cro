@@ -307,6 +307,22 @@ test('Context append deduplicates bullets without trimming or rewriting existing
   assert.equal(core.appendContext(existing,['Customer need: Retail reporting.']),existing);
 });
 
+test('Keep + add in the demo adds below the current Next step and leaves Last progress alone',()=>{
+  const before=core.initial(),id='pernod-ricard',old=rowFor(before,id);
+  const after=core.approve(before,id,{nextStepBullets:['received sell-out excel from them, meeting with them on Wed 4th Nov','Send the comparison file.'],clientContextBullets:[],nextStepMode:'append'},at);
+  const updated=rowFor(after,id);
+  assert.equal(updated.lastProgress,old.lastProgress);
+  assert.equal(updated.nextStep,old.nextStep+'\n- Send the comparison file.');
+  assert.equal(after.activity[0].before.lastProgress,after.activity[0].after.lastProgress);
+  assert.equal(core.valid(after),true);
+  // Without the mode the demo behaves as before: the old Next step moves to Last progress.
+  const replaced=rowFor(core.approve(before,id,{nextStepBullets:['Send the comparison file.'],clientContextBullets:[]},at),id);
+  assert.equal(replaced.lastProgress,old.nextStep);
+  assert.equal(replaced.nextStep,'- Send the comparison file.');
+  assert.equal(html.includes('Either way the previous Next Step is copied to Last progress'),false);
+  assert.ok(html.includes('does not change Last progress'));
+});
+
 test('Both groups empty or malformed cannot be approved',()=>{
   for(const update of [{nextStepBullets:[],clientContextBullets:[]},{nextStepBullets:['Valid'],clientContextBullets:[null]},{nextStepBullets:[],clientContextBullets:'Wrong'},{nextStepBullets:['x'.repeat(4001)],clientContextBullets:[]}]){
     assert.throws(()=>core.approve(core.initial(),'campari',update,at));
