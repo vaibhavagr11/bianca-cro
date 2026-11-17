@@ -867,6 +867,77 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                    hidden, routed, audit, waiting=waiting, more_waiting=more_waiting)
 
 
+# ---------------------------------------------------------------- meeting prep (pure)
+
+RESPONSES = {"accepted": "accepted", "declined": "declined", "tentative": "tentative", "needsAction": "not yet answered"}
+PREP_LABELS = {"AI recommendation": "Suggested", "Follow up": "Follow up"}
+
+
+def _guest_line(guests: list[dict]) -> str:
+    """Who from outside Bianca is on the invite and whether they said yes."""
+    if not guests:
+        return ""
+    name = lambda g: g.get("name") or g["address"]
+    if all(g.get("response") == "declined" for g in guests):
+        who = name(guests[0]) + (f" +{len(guests) - 1}" if len(guests) > 1 else "")
+        return f"{who} declined the invite - confirm it is still on"
+    lead = next((g for g in guests if g.get("response") == "accepted"), guests[0])
+    answer = RESPONSES.get(lead.get("response") or "")
+    return f"With {name(lead)}" + (f" ({answer})" if answer else "") + (f" +{len(guests) - 1}" if len(guests) > 1 else "")
+
+
+def meeting_prep(meeting: Meeting, section: "Section", view: DealView | None, today: date, *, checked: bool = False) -> str:
+    """One prep line per meeting, from what the brief already knows. Never blank for a meeting tied to a deal.
+
+    Order: who is coming, then the most pressing thing on record for the deal - a row this brief already shows
+    for it (Needs you today, Deals to move, Waiting, Follow-ups), else the deal's open ask, blocker or suggestion,
+    else its summary, else when we were last in touch. With checked=True (a verified build) only rows that passed
+    the pre-send check and plain facts are used. A meeting with no pipeline deal says so and names the guest.
+    """
+    guests = _guest_line(meeting.guests)
+    if not meeting.deal:
+        return ". ".join(x for x in (guests, "No pipeline deal matched - check who this is with") if x) + "."
+    deal, context = meeting.deal, ""
+    for row in section.today:
+        if row.deal == deal:
+            context = f"{row.tag}: {row.text}"
+            break
+    if not context:
+        for v, move, note in section.highlights:
+            if v.deal != deal:
+                continue
+            if move.tag in ("Confirm status", "Clarify next action"):
+                context = f"Open issue: {note.text}" if note else ""
+            else:
+                context = f"{PREP_LABELS.get(move.tag, move.tag)}: {move.text}"
+            break
+    if not context:
+        wait = next((w for w in section.waiting if w.deal == deal), None)
+        if wait:
+            context = f"Waiting on their reply since {_date(wait.sent)}" + (f": {wait.action}" if wait.action else "")
+    if not context:
+        follow = next((m for m in section.followups if (m.deal or m.text.split(":", 1)[0]) == deal), None)
+        if follow:
+            context = follow.text.split(":", 1)[-1].strip() if follow.text.startswith(f"{deal}:") else follow.text
+    if not context and view is not None:
+        if view.unanswered and view.unanswered.action and not checked:
+            context = f"Customer asked: {view.unanswered.action}"
+        elif view.blocker and view.blocker.verified:
+            context = f"Open issue: {view.blocker.text}"
+        elif view.recommendation and view.recommendation.verified and not checked:
+            context = f"Suggested: {view.recommendation.text}"
+        elif view.summary and view.summary.verified:
+            context = split_sentences(view.summary.text)[0]
+    if not context:
+        last = view.last_contact if view else None
+        context = (f"No open item on record - last contact {_date(last)}" if last
+                   else "No open item or earlier contact on record for this deal")
+    matched = f" (deal matched by guest domain {meeting.matched_by})" if meeting.matched_by else ""
+    context = context.rstrip()
+    lead = f"{guests}. " if guests else ""
+    return f"{lead}{context}{'' if context.endswith(('.', '!', '?')) else '.'}{matched}"
+
+
 # ---------------------------------------------------------------- rendering
 
 TAG_COLOR = {"Due now": RED, "Reply needed": BLUE, "We owe": INK, "Customer asked": BLUE,

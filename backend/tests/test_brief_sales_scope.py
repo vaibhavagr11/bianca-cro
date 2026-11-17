@@ -433,3 +433,76 @@ def test_vendor_ticket_or_help_desk_mail_is_never_reported_as_a_customer_reply(b
     v1 = brief_client(BriefData([delta], [ticket], [], [])).post(
         "/brief/build?dry_run=true&version=v1", headers={"X-Ingest-Token": "test-token"}).json()
     assert "Customer replied" not in v1["html"]
+
+
+# ---- findings 11 and 5 (11/09 evals): prep was blank on every meeting; prep ignored the invite's guest
+
+def _meeting(title, company, guests=(), *, hours=3):
+    people = [{"address": "ramiro@bianca.example", "name": "Ramiro", "response": "accepted"}, *guests]
+    return {"id": title, "subject": title, "company_id": company, "rules_company_id": None,
+            "occurred_at": NOW + timedelta(hours=hours), "participants": {"attendees": people},
+            "meta": {"status": "confirmed"}}
+
+
+class PassingGate:
+    """A pre-send check that keeps every row, so the test exercises the verified path without a model."""
+    as_of = NOW
+    audit = {}
+
+    def __call__(self, actions):
+        return {a.key: Verdict("waiting" if a.kind == "waiting" else "still_owed", "fixture") for a in actions}
+
+    def ready_fields(self):
+        return {}
+
+    def finalize(self, conn, response):
+        pass
+
+
+@pytest.mark.parametrize("verification", ["off", "shadow"])
+def test_every_meeting_tied_to_a_deal_gets_a_prep_line(monkeypatch, brief_client, verification):
+    monkeypatch.setattr(brief_api, "create_gate", lambda *_: PassingGate())
+    ana = {"address": "ana@owing.example", "name": "Ana Ruiz", "response": "accepted"}
+    ally = {"address": "ally@freestylesnacking.com", "name": "", "response": "accepted"}
+    stranger = {"address": "sam@unknown-firm.com", "name": "Sam", "response": "needsAction"}
+    deals = [deal("owing"), deal("quiet"), {**deal("Freestyle Snacks"), "company_id": "freestyle"}]
+    insights = [insight("promise", "owing", "Send the pilot pricing", SALES)]
+    meetings = [
+        _meeting("Pricing review", "owing", [ana]),
+        _meeting("Catch-up", "quiet", [{"address": "leo@quiet.example", "name": "Leo", "response": "declined"}]),
+        _meeting("30 Minute Call (Ramiro Godfrid)", None, [ally]),
+        _meeting("Intro call", None, [stranger]),
+    ]
+    client = brief_client(BriefData(deals, [], insights, [], meetings=meetings))
+    response = client.post(f"/brief/build?dry_run=true&version=v2&verification={verification}",
+                           headers={"X-Ingest-Token": "test-token"})
+    assert response.status_code == 200
+    result = response.json()
+    prep = {m["title"]: (m["deal"], m["prep"]) for m in result["payload"]["sections"][0]["meetings"]}
+    assert prep["Pricing review"] == ("owing", "With Ana Ruiz (accepted). Due now: Send the pilot pricing.")
+    assert prep["Catch-up"] == ("quiet", "Leo declined the invite - confirm it is still on. "
+                                         "No open item on record - last contact Nov 3.")
+    # Finding 5: the accepted guest's domain names a pipeline company, so the meeting is tied to that deal.
+    assert prep["30 Minute Call (Ramiro Godfrid)"] == (
+        "Freestyle Snacks", "With ally@freestylesnacking.com (accepted). No open item on record - last contact Nov 3. "
+                            "(deal matched by guest domain freestylesnacking.com)")
+    assert prep["Intro call"] == (None, "With Sam (not yet answered). No pipeline deal matched - check who this is with.")
+    for title, (linked, line) in prep.items():
+        assert line and line in html.unescape(result["html"]) and line in result["text"]
+    assert all(line for linked, line in prep.values() if linked)
+
+
+def test_guest_domain_matching_needs_one_distinctive_company_and_respects_working_clients(brief_client):
+    grupo = {"address": "ana@grupobimbo.com", "name": "Ana", "response": "accepted"}
+    koala = {"address": "kim@koalaeco.com", "name": "Kim", "response": "accepted"}
+    known = {"address": "pat@kof.example", "name": "Pat", "response": "accepted"}
+    deals = [{**deal("Grupo Pelon"), "company_id": "pelon"}, {**deal("FEMSA MX"), "company_id": "femsa"},
+             {**deal("Koala Eco"), "company_id": "koala", "stage": "5. Working client", "stage_rank": 5}]
+    meetings = [_meeting("Bimbo intro", None, [grupo]), _meeting("Koala sync", None, [koala]),
+                _meeting("Whitespace review", None, [known])]
+    domains = [{"domain": "kof.example", "company_id": "femsa", "evidence_count": 4, "origin": "learned"}]
+    client = brief_client(BriefData(deals, [], [], [], meetings=meetings, domains=domains))
+    result = client.post("/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"}).json()
+    found = {m["title"]: m["deal"] for m in result["payload"]["sections"][0]["meetings"]}
+    # "Grupo" alone is too common to pick a deal; a working client's meeting stays out; a learned domain links.
+    assert found == {"Bimbo intro": None, "Whitespace review": "FEMSA MX"}

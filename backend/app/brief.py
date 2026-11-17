@@ -45,6 +45,8 @@ class Meeting:
     attendees: list[str]  # team owner codes attending
     context: str = ""     # deal summary + open items, for the prep line
     link: str | None = None
+    guests: list[dict] = field(default_factory=list)  # people outside Bianca on the invite: name, address, response
+    matched_by: str | None = None  # the guest domain that tied this meeting to its deal, when nothing else did
 
 
 @dataclass

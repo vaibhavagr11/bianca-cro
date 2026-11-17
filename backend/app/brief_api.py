@@ -21,7 +21,7 @@ from app.brief_text import prepare_table_text
 from app.config import settings
 from app.gmail import domain
 from app.ingest import _workspace_id, require_token
-from app.pipeline import is_working_client
+from app.pipeline import is_working_client, normalize_name
 from app.pipeline_freshness import check_fresh_pipeline, require_fresh_pipeline
 from app.process import _claude
 
@@ -37,22 +37,23 @@ FOUNDER_ORDER = ["RG", "NC"]  # sections in this order; NDL gets the small share
 DISPLAY = {"RG": ("Ramiro", "Ramiro Godfrid"), "NC": ("Nico", "Nico Casaux"), "NDL": ("Nico DL", "Nico de León")}
 
 
-def _sales_deals(conn, workspace_id) -> tuple[dict[str, dict], set[str]]:
+def _sales_deals(conn, workspace_id) -> tuple[dict[str, dict], dict[str, str]]:
+    """(deals the brief covers by company id, working clients as company id -> name). Working clients stay out."""
     active = {}
-    working_clients = set()
+    working_clients = {}
     for deal in conn.execute(
             "select o.id, o.company_id, c.name, o.stage, o.stage_rank, o.owner_code, o.removed_at from opportunities o"
             " join companies c on c.id = o.company_id where o.workspace_id = %s order by o.id",
             (workspace_id,)):
         company_id = str(deal["company_id"])
         if is_working_client(deal["stage"]):
-            working_clients.add(company_id)
+            working_clients[company_id] = deal["name"]
         elif deal["removed_at"] is None:
             active[company_id] = deal
     return active, working_clients
 
 
-def _working_client_record(record: dict, working_clients: set[str]) -> bool:
+def _working_client_record(record: dict, working_clients: dict[str, str]) -> bool:
     # A rules link can identify the company even when the primary link is absent or disputed.
     return str(record["company_id"]) in working_clients or str(record.get("rules_company_id")) in working_clients
 
@@ -151,7 +152,46 @@ def _profile_sales_entry(entry: dict, profile: dict, sales_by_id: dict[str, dict
                                   for r in evidence)
 
 
-def _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, email_to_code, sales) -> list[brief.Meeting]:
+# Words too common in company names to tie a guest's email domain to one deal on their own.
+_GENERIC_NAME_WORDS = frozenset("grupo group foods food wines wine brands brand company companies club coca cola "
+                                "distribuidora distri bebidas drinks snacks snack global international holding "
+                                "holdings corp corporation limited industrias mexico argentina peru chile usa".split())
+
+
+def _deal_for_guests(guests: list[dict], deals: dict[str, dict], working_clients: dict[str, str],
+                     domain_company: dict[str, str], contact_company: dict[str, str]) -> tuple[str | None, str | None]:
+    """(company id, the domain that decided it) for a meeting no other rule linked, from who is invited.
+
+    First what entity resolution already learned (a guest's address or domain tied to one company). Failing that,
+    a guest domain that carries exactly one pipeline company's distinctive name (freestylesnacking.com -> Freestyle
+    Snacks). Two different companies on one invite, or a free-mail guest we do not know, decide nothing.
+    """
+    found: dict[str, str] = {}
+    for guest in guests:
+        address = guest["address"]
+        host = domain(address)
+        company = contact_company.get(address) or (None if host in resolution.FREEMAIL else domain_company.get(host))
+        if company:
+            found.setdefault(company, host)
+    if not found:
+        for guest in guests:
+            host = domain(guest["address"])
+            if host in resolution.FREEMAIL or brief_v2.helpdesk_host(host):
+                continue
+            label = host.split(".")[0].replace("-", "")
+            names = {**working_clients, **{company_id: d["name"] for company_id, d in deals.items()}}
+            for company_id, name in names.items():
+                words = [w.replace("-", "") for w in normalize_name(name).split()]
+                if any(len(w) >= 5 and w not in _GENERIC_NAME_WORDS and w in label for w in words):
+                    found.setdefault(company_id, host)
+    if len(found) != 1:
+        return None, None
+    return next(iter(found.items()))
+
+
+def _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, email_to_code, sales, *,
+                       internal: set[str] = frozenset(), domain_company: dict[str, str] | None = None,
+                       contact_company: dict[str, str] | None = None) -> list[brief.Meeting]:
     # Preserve prep only when a qualifying action is supported by this particular meeting.
     prep: dict[str, str] = {}
     for r in sales:
@@ -159,6 +199,7 @@ def _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, em
                 and r["type"] in ("commitment", "next_step")):
             prep.setdefault(str(r["origin_record_id"]), r["text"])
     start = datetime.combine(today, time.min, tz)
+    ours = set(internal) | {d.lower() for d in settings.project_team_domains}
     meetings = []
     for m in conn.execute(
             "select id, subject, occurred_at, participants, company_id, rules_company_id from source_records"
@@ -167,12 +208,23 @@ def _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, em
             " order by occurred_at", (workspace_id, start, start + timedelta(days=2))):
         if _working_client_record(m, working_clients):
             continue
-        deal = deals.get(str(m["company_id"]))
-        codes = sorted({email_to_code[a["address"]] for a in (m["participants"] or {}).get("attendees") or []
-                        if a.get("address") in email_to_code})
+        attendees = [a for a in (m["participants"] or {}).get("attendees") or [] if a.get("address")]
+        guests = [{"address": a["address"].lower(), "name": (a.get("name") or "").strip(), "response": a.get("response")}
+                  for a in attendees if "@" in a["address"] and domain(a["address"].lower()) not in ours
+                  and domain(a["address"].lower()) not in resolution.IGNORED_DOMAINS]
+        # The classifier's link first, then the people-based link, then the guests' own domains.
+        deal = deals.get(str(m["company_id"])) or deals.get(str(m.get("rules_company_id")))
+        matched_by = None
+        if deal is None and not m["company_id"] and internal:
+            company_id, matched_by = _deal_for_guests(guests, deals, working_clients, domain_company or {},
+                                                      contact_company or {})
+            if company_id in working_clients:
+                continue            # a working client's meeting: out of the brief, like the rest of its activity
+            deal = deals.get(company_id)
+        codes = sorted({email_to_code[a["address"]] for a in attendees if a.get("address") in email_to_code})
         meetings.append(brief.Meeting(m["occurred_at"].astimezone(tz), m["subject"] or "(no title)",
                                       deal["name"] if deal else None, deal["stage"] if deal else None, codes,
-                                      context=prep.get(str(m["id"]), "")))
+                                      context=prep.get(str(m["id"]), ""), guests=guests, matched_by=matched_by))
     return meetings
 
 
@@ -381,7 +433,8 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
                 cands.append(c)
 
         # Meetings today and tomorrow (local time), not cancelled.
-        meetings = _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, email_to_code, sales)
+        meetings = _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, email_to_code, sales,
+                                      internal=internal)
 
         # Changes since the last brief.
         changes: list[brief.Change] = []
@@ -673,7 +726,9 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                     if gate:
                         sources[f"thread:{thread_id}"] = ActionSource("reply", str(t["id"]), t["occurred_at"])
 
-        meetings = _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, email_to_code, sales)
+        meetings = _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, email_to_code, sales,
+                                      internal=internal, domain_company=domain_company,
+                                      contact_company=contact_company)
 
         # What changed: only records stored since the last brief can hold a development; each is then dated by
         # its source event time (email sent, meeting date), never by when we stored it.
@@ -830,6 +885,10 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
     ndl = ndl[:brief.MAX_NDL]
     ndl_review = brief_review.verify_v2(sections, ndl, {d["name"]: key for key, d in deals.items()}, sources, gate) \
         if gate else None
+    # Prep is written last, from the rows that survived the check above, so it never revives a closed action.
+    for s in sections:
+        s.meetings = [(m, prep or brief_v2.meeting_prep(m, s, views.get(m.deal), today, checked=gate is not None))
+                      for m, prep in s.meetings]
 
     changes: list[brief_v2.ChangeRow] = []
     for ch in stage_changes:
