@@ -1459,6 +1459,15 @@ def _long_date(d: date, today: date) -> str:
 
 
 def change_label(c: ChangeRow) -> str:
+    notes += [(f"<b>{_e(label)}</b> " if label else "") + _e(text) for label, text in sheet_footers(s, today)]
+    if notes:
+        out.append("".join(f'<p style="margin:6px 0 0;font:12px/1.5 {FONT};color:{MUTED}">{n}</p>' for n in notes))
+    return "".join(out) + verification_html(s.verification)
+
+
+def sheet_footers(s: Section, today: date) -> list[tuple[str, str]]:
+    """(label, text) for the lines about dated Sheet steps that are not rows today; the same in HTML and text."""
+    out = []
     if c.kind == "late" and c.event:
         return f"from {_date(c.event)}, recorded late"
     return c.source
@@ -1580,6 +1589,8 @@ def to_payload(sections: list[Section], ndl_rows: list[TodayRow], changes: list[
                      "replied_before": w.replied_before, "auto_reply": w.auto_reply, "thread_id": w.thread_id,
                      "action": w.action}
                     for w in s.waiting], "more_waiting": s.more_waiting,
+            lines.append(RESURFACE_NOTE)
+        lines += [f"{label} {text}".strip() for label, text in sheet_footers(s, today)]
         "unclear": [v.deal for v in s.unclear], "dormant": s.dormant,
         "backlog": {"count": s.backlog.count, "deals": s.backlog.deals, "oldest": s.backlog.oldest,
                     "exceptions": [item(i) for i in s.backlog.exceptions]},
