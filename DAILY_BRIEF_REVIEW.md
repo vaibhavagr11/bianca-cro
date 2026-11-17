@@ -54,3 +54,33 @@ uv run pytest -q
 Before approving, record the deployed revision and n8n path reviewed, the result of one staging render with approved long-field examples, the forced review outcome, and the policy for a blocked build. A successful sign-off includes a complete, faithful description at or below 160 characters, a valid destination and message body on success, and a visible operator outcome on review without a duplicate or stale send.
 
 [Core tests](backend/tests/test_brief_text.py) · [V1 display tests](backend/tests/test_brief_v1_text.py) · [V2 render and API tests](backend/tests/test_brief_v2_text.py)
+
+
+## 11/17/2026 - fixes from the 11/09 evals and the founders' 11/12 session
+
+Branch `brief-fixes-1117`. Everything below is deterministic code in the v2 brief (the version n8n requests); no prompt, migration, n8n workflow or required setting changed. All new settings have defaults in [config.py](backend/app/config.py).
+
+| What a founder sees | Rule | Where |
+| --- | --- | --- |
+| A date set in the Sheet brings the deal back | A Next step bullet ending in `(complete by Nov 16, 2026)` shows in **Needs you today** on that date, tagged **Sheet date**, source "Sheet next step". It stays, marked late, for `BRIEF_SHEET_STEP_OVERDUE_DAYS` (14), then becomes a one-line reminder to update the Sheet. Not for Paused deals or working clients. If the same step also exists as an extracted item, the item is held until the date and the Sheet row replaces it, so a step is never listed twice. Sheet rows have a Done button and are not sent to the pre-send check. | [brief_sheet_steps.py](backend/app/brief_sheet_steps.py), `brief_api._apply_sheet_dates`, `brief_v2.sheet_rows` |
+| No "keep following up" rows | Nudge-only items and suggestions are replaced by one time-based reminder per deal: "3 weeks since your last email - follow up this week", on the first brief on or after each `BRIEF_NUDGE_EVERY_DAYS` (7) mark, on the Waiting row when there is one, else under Follow-ups. After `BRIEF_PAUSE_AFTER_EMAILS` (5) of our emails in a row with no reply: "5 emails with no reply - consider moving to Paused". | `brief_v2.Cadence`, `_split_followups`, `_waiting_status` |
+| Waiting items never in Deals to move | A step or blocker that only says the customer has not answered ("Wait for Franco's reply", "No reply since Oct 21") is the waiting state, never a next move or a Situation. | `brief_followups.is_waiting_only` |
+| Shorter tables | No table lists more than `BRIEF_MAX_TABLE_ROWS` (7) rows; a line under the table counts what was left out. A deal already in Needs you today gets no second, generic row in Deals to move. | `brief_v2.cap_tables`, `select_changes` |
+| Quiet In Talks deals, a few at a time | "Quiet In Talks deals to revisit (3 of N)": In Talks, no recorded contact in over two weeks or none at all, nothing else open. `BRIEF_RESURFACE_PER_DAY` (3, 0 = off) per founder, longest-untouched first; a deal that was listed waits `BRIEF_RESURFACE_COOLDOWN_DAYS` (14), read from the archived briefs. | `brief_v2.build_section` |
+| Pilots: sales items only | On a Pilot deal, items stored before scopes existed (blank scope) are hidden (`BRIEF_PILOT_STRICT_SCOPE`, default on). | `brief_api._scoped_rows` |
+| Prep on every meeting | Written last, from rows that survived the pre-send check: who is on the invite and whether they accepted, then the most pressing row the brief shows for the deal, else its open issue, Sheet next step, summary or last contact. A meeting the classifier did not link is tied to a deal when a guest's address or domain points to exactly one pipeline company. | `brief_v2.meeting_prep`, `brief_api._deal_for_guests` |
+| Cancelled meetings | Google's "Canceled event" mail, which is never stored, now marks the stored meeting cancelled at Gmail ingest when it is newer than the latest calendar sync. | `gmail.cancellation_notices`, `ingest.apply_cancellation_notices` |
+| Situation text | Sentences no longer end at "2. In Talks", decimals, abbreviations, initials or inside a quote; a long Situation is cut at a clause break, never with an ellipsis. | `brief_text.split_sentences` |
+| "Customer replied" | Help-desk ticket notices are system mail. "Customer replied" is said only for a sender on the deal company's own domain; anyone else is named by domain. Up to 7 changes show, customer-written ones first. | `brief_v2.is_automated`, `reply_origin` |
+| Already-answered rows | Without the pre-send check, a row whose email thread we have written in since is marked "you wrote back Nov 5 - still open?" (not hidden: a later email can be a thank-you). | `brief_api.answered_after` |
+| Stable wording | A regenerated suggestion that cites the same insights and says the same thing keeps its previous wording, so rows and Done clicks stay stable. | `profiler.keep_wording` |
+
+### Check after deploy
+
+- **Sheet dates.** In a dry run (`POST /brief/build?version=v2&dry_run=true`), confirm a row dated today in the live Sheet appears as **Sheet date** and that `payload.sections[].sheet_later` lists the future ones. A slash date such as 03/04/2026 is not read (ambiguous); the Hub writes month names.
+- **Weekly nudge and quiet-deal batch.** Both read the `briefs` archive (`for_date`, `payload.sections[].resurfaced`). Dry runs do not archive, so a preview repeats the same nudge and batch until a real brief is sent.
+- **Cancelled meetings.** Only works if the n8n Gmail search returns "Canceled event" mail; check `meetings_cancelled` in the `/ingest/gmail` response. Re-fetching the calendar right before the build is still the complete fix and is an n8n change.
+- **Friday mail gap (finding 1).** Not fixed here: the Gmail search in n8n needs `newer_than:4d` instead of `newer_than:2d`. The backend already skips mail it has (`store_gmail` matches on Gmail id and Message-ID), so the longer window is safe.
+- **Pilots.** Product-work items that were extracted with a sales scope before PR #17 still show; they need a re-extraction run on Pilot deals.
+
+Tests: `cd backend && uv run pytest -q` (803 passed, 13 skipped, which need a local test database). The end-to-end fixture is [test_brief_fixture_1117.py](backend/tests/test_brief_fixture_1117.py); run it with `BRIEF_FIXTURE_HTML=<path>` to save the rendered email.
