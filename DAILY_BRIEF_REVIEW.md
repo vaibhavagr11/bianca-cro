@@ -83,4 +83,30 @@ Branch `brief-fixes-1117`. Everything below is deterministic code in the v2 brie
 - **Friday mail gap (finding 1).** Not fixed here: the Gmail search in n8n needs `newer_than:4d` instead of `newer_than:2d`. The backend already skips mail it has (`store_gmail` matches on Gmail id and Message-ID), so the longer window is safe.
 - **Pilots.** Product-work items that were extracted with a sales scope before PR #17 still show; they need a re-extraction run on Pilot deals.
 
-Tests: `cd backend && uv run pytest -q` (803 passed, 13 skipped, which need a local test database). The end-to-end fixture is [test_brief_fixture_1117.py](backend/tests/test_brief_fixture_1117.py); run it with `BRIEF_FIXTURE_HTML=<path>` to save the rendered email.
+### Release review (11/17) - what changed after running the branch on a real database
+
+Found by building eight consecutive days of briefs against Postgres from a seeded pipeline (36 deals), first with master's code and then with this branch on the same archive. Fixed here:
+
+- **Nothing optional can stop the send.** Sheet dates, the weekly nudge, the quiet-deal batch, guest matching, meeting prep and the "wrote back" cue are extras: if one fails, the reason is logged (`brief built without ...`, `sheet dates skipped for opportunity ...`, `brief section RG rebuilt without ...`) and the brief is built without it. The archive reads run in a savepoint. At Gmail ingest a cancellation notice the database cannot read is skipped on its own; it used to fail the whole mail sync. A profile is still saved when its earlier wording cannot be carried over.
+- **Blank or huge text.** A blank insight, action or summary no longer raises in the sentence splitter (it did since 11/17; before that it gave blank text). A Next step line with a long run of spaces after "(complete by" no longer stalls the build, and a very long text is read once.
+- **Paused deals get no reminder.** No "follow up this week", no "consider moving to Paused" (the deal is already Paused) and no Follow-ups row. Their Waiting row reads as it did before 11/17.
+- **The hold-back rule never hides what is due.** An extracted item that is due (or due tomorrow) or overdue by its own date stays in the brief even when the same step carries a later date in the Sheet.
+- **Ticket numbers.** "Request #123" in a subject marks a system notice only when the sender is a help-desk host or a support mailbox. A buyer's "Solicitud N° 4521 - alta de proveedor" and our own replies in that thread are people again (they had dropped out of Reply needed and Waiting). A desk label in brackets ("[Acme Help Center]") is still enough on its own.
+- Smaller: a deal with a meeting today or tomorrow is not listed as quiet; a long-past Sheet date from another year shows its year; "Nov 16, 26" is read as 2026.
+
+Off switches (all default to the 11/17 behaviour; set the variable on the backend and the next build uses it):
+
+| Behaviour | Turn off with | With it off |
+| --- | --- | --- |
+| 7-row cap | `BRIEF_MAX_TABLE_ROWS=1000` | Needs you today and Meetings list every row; Deals to move (6), Waiting (6) and Follow-ups (3) keep their earlier limits. What changed lists every change (the old 3 + 2 quota is gone for good). |
+| Weekly nudge and "consider Paused" | `BRIEF_FOLLOWUP_NUDGES=false` | Reminders print as written and Waiting rows carry no nudge, as before 11/17. Waiting statements ("Wait for Franco's reply") are ordinary steps again. |
+| Quiet In Talks batch | `BRIEF_RESURFACE_PER_DAY=0` | No batch; the "Confirm status" and "no record in 45+ days" lines count those deals as before. |
+| Pilot strict scope | `BRIEF_PILOT_STRICT_SCOPE=false` | Not-yet-scoped items show on Pilot deals again. |
+| Sheet dates | `BRIEF_SHEET_DATES=false` | "(complete by ...)" notes are not read. |
+| Holding the matching item until the Sheet date | `BRIEF_SHEET_HOLD_MATCHING=false` | Sheet dates still show on their day; the extracted item keeps showing by its own rules before it. |
+
+No switch (by design, they are corrections): prep lines and guest matching, cancelled meetings, "Customer replied" wording, Situation cuts, the "you wrote back" cue, kept wording, and "no second generic row for a deal already in Needs you today".
+
+Known limits, for the team to decide: see the review report (Needs you today is capped at 7 with only a count for the rest; a Sheet-date row stays up to 14 days and sorts first; "consider moving to Paused" repeats daily; a missed brief day can bring two nudges less than 7 days apart; a cancellation notice matches by title and day only).
+
+Tests: `cd backend && uv run pytest -q` (832 passed, 13 skipped, which need a local test database). The review's tests are in [test_brief_review_1117.py](backend/tests/test_brief_review_1117.py). The end-to-end fixture is [test_brief_fixture_1117.py](backend/tests/test_brief_fixture_1117.py); run it with `BRIEF_FIXTURE_HTML=<path>` to save the rendered email.
