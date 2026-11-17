@@ -119,18 +119,19 @@ def brief(monkeypatch, brief_client, request):
 def test_fixture_brief_reads_right_section_by_section(brief):
     text, page, founder = brief["text"], brief["page"], brief["founder"]
 
-    # Needs you today: the Sheet date is there, the table stops at 7 and says what it left out (B-15, B-09).
+    # Needs you today: the Sheet date is there, and every row shows - this table is never cut (B-15; decision 11/17).
     assert "• [Sheet date] Andes Dairy — Email Franco the revised deck (due today)" in text
-    assert "Needs you today (10)" in page and len(founder["today"]) == 7
-    assert "+ 3 more need you today - left out to keep this table to 7 rows" in page
+    assert "Needs you today (10)" in page and len(founder["today"]) == 10 and founder["more_today"] == 0
+    assert "more need you today" not in page and "more need you today" not in text
     assert "Revisit after their planning cycle" not in page
     assert "1 dated Sheet step(s) not due yet; next: Long Lead Co, Feb 17, 2027." in page
 
     # Deals to move: the Situation survives the stage number (finding 13) and no table is longer than 7 (B-09).
     assert "Cerveza Norte is in '2. In Talks' after two calls with the commercial team." in page
     assert "is in '2.<" not in brief["html"] and "…" not in page
-    for table in page.split("<table")[1:]:
-        assert table.split("</table>")[0].count("<tr>") - 1 <= 7
+    for table in page.split("<table")[1:]:                 # every table but Needs you today stops at 7 rows
+        rows = table.split("</table>")[0]
+        assert rows.count("<tr>") - 1 <= (10 if ">Due now<" in rows else 7)
 
     # Waiting on their reply: the waiting deal is only here, with the weekly nudge; five emails suggest Paused.
     assert "• Farma Sur: To Buyer · no reply yet, 2 weeks since your last email - follow up this week" in text
@@ -175,7 +176,7 @@ def test_fixture_brief_reads_right_section_by_section(brief):
 def test_fixture_brief_holds_under_the_pre_send_check(brief):
     text, page, founder = brief["text"], brief["page"], brief["founder"]
     assert "• [Sheet date] Andes Dairy — Email Franco the revised deck (due today)" in text   # not sent for checking
-    assert len(founder["today"]) == 7 and founder["more_today"] == 3
+    assert len(founder["today"]) == 10 and founder["more_today"] == 0
     assert "• Silent Wines: To Buyer · 5 emails with no reply - consider moving to Paused" in text
     assert "Farma Sur" not in {h["deal"] for h in founder["highlights"]}
     assert all(m["prep"] for m in founder["meetings"]) and "Called-off demo" not in page

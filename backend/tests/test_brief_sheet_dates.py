@@ -42,9 +42,9 @@ def test_dated_sheet_step_is_due_on_its_date_and_overdue_after_it(monkeypatch, b
         sheet_deal("Undated", "- Email her Monday"),
     ]
     result = build(brief_client(BriefData(deals, [], [], [])), verification)
-    assert today_rows(result) == [                   # the late one first
-        ("Late", "Sheet date", "Call Ana about pricing", "due Nov 2, 3d late", "Sheet next step"),
+    assert today_rows(result) == [                   # what is due today first, then the late one (decision 11/17)
         ("Due Today", "Sheet date", "Email Franco the revised deck", "due today", "Sheet next step"),
+        ("Late", "Sheet date", "Call Ana about pricing", "due Nov 2, 3d late", "Sheet next step"),
     ]
     section = result["payload"]["sections"][0]
     assert section["sheet_stale"] == [{"deal": "Long Past", "due": "2026-10-01"}]

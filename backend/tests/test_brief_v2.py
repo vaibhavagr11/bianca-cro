@@ -1,6 +1,7 @@
 """Regression tests for brief v2. Each mirrors a failure seen in the Oct 28 briefs (v1, then the first v2 draft)."""
 
 import re
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
 
@@ -740,9 +741,10 @@ def test_waiting_list_is_per_founder_prospects_first_newest_silence_first():
     assert [w.deal for w in shown] == ["Andina Chile", "Arca Peru", "Customer Co"] and more == 0
     assert waiting_text(wait("Arca Peru", 50, nudges=3, auto=True)) == "To Juan Pérez · no reply to our 3 emails, out-of-office received"
     assert waiting_text(wait("Farmater", 7, nudges=4, replied=True)) == "To Juan Pérez · 4 emails since their last reply"
-    # B-11: from the fifth unanswered email the row suggests Paused instead of counting on.
-    assert waiting_text(wait("Farmater", 7, nudges=8, replied=True)) == \
+    # B-11: from the fifth unanswered email the row suggests Paused - on the deal's weekly day only (decision 11/17).
+    assert waiting_text(replace(wait("Farmater", 7, nudges=8, replied=True), nudge=True)) == \
         "To Juan Pérez · 8 emails with no reply - consider moving to Paused"
+    assert waiting_text(wait("Farmater", 9, nudges=8, replied=True)) == "To Juan Pérez · 8 emails since their last reply"
 
 
 @pytest.mark.parametrize("has_evidence", [True, False])
@@ -904,8 +906,10 @@ def test_waiting_row_carries_the_weekly_nudge_and_suggests_paused_after_five_ema
     assert waiting_text(quiet_day) == "To Juan · no reply to our 2 emails"
     fifth = Waiting("Andina", "2. In Talks", "Juan", TODAY - timedelta(days=21), 21, 5, True, False, None, nudge=True)
     assert waiting_text(fifth) == "To Juan · 5 emails with no reply - consider moving to Paused"
-    assert waiting_text(Waiting("Andina", "2. In Talks", "Juan", TODAY, 21, 3, True, False, None, pause_after=3)) == \
-        "To Juan · 3 emails with no reply - consider moving to Paused"
+    assert waiting_text(Waiting("Andina", "2. In Talks", "Juan", TODAY, 21, 3, True, False, None, pause_after=3,
+                                nudge=True)) == "To Juan · 3 emails with no reply - consider moving to Paused"
+    # Between two weekly days the row only states the silence: the suggestion shows at most once per 7 days.
+    assert waiting_text(replace(fifth, nudge=False)) == "To Juan · 5 emails since their last reply"
 
 
 def test_vague_follow_up_is_replaced_by_one_time_based_nudge_per_deal():
@@ -923,9 +927,11 @@ def test_vague_follow_up_is_replaced_by_one_time_based_nudge_per_deal():
     quiet = build_section("RG", "RG", "Ramiro", {"Andina": v}, vague, [], TODAY, DISPLAY, cadence=told)
     assert quiet.followups == [] and quiet.highlights == []        # and no generic "Confirm status" row instead
 
-    v.unanswered_emails = 5
-    paused = build_section("RG", "RG", "Ramiro", {"Andina": v}, vague, [], TODAY, DISPLAY, cadence=told)
+    v.unanswered_emails = 5                                        # on the weekly day, Paused replaces the nudge
+    paused = build_section("RG", "RG", "Ramiro", {"Andina": v}, vague, [], TODAY, DISPLAY)
     assert [m.text for m in paused.followups] == ["Andina: 5 emails with no reply - consider moving to Paused."]
+    again = build_section("RG", "RG", "Ramiro", {"Andina": v}, vague, [], TODAY, DISPLAY, cadence=told)
+    assert again.followups == []                                   # already shown this week: not repeated daily
 
     v.unanswered_emails, v.last_reply = 0, TODAY - timedelta(days=3)     # they wrote last: nothing to nudge
     assert build_section("RG", "RG", "Ramiro", {"Andina": v}, vague, [], TODAY, DISPLAY).followups == []

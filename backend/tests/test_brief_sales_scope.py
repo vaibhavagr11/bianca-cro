@@ -531,17 +531,23 @@ def test_guest_domain_matching_needs_one_distinctive_company_and_respects_workin
 
 def test_waiting_rows_nudge_weekly_and_suggest_paused_after_five_unanswered_emails(brief_client):
     silent = [email(f"silent-{n}", "silent", "Can you confirm the pilot dates?", days=days, outgoing=True,
-                    thread="silent-thread") for n, days in enumerate((40, 33, 26, 19, 12))]
+                    thread="silent-thread") for n, days in enumerate((42, 35, 28, 21, 14))]
+    midweek = [email(f"mid-{n}", "midweek", "Can you confirm the pilot dates?", days=days, outgoing=True,
+                     thread="mid-thread") for n, days in enumerate((40, 33, 26, 19, 12))]
     weekly = email("weekly-ask", "weekly", "Can you approve the proposal?", days=14, outgoing=True)
     told = email("told-ask", "told", "Can you share the store list?", days=15, outgoing=True)
-    data = BriefData([deal("silent"), deal("weekly"), deal("told")], [*silent, weekly, told], [], [])
+    data = BriefData([deal("silent"), deal("midweek"), deal("weekly"), deal("told")],
+                     [*silent, *midweek, weekly, told], [], [])
     data.briefed = [NOW.date() - timedelta(days=1)]          # yesterday's brief carried "told"'s day-14 nudge
     result = brief_client(data).post("/brief/build?dry_run=true&version=v2",
                                      headers={"X-Ingest-Token": "test-token"}).json()
     rows = {w["deal"]: w for w in result["payload"]["sections"][0]["waiting"]}
     assert rows["silent"]["nudges"] == 5
     text = result["text"]
-    assert "• silent: To Buyer · 5 emails with no reply - consider moving to Paused (12d since Oct 24)" in text
+    # Decision 11/17: the Paused suggestion keeps the weekly cadence and takes the nudge's place on that day.
+    assert "• silent: To Buyer · 5 emails with no reply - consider moving to Paused (14d since Oct 22)" in text
+    assert "• midweek: To Buyer · no reply to our 5 emails (12d since Oct 24)" in text    # its day-7 mark has passed
+    assert text.count("consider moving to Paused") == 1 and text.count("follow up this week") == 1
     assert "• weekly: To Buyer · no reply yet, 2 weeks since your last email - follow up this week (14d since Oct 22)" in text
     assert "• told: To Buyer · no reply yet (15d since Oct 21)" in text      # at most one nudge per 7 days
 
@@ -550,7 +556,7 @@ def test_nudge_thresholds_are_settings(monkeypatch, brief_client):
     monkeypatch.setattr(brief_api.settings, "brief_pause_after_emails", 2)
     monkeypatch.setattr(brief_api.settings, "brief_nudge_every_days", 10)
     two = [email(f"two-{n}", "two", "Can you confirm?", days=days, outgoing=True, thread="two-thread")
-           for n, days in enumerate((20, 9))]
+           for n, days in enumerate((20, 10))]
     ten = email("ten-ask", "ten", "Can you approve the proposal?", days=10, outgoing=True)
     result = brief_client(BriefData([deal("two"), deal("ten")], [*two, ten], [], [])).post(
         "/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"}).json()
@@ -606,20 +612,21 @@ def test_no_table_lists_more_than_seven_rows_and_says_how_many_were_left_out(mon
     result = client.post(f"/brief/build?dry_run=true&version=v2&verification={verification}",
                          headers={"X-Ingest-Token": "test-token"}).json()
     founder = result["payload"]["sections"][0]
-    assert len(founder["today"]) == 7 and founder["more_today"] == 2
+    assert len(founder["today"]) == 9 and founder["more_today"] == 0     # decision 11/17: this table is never cut
     assert len(founder["highlights"]) <= 7 and len(founder["followups"]) <= 7
     assert len(founder["meetings"]) == 7 and founder["more_meetings"] == 2
     assert len(founder["waiting"]) <= 7
     assert len(founder["waiting"]) + founder["more_waiting"] == (9 if verification == "off" else len(founder["waiting"]))
     assert "Ramiro 9 today" in result["subject"]
     page = html.unescape(result["html"])
-    assert "Needs you today (9)" in page and "+ 2 more need you today - left out to keep this table to 7 rows" in page
-    assert "+ 2 more on your calendar" in page
-    if verification == "off":
-        assert "+ 3 more in the Sheet waiting on a reply" in page
-    assert "+ 2 more need you today - left out to keep this table to 7 rows" in result["text"]
+    assert "Needs you today (9)" in page and "more need you today" not in page + result["text"]
+    for body in (page, result["text"]):                                 # a capped table names what it left out
+        assert "+ 2 more on your calendar: Deal 08, Deal 09" in body
+        if verification == "off":
+            assert "+ 3 more in the Sheet waiting on a reply: Deal 07, Deal 08, Deal 09" in body
     for table in page.split("<table")[1:]:
-        assert table.split("</table>")[0].count("<tr>") - 1 <= 7        # header row aside
+        rows = table.split("</table>")[0]
+        assert rows.count("<tr>") - 1 <= (9 if ">Due now<" in rows else 7)        # header row aside
 
 
 def test_table_limit_is_a_setting(monkeypatch, brief_client):
@@ -629,7 +636,7 @@ def test_table_limit_is_a_setting(monkeypatch, brief_client):
     result = brief_client(BriefData([deal(name) for name in names], [], insights, [])).post(
         "/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"}).json()
     founder = result["payload"]["sections"][0]
-    assert len(founder["today"]) == 4 and founder["more_today"] == 2 and len(founder["highlights"]) <= 4
+    assert len(founder["today"]) == 6 and founder["more_today"] == 0 and len(founder["highlights"]) <= 4
 
 
 # ---- B-12 (11/12): frozen In Talks deals come back in small batches, never all at once

@@ -28,6 +28,43 @@ def build(client):
 
 # ---- 1. Needs you today shows every row
 
+@pytest.mark.parametrize("count", [1, 7, 8, 25])
+@pytest.mark.parametrize("max_rows", [7, 2])
+def test_a_deal_with_something_due_today_is_always_named_in_the_email(monkeypatch, brief_client, count, max_rows):
+    monkeypatch.setattr(brief_api.settings, "brief_max_table_rows", max_rows)
+    names = [f"Promise Co {n:02d}" for n in range(1, count + 1)]
+    insights = [insight(f"promise-{n}", name, f"Send the contract to {name}", SALES) for n, name in enumerate(names)]
+    ask = email("reply-ask", "Asker", "Can you send the price list this week?")
+    insights.append(insight("ask", "Asker", "Send the price list", SALES, type_="next_step", origin=ask,
+                            quote=ask["body"], dated=False))
+    late = {**deal("Late Sheet"), "next_step": "- Call Ana about pricing (complete by Nov 2, 2026)"}
+    data = BriefData([deal(name) for name in names] + [deal("Asker"), late], [ask], insights, [])
+    result = build(brief_client(data))
+    page, text = html.unescape(result["html"]), result["text"]
+    section = result["payload"]["sections"][0]
+    assert len(section["today"]) == count + 2 and section["more_today"] == 0
+    assert f"Needs you today ({count + 2})" in page and f"Ramiro {count + 2} today" in result["subject"]
+    for name in (*names, "Asker", "Late Sheet"):
+        assert f"<b>{name}</b>" in result["html"] and f"] {name} — " in text
+    assert "more need you today" not in page + text
+    # The customer waiting on a reply reads first, the late Sheet date last.
+    assert section["today"][0]["tag"] == "Reply needed" and section["today"][-1]["deal"] == "Late Sheet"
+
+
+def test_needs_you_today_order_is_replies_and_due_today_then_overdue_then_late_sheet_dates():
+    def row(deal, tag, late):
+        return TodayRow(deal, "2. In Talks", tag, "x", "", "RG", None, late=late)
+    rows = [row("sheet 5d late", "Sheet date", 5), row("due 3d late", "Due now", 3), row("due tomorrow", "Due now", -1),
+            row("sheet 1d late", "Sheet date", 1), row("due today", "Due now", 0), row("due 1d late", "Due now", 1),
+            row("reply", "Reply needed", 0), row("sheet today", "Sheet date", 0)]
+    assert [r.deal for r in sort_today(rows)] == [
+        "reply", "due today", "sheet today", "due tomorrow",       # cannot wait
+        "due 1d late", "due 3d late",                              # overdue by its own date, most recent first
+        "sheet 1d late", "sheet 5d late"]                          # late Sheet dates
+
+
+# ---- 2. every capped table names the deals it left out
+
 def test_left_out_names_lists_eight_deals_then_counts_the_rest():
     assert left_out_names(["Andina Chile", "Arca Peru", "Chifles", "Arca Peru", None, ""]) == "Andina Chile, Arca Peru, Chifles"
     many = [f"Deal {n}" for n in range(1, 12)]

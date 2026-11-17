@@ -1059,7 +1059,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             sections.append(section(plain, items_before_sheet, None, 0))
 
     ndl = [brief_v2.TodayRow(i.deal, views[i.deal].stage, "Due now", i.text, f"due {i.due:%b} {i.due.day}", "Nico DL",
-                             i.link, i.id, i.source, f"insight:{i.id}")
+                             i.link, i.id, i.source, f"insight:{i.id}", late=(today - i.due).days)
            for i in items if i.route == "NDL" and i.kind == "owed" and i.bucket in ("today", "overdue")]
     ndl += [brief_v2.TodayRow(v.deal, v.stage, "Reply needed", brief_v2.reply_text(v.unanswered),
                               f"received {v.unanswered.days}d ago", "Nico DL", v.unanswered.link, v.unanswered.item_id,
