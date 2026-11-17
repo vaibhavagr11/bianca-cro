@@ -55,6 +55,7 @@ class Item:
     link: str | None = None
     bucket: str = ""
     kind: str = "next_step"         # owed | customer_request | proposed | next_step
+    replied: date | None = None     # we wrote back in its email thread on this day, after it was asked
 
 
 @dataclass
@@ -70,6 +71,7 @@ class Note:
     ref: str | None = None          # stable id of a suggestion, so a founder can dismiss it
     followup_only: bool = False
     on: date | None = None          # day of the newest evidence it cites
+    replied: date | None = None     # we wrote in every email thread it cites on or before this day, after `on`
 
 
 @dataclass
@@ -491,8 +493,13 @@ def addresses(evidence: frozenset, blocker: Note) -> bool:
     return bool(evidence & blocker.evidence)
 
 
+def _still_open(when: str, replied: date | None) -> str:
+    """Mark a row whose email thread we have answered since: likely handled, but only a person can say."""
+    return f"{when} · you wrote back {_date(replied)} - still open?" if replied else when
+
+
 def item_move(tag: str, text: str, when: str, i: Item) -> Move:
-    return Move(tag, text, when, i.link, i.id, i.source, f"insight:{i.id}", i.deal)
+    return Move(tag, text, _still_open(when, i.replied), i.link, i.id, i.source, f"insight:{i.id}", i.deal)
 
 
 def email_move(tag: str, text: str, when: str, u: Unanswered, deal: str | None = None) -> Move:
@@ -500,7 +507,7 @@ def email_move(tag: str, text: str, when: str, u: Unanswered, deal: str | None =
 
 
 def note_move(tag: str, text: str, when: str, n: Note, link: str | None, deal: str | None = None) -> Move:
-    return Move(tag, text, when, link, None, n.source, f"rec:{n.ref}" if n.ref else None, deal)
+    return Move(tag, text, _still_open(when, n.replied), link, None, n.source, f"rec:{n.ref}" if n.ref else None, deal)
 
 
 def recorded_move(i: Item, text: str) -> Move:

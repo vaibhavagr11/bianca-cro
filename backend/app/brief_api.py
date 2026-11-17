@@ -745,6 +745,13 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                 " where workspace_id = %s and for_date >= %s and for_date < %s",
                 (workspace_id, today - timedelta(days=settings.brief_resurface_cooldown_days), today))
             for name in r.get("deals") or [])
+        def answered_after(thread_id: str | None, at: datetime | None) -> datetime | None:
+            """When we last sent a real email to someone outside Bianca in this thread after the given moment."""
+            if at is None:
+                return None
+            return max((m["at"] for m in threads.get(thread_id or "", [])
+                        if not m["automated"] and not from_customer(m) and outside(m) and m["at"] > at), default=None)
+
         waiting_candidates: list[brief_v2.Waiting] = []
         waiting: dict[str, brief_v2.Waiting] = {}
         for thread_id, msgs in threads.items():
@@ -843,6 +850,19 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                              followup_only=with_why and entry.get("followup_only") is True,
                              on=when.date() if when else None)
 
+    def replied_since(evidence: frozenset):
+        """Already-done cue for builds without the pre-send check (11/09 evals, FEMSA): the day we last wrote in
+        the email threads a suggestion rests on, if in every one of them we wrote after the newest thing it cites.
+
+        A later email is not proof the suggestion was carried out (it may be a thank-you), so the row is kept and
+        only marked "you wrote back <day> - still open?". A verified build asks the pre-send check instead.
+        """
+        cited = [ins_by_id[i] for i in evidence if i in ins_by_id]
+        times = [r["origin_occurred_at"] or r["occurred_at"] for r in cited if r["origin_occurred_at"] or r["occurred_at"]]
+        mail = {r["unit_id"] for r in cited if r["source"] == "gmail"}
+        replies = [answered_after(thread_id, max(times)) for thread_id in mail] if times else []
+        return max(replies).astimezone(tz).date() if replies and all(replies) else None
+
     views: dict[str, brief_v2.DealView] = {}
     for company_id, d in deals.items():
         prow = profiles.get(str(d["id"]))
@@ -853,6 +873,9 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                  and _profile_sales_entry(a, prow, sales_by_id, d)
                  and (n := note(d, a, prow, True)) and n.verified
                  and closed.get(("rec", n.ref), ("",))[0] != "done"]
+        if not gate:                    # a verified build asks the pre-send check instead
+            for n in recs_:
+                n.replied = replied_since(n.evidence)
         views[d["name"]] = brief_v2.DealView(
             d["name"], d["stage"], d["stage_rank"], d["owner_code"], last_contact.get(company_id),
             blocker=blockers[0] if blockers else None,
@@ -916,11 +939,16 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         kind = brief_v2.item_kind(r["type"], r["due_date"], speaker(r), r["quote"], side_for(r))
         if gate:
             sources[f"insight:{r['id']}"] = ActionSource.insight("recommendation" if kind == "proposed" else "commitment", r)
+        replied = None
+        if not gate and kind == "customer_request" and r["source"] == "gmail":
+            # The customer asked by email and we have written back in that thread since: flag it, do not hide it.
+            replied = answered_after(r["unit_id"], timestamp)
         items.append(brief_v2.Item(
             str(r["id"]), d["name"], r["text"], r["due_date"], recorded, r["owner_name"], route, basis, delegated,
             f"{SOURCE_LABEL.get(r['source'], r['source'])} · {when:%b} {when.day}" if when else r["source"],
             _link_for(r["source"], r["unit_id"], r["meta"]),
-            brief_v2.bucket(r["due_date"], recorded, today, t1, t2), kind))
+            brief_v2.bucket(r["due_date"], recorded, today, t1, t2), kind,
+            replied=replied.astimezone(tz).date() if replied else None))
 
     items = _apply_sheet_dates(deals, views, items, ins_rows, closed, today)
 

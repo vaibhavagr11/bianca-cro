@@ -190,3 +190,19 @@ def test_an_email_to_another_contact_at_the_company_is_not_a_reply():
     answer = activity("answer", "Pricing for the pilot is $500 per month.")   # to the person who asked
     client = FakeClaude(lambda payload: [model_verdict("handled", "R1", "Pricing for the pilot is $500 per month.")])
     assert review(reply, [answer], client).verdicts[reply.key].state == "handled"
+
+
+# ---- findings 4 and 16 (11/09 evals): a recommendation shown after the founder had already replied in the thread
+
+def test_recommendation_with_a_later_same_thread_reply_is_never_kept_as_owed_without_a_verdict():
+    rec = replace(ACTION, kind="recommendation", text="Send Patricio the whitespace-analysis overview")
+    reply = activity("reply", "Hi Patricio, here is the whitespace-analysis overview.", thread=ORIGIN.thread_id)
+    # No rule can tell a delivery from a thank-you, so with a later reply the row must be judged:
+    # without a model it is "unclear" (shown under Needs verification), never silently "still owed".
+    assert review(rec, [reply]).verdicts[rec.key] == verification.Verdict("unclear", "model_unavailable")
+    quote = "here is the whitespace-analysis overview."
+    handled = FakeClaude(lambda payload: [model_verdict("handled", "R1", quote)])
+    assert review(rec, [reply], handled).verdicts[rec.key].state == "handled"
+    assert handled.calls[0]["records"][0]["direction"] == "outbound"
+    # With no later activity at all the row stays owed by rule, with no model call.
+    assert review(rec, []).verdicts[rec.key] == verification.Verdict("still_owed", "no_later_activity", ("origin",))

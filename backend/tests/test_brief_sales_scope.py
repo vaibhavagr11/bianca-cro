@@ -701,3 +701,55 @@ def test_pilot_deal_shows_only_items_classified_as_deal_progression(monkeypatch,
     monkeypatch.setattr(brief_api.settings, "brief_pilot_strict_scope", False)
     relaxed = client.post(f"/brief/build?dry_run=true&version={version}", headers={"X-Ingest-Token": "test-token"}).json()
     assert product_work[0] in relaxed["html"]
+
+
+# ---- findings 4 and 16 (11/09 evals): "Send Patricio the overview" although Ramiro had already replied to him
+
+@pytest.mark.parametrize("verification", ["off", "shadow"])
+def test_suggestion_whose_thread_we_already_answered_is_flagged_or_left_to_the_pre_send_check(
+        monkeypatch, brief_client, verification):
+    checked = []
+
+    class Gate(PassingGate):
+        def __call__(self, actions):
+            checked.extend(actions)
+            return super().__call__(actions)
+
+    monkeypatch.setattr(brief_api, "create_gate", lambda *_: Gate())
+    ask = email("patricio-ask", "FEMSA MX", "Could you walk us through the whitespace analysis?", days=6,
+                thread="femsa-thread")
+    reply = email("ramiro-reply", "FEMSA MX", "Hi Patricio, here is the overview.", days=4, outgoing=True,
+                  thread="femsa-thread")
+    reply["reply_expectation"] = None
+    other = email("other-ask", "Other Co", "Could you share a case study?", days=6, thread="other-thread")
+    elsewhere = email("elsewhere", "Other Co", "Intro to our partner.", days=4, outgoing=True, thread="second-thread")
+    elsewhere["reply_expectation"] = None
+    suggestion = "Send Patricio the whitespace-analysis overview"
+    control = "Send the case study to Other Co"
+    insights = [
+        insight("femsa-need", "FEMSA MX", "Patricio wants a walkthrough of the whitespace analysis", SALES,
+                type_="need", origin=ask, quote=ask["body"], owner_side=None, dated=False),
+        insight("other-need", "Other Co", "The buyer wants a case study", SALES, type_="need", origin=other,
+                quote=other["body"], owner_side=None, dated=False),
+    ]
+    profiles = [
+        {"opportunity_id": "FEMSA MX-opportunity", "generated_at": NOW, "profile": {"refs": {"I1": "femsa-need"},
+         "recommended_actions": [{"action": suggestion, "evidence": ["I1"], "action_scope": SALES}]}},
+        {"opportunity_id": "Other Co-opportunity", "generated_at": NOW, "profile": {"refs": {"I1": "other-need"},
+         "recommended_actions": [{"action": control, "evidence": ["I1"], "action_scope": SALES}]}},
+    ]
+    client = brief_client(BriefData([deal("FEMSA MX"), deal("Other Co")], [ask, reply, other, elsewhere],
+                                    insights, profiles))
+    result = client.post(f"/brief/build?dry_run=true&version=v2&verification={verification}",
+                         headers={"X-Ingest-Token": "test-token"}).json()
+    moves = {h["deal"]: h["move"] for h in result["payload"]["sections"][0]["highlights"]}
+    assert moves["FEMSA MX"]["text"] == suggestion and moves["Other Co"]["text"] == control
+    if verification == "off":
+        # No pre-send check ran: the row is kept but says we already wrote back in that thread.
+        assert moves["FEMSA MX"]["when"].endswith("· you wrote back Nov 1 - still open?")
+        assert "still open?" not in moves["Other Co"]["when"]          # an email in another thread proves nothing
+    else:
+        # The pre-send check receives the suggestion anchored to Patricio's email, so it can read the reply.
+        anchored = {a.text: a for a in checked}
+        assert anchored[suggestion].origin_record_id == "patricio-ask" and anchored[suggestion].kind == "recommendation"
+        assert "still open?" not in moves["FEMSA MX"]["when"]
