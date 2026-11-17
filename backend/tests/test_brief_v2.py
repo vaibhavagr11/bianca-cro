@@ -233,8 +233,16 @@ def test_legacy_followup_recommendation_leaves_room_for_an_independent_move():
     s = section("RG", [v], [])
 
     assert [move.text for _, move, _ in s.highlights] == [next_move.text]
+    assert s.followups == []                         # B-10: three days after the last contact is too soon to nudge
+
+    v.last_contact = TODAY - timedelta(days=9)
+    s = section("RG", [v], [])
+    assert [move.text for _, move, _ in s.highlights] == [next_move.text]
     assert [move.done for move in s.followups] == ["rec:approval"]
     assert all(move.tag == "Follow up" for move in s.followups)
+    # B-10: the vague wording is replaced by how long it has been and what to do.
+    assert [move.text for move in s.followups] == [
+        "Andina Chile: 9 days since the last contact on record - follow up this week (re: pilot approval)."]
 
 
 def test_first_sentence_keeps_moves_short():
@@ -719,7 +727,10 @@ def test_waiting_list_is_per_founder_prospects_first_newest_silence_first():
     shown, more = pick_waiting(ws, "RG")
     assert [w.deal for w in shown] == ["Andina Chile", "Arca Peru", "Customer Co"] and more == 0
     assert waiting_text(wait("Arca Peru", 50, nudges=3, auto=True)) == "To Juan Pérez · no reply to our 3 emails, out-of-office received"
-    assert waiting_text(wait("Farmater", 7, nudges=8, replied=True)) == "To Juan Pérez · 8 emails since their last reply"
+    assert waiting_text(wait("Farmater", 7, nudges=4, replied=True)) == "To Juan Pérez · 4 emails since their last reply"
+    # B-11: from the fifth unanswered email the row suggests Paused instead of counting on.
+    assert waiting_text(wait("Farmater", 7, nudges=8, replied=True)) == \
+        "To Juan Pérez · 8 emails with no reply - consider moving to Paused"
 
 
 @pytest.mark.parametrize("has_evidence", [True, False])
@@ -826,3 +837,70 @@ def test_customer_replied_is_only_said_for_the_customers_own_senders():
     assert reply_origin(["agent@vtinfo.com"], own, set()) == "vtinfo.com"            # the data vendor copied in
     assert reply_origin(["support@vtinfo.zendesk.com"], None, set()) == "vtinfo.zendesk.com"
     assert helpdesk_host("support@vtinfo.zendesk.com") and not helpdesk_host("ana@delta.com")
+
+
+# ---- B-10 / B-11 (11/12 founder session): time-based nudges, weekly at most, and Paused after five emails
+
+from app.brief_v2 import Cadence, elapsed, nudge_text  # noqa: E402
+
+
+def test_nudge_is_due_once_per_seven_days_on_the_first_brief_after_each_mark():
+    sent = date(2026, 11, 2)                                     # a Monday
+    weekly = Cadence(7, 5, frozenset())
+    assert not weekly.due(sent, sent + timedelta(days=6))        # under a week: no nudge
+    assert weekly.due(sent, sent + timedelta(days=7))
+    told = Cadence(7, 5, frozenset({sent + timedelta(days=7)}))  # a brief went out on the mark day
+    assert not told.due(sent, sent + timedelta(days=8)) and not told.due(sent, sent + timedelta(days=13))
+    assert told.due(sent, sent + timedelta(days=14))             # the next week's mark
+    # A mark on a Saturday is shown on Monday's brief, once.
+    friday = date(2026, 10, 31) - timedelta(days=7)
+    assert Cadence(7, 5, frozenset()).due(friday + timedelta(days=1), date(2026, 11, 2))
+    assert not Cadence(7, 5, frozenset({date(2026, 11, 2)})).due(friday + timedelta(days=1), date(2026, 11, 3))
+
+
+def test_elapsed_time_reads_in_days_then_whole_weeks():
+    assert [elapsed(n) for n in (1, 9, 13, 14, 20, 36)] == ["1 day", "9 days", "13 days", "2 weeks", "2 weeks", "5 weeks"]
+    assert nudge_text(36) == "5 weeks since your last email - follow up this week"
+
+
+def test_waiting_row_carries_the_weekly_nudge_and_suggests_paused_after_five_emails():
+    assert waiting_text(Waiting("Andina", "2. In Talks", "Juan", TODAY - timedelta(days=21), 21, 2, False, False, None,
+                                nudge=True)) == \
+        "To Juan · no reply to our 2 emails, 3 weeks since your last email - follow up this week"
+    quiet_day = Waiting("Andina", "2. In Talks", "Juan", TODAY - timedelta(days=22), 22, 2, False, False, None)
+    assert waiting_text(quiet_day) == "To Juan · no reply to our 2 emails"
+    fifth = Waiting("Andina", "2. In Talks", "Juan", TODAY - timedelta(days=21), 21, 5, True, False, None, nudge=True)
+    assert waiting_text(fifth) == "To Juan · 5 emails with no reply - consider moving to Paused"
+    assert waiting_text(Waiting("Andina", "2. In Talks", "Juan", TODAY, 21, 3, True, False, None, pause_after=3)) == \
+        "To Juan · 3 emails with no reply - consider moving to Paused"
+
+
+def test_vague_follow_up_is_replaced_by_one_time_based_nudge_per_deal():
+    vague = [item("Andina", "Keep following up with the buyer", id="a", kind="next_step", deal_owner="RG"),
+             item("Andina", "Check in with Juan on the store data", id="b", kind="next_step", deal_owner="RG")]
+    v = view("Andina", 2, owner="RG", last_outbound=TODAY - timedelta(days=36), unanswered_emails=2)
+    s = build_section("RG", "RG", "Ramiro", {"Andina": v}, vague, [], TODAY, DISPLAY)
+    assert s.highlights == []
+    [move] = s.followups                                        # one row for the deal, not one per vague item
+    assert move.text == "Andina: 5 weeks since your last email - follow up this week."
+    assert move.when == "your last email Sep 22" and move.done == "insight:a"
+    assert "Keep following up" not in render([s], [], [], TODAY, 1, "c", False)
+
+    told = Cadence(7, 5, frozenset({TODAY - timedelta(days=1)}))   # yesterday's brief already carried this week's nudge
+    quiet = build_section("RG", "RG", "Ramiro", {"Andina": v}, vague, [], TODAY, DISPLAY, cadence=told)
+    assert quiet.followups == [] and quiet.highlights == []        # and no generic "Confirm status" row instead
+
+    v.unanswered_emails = 5
+    paused = build_section("RG", "RG", "Ramiro", {"Andina": v}, vague, [], TODAY, DISPLAY, cadence=told)
+    assert [m.text for m in paused.followups] == ["Andina: 5 emails with no reply - consider moving to Paused."]
+
+    v.unanswered_emails, v.last_reply = 0, TODAY - timedelta(days=3)     # they wrote last: nothing to nudge
+    assert build_section("RG", "RG", "Ramiro", {"Andina": v}, vague, [], TODAY, DISPLAY).followups == []
+
+
+def test_proposal_reminder_says_how_long_ago_and_keeps_what_was_proposed():
+    proposal = item("Arca Peru", "Bianca proposed reconnecting with Renzo", recorded=TODAY - timedelta(days=9),
+                    deal_owner="RG", id="proposal", kind="proposed")
+    s = section("RG", [view("Arca Peru", 2, owner="RG", last=proposal.recorded)], [proposal])
+    assert [m.text for m in s.followups] == [
+        "Arca Peru: 9 days since we proposed this - follow up this week: Bianca proposed reconnecting with Renzo."]

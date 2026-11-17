@@ -113,6 +113,9 @@ class DealView:
     unanswered: Unanswered | None = None
     developments: int = 0           # new or late-recorded developments since the last brief
     recommendations: list[Note] = field(default_factory=list)  # all of the profile's suggested moves
+    last_outbound: date | None = None   # our latest email to someone outside Bianca on this deal
+    last_reply: date | None = None      # the customer's latest real email on this deal
+    unanswered_emails: int = 0          # our emails in a row since their last reply
     sheet_steps: list[SheetDue] = field(default_factory=list)  # dated Next step bullets from the Sheet
     held: int = 0                   # extracted items held back until the date the founder set for them in the Sheet
     sheet_next: str = ""            # first line of the Sheet's Next step cell, for context lines
@@ -309,6 +312,40 @@ def reply_origin(senders: list[str], own_domains: set[str] | None, own_contacts:
     return None
 
 
+@dataclass(frozen=True)
+class Cadence:
+    """How often to nudge while a customer stays silent, and when to suggest Paused instead (see config)."""
+    every: int = 7                  # days between "follow up this week" nudges for one deal
+    pause_after: int = 5            # our emails in a row with no reply before suggesting Paused
+    briefed: frozenset = frozenset()  # recent days a brief was sent, so a nudge shows once per mark
+
+    def due(self, last_sent: date, today: date) -> bool:
+        """True on the first brief on or after each `every`-day mark since our last email, and only then.
+
+        A mark that falls on a day with no brief (a weekend) is shown on the next brief day, not skipped.
+        """
+        days = (today - last_sent).days
+        if days < self.every:
+            return False
+        mark = last_sent + timedelta(days=days - days % self.every)
+        return not any(mark <= sent < today for sent in self.briefed)
+
+
+def elapsed(days: int) -> str:
+    """"9 days", "2 weeks", "5 weeks": whole weeks once it is two or more."""
+    if days < 14:
+        return f"{days} day{'' if days == 1 else 's'}"
+    return f"{days // 7} weeks"
+
+
+def nudge_text(days: int) -> str:
+    return f"{elapsed(days)} since your last email - follow up this week"
+
+
+def pause_text(emails: int) -> str:
+    return f"{emails} emails with no reply - consider moving to Paused"
+
+
 @dataclass
 class Waiting:
     """A thread where we wrote last and are still expecting the customer's response."""
@@ -327,6 +364,8 @@ class Waiting:
     rank: int | None = None
     action: str | None = None      # the specific response we are waiting on
     evidence: frozenset[str] = frozenset()  # insight IDs for the specific ask
+    nudge: bool = False             # today is this deal's weekly "follow up this week" day
+    pause_after: int = 5            # our unanswered emails in a row before the row suggests Paused
 
 
 def waiting_on_them(thread: list[dict], internal: set[str], now: datetime) -> dict | None:
@@ -388,12 +427,17 @@ def waiting_text(w: Waiting) -> str:
 
 
 def _waiting_status(w: Waiting) -> str:
-    if w.replied_before:
+    """How the silence stands, then what to do about it: Paused after too many emails, else the weekly nudge."""
+    if w.nudges >= w.pause_after:
+        bits = [pause_text(w.nudges)]
+    elif w.replied_before:
         bits = [f"{w.nudges} emails since their last reply" if w.nudges > 1 else "no reply to our last email"]
     else:
         bits = [f"no reply to our {w.nudges} emails" if w.nudges > 1 else "no reply yet"]
     if w.auto_reply:
         bits.append("out-of-office received")
+    if w.nudge and w.nudges < w.pause_after:
+        bits.append(nudge_text(w.days))
     return ", ".join(bits)
 
 
@@ -720,8 +764,44 @@ def _without_waiting_action(view: DealView, waiting: Waiting) -> DealView:
                    recommendation=preferred, recommendations=recommendations)
 
 
-def _split_followups(view: DealView, today: date, used: set[str]) -> tuple[DealView, list[Move]]:
-    """Collect reminder actions and leave independent next moves available for deal selection."""
+_TOPIC = re.compile(r"\b(?:on|about|regarding|re:|sobre|acerca de)\s+(?P<topic>[^.!?;]{3,70})[.!?]?\s*$", re.I)
+
+
+def _nudge(view: DealView, today: date, cadence: Cadence, about: str, basis: date | None, tag_since: str,
+           force: bool = False) -> tuple[str, str] | None:
+    """(text, when) for a deal's one time-based follow-up reminder today, or None when none is due.
+
+    Instead of repeating a vague "keep following up", say how long it has been and what to do: after
+    cadence.pause_after of our emails with no reply, suggest Paused; otherwise "follow up this week", shown once
+    per cadence.every days. No reminder while the customer wrote last (the next move is ours, not a nudge).
+    """
+    if view.last_reply and view.last_outbound and view.last_reply > view.last_outbound:
+        return None
+    if view.unanswered_emails >= cadence.pause_after:
+        last = f"last email {_date(view.last_outbound)}" if view.last_outbound else _last(view, today)
+        return f"{view.deal}: {pause_text(view.unanswered_emails)}.", last
+    if basis is None or not (force or cadence.due(basis, today)):
+        return None
+    days = (today - basis).days
+    if about.startswith(":"):       # a proposal of ours: keep what was proposed
+        tail = about.rstrip(". ") + "."
+    else:                           # a nudge-only text: keep only its topic, if it names one
+        topic = _TOPIC.search(about)
+        tail = f" (re: {topic['topic'].strip()})." if topic else "."
+    return f"{view.deal}: {elapsed(days)} since {tag_since} - follow up this week{tail}", f"{tag_since} {_date(basis)}"
+
+
+def _split_followups(view: DealView, today: date, used: set[str], cadence: Cadence = Cadence(),
+                     has_wait: bool = False) -> tuple[DealView, list[Move], bool]:
+    """Collect reminder actions and leave independent next moves available for deal selection.
+
+    Returns the view without its reminder material, the reminders to print today, and whether the deal has
+    reminder material at all (it may be between two weekly nudges, with nothing to print today).
+
+    Nudge-only items and suggestions ("keep following up", "check in") are never printed as written. A deal gets
+    at most one time-based reminder ("3 weeks since your last email - follow up this week"), on its weekly day,
+    and none when a Waiting row for the deal already carries it (has_wait).
+    """
     followups: list[Move] = []
     followup_items: set[str] = set()
     unanswered = view.unanswered
@@ -733,13 +813,14 @@ def _split_followups(view: DealView, today: date, used: set[str]) -> tuple[DealV
             followup_items.add(unanswered.item_id)
         unanswered = None
 
+    nudges: list[tuple[Move, str, date | None, str]] = []   # (what closes it, its wording, since when, since what)
     proposals = [i for i in view.items if i.kind == "proposed" and i.id not in used
                  and PROPOSAL_FOLLOWUP_DAYS[0] <= (today - i.recorded).days <= PROPOSAL_FOLLOWUP_DAYS[1]
                  and (view.last_contact or i.recorded) <= i.recorded]
     if proposals:
         proposal = max(proposals, key=lambda i: i.recorded)
-        followups.append(item_move("Follow up", f"{view.deal}: Check whether to follow up on our proposal. {proposal.text}",
-                                   f"proposed {_date(proposal.recorded)}", proposal))
+        nudges.append((item_move("Follow up", "", "", proposal), f": {proposal.text}",
+                       proposal.recorded, "we proposed this"))
         followup_items.update(i.id for i in proposals)
 
     for i in view.items:
@@ -748,7 +829,8 @@ def _split_followups(view: DealView, today: date, used: set[str]) -> tuple[DealV
             continue
         followup_items.add(i.id)
         if i.id not in used and i.bucket not in ("stale", "old_undated"):
-            followups.append(item_move("Follow up", f"{view.deal}: {i.text}", f"recorded {_date(i.recorded)}", i))
+            nudges.append((item_move("Follow up", "", "", i), i.text, view.last_outbound or i.recorded,
+                           "your last email" if view.last_outbound else "this was noted"))
 
     recommendations = list(view.recommendations)
     if view.recommendation and view.recommendation not in recommendations:
@@ -763,20 +845,29 @@ def _split_followups(view: DealView, today: date, used: set[str]) -> tuple[DealV
         repeats_reminder = bool(rec.evidence & followup_items) and norm(rec.text).rstrip(".!?") in reminder_texts
         if rec.followup_only or is_followup_only(rec.text) or repeats_reminder:
             if not (rec.evidence and rec.evidence <= followup_items):
-                followups.append(note_move("Follow up", f"{view.deal}: {rec.text}", _last(view, today),
-                                           rec, rec.link, view.deal))
+                nudges.append((note_move("Follow up", "", "", rec, rec.link, view.deal), rec.text,
+                               view.last_outbound or view.last_contact,
+                               "your last email" if view.last_outbound else "the last contact on record"))
         else:
             deal_moves.append(rec)
 
-    return replace(view, items=[i for i in view.items if i.id not in followup_items], unanswered=unanswered,
-                   recommendation=next(iter(deal_moves), None), recommendations=deal_moves), followups
+    if nudges and not has_wait:
+        target, about, basis, since = nudges[0]
+        worded = _nudge(view, today, cadence, about, basis, since)
+        if worded:
+            followups.append(replace(target, text=worded[0], when=worded[1], deal=view.deal))
+
+    return (replace(view, items=[i for i in view.items if i.id not in followup_items], unanswered=unanswered,
+                    recommendation=next(iter(deal_moves), None), recommendations=deal_moves),
+            followups, bool(followups or nudges))
 
 
 def build_section(code: str, name: str, short: str, views: dict[str, DealView], items: list[Item],
                   meetings: list[tuple[Meeting, str]], today: date, display: dict[str, str],
                   hidden: int = 0, critical_ahead: int = 3, in_talks_target: int = 2, *,
                   waiting: list[Waiting] | None = None, more_waiting: int = 0,
-                  waiting_candidates: list[Waiting] | None = None, sheet_overdue_days: int = 14) -> Section:
+                  waiting_candidates: list[Waiting] | None = None, sheet_overdue_days: int = 14,
+                  cadence: Cadence = Cadence()) -> Section:
     mine: dict[str, DealView] = {}
 
     def view(deal: str) -> DealView:
@@ -789,7 +880,8 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                                   developments=src.developments if own else 0,
                                   recommendations=src.recommendations if own else [],
                                   sheet_steps=src.sheet_steps if own else [], held=src.held if own else 0,
-                                  sheet_next=src.sheet_next)
+                                  sheet_next=src.sheet_next, last_outbound=src.last_outbound,
+                                  last_reply=src.last_reply, unanswered_emails=src.unanswered_emails)
         return mine[deal]
 
     routed = [i for i in items if i.route == code]
@@ -842,10 +934,14 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
 
     action_views = {}
     reminders = {}
+    quiet_reminders: set[str] = set()   # deals whose only material is a reminder, even on a day none is printed
     for deal, v in mine.items():
         for w in waits_by_deal.get(deal, []):
             v = _without_waiting_action(v, w)
-        action_views[deal], reminders[deal] = _split_followups(v, today, used)
+        action_views[deal], reminders[deal], pending = _split_followups(v, today, used, cadence,
+                                                                        has_wait=bool(waits_by_deal.get(deal)))
+        if pending:
+            quiet_reminders.add(deal)
 
     highlight_views = []
     followup_only = set()
@@ -855,7 +951,7 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
     for original in eligible:
         v = action_views[original.deal]
         move = primary_move(v, today, used)
-        has_reminder = bool(waits_by_deal.get(v.deal) or reminders[v.deal])
+        has_reminder = bool(waits_by_deal.get(v.deal) or reminders[v.deal] or v.deal in quiet_reminders)
         proposal_only = move.tag == "Confirm status" and any(i.kind == "proposed" for i in original.items)
         # A generic fallback would give a follow-up-only deal a highlight slot.
         if proposal_only or (has_reminder and move.tag in ("Confirm status", "Clarify next action")):

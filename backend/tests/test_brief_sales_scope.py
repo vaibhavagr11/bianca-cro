@@ -66,6 +66,8 @@ class BriefData:
         self.changes = changes
         self.domains = domains
         self.contacts = contacts
+        self.last_contact_days = 2
+        self.briefed = []           # days a brief was already sent, for the weekly nudge
 
     def execute(self, query, params=()):
         if "from company_domains" in query:
@@ -78,6 +80,8 @@ class BriefData:
             return Result([{"owner_code": "RG", "full_name": "Ramiro Godfrid", "email": "ramiro@bianca.example",
                             "receives_brief": True}])
         if "from briefs" in query:
+            if "for_date" in query:
+                return Result([{"for_date": day} for day in self.briefed])
             return Result([{"created_at": NOW - timedelta(hours=6)}])
         if "from opportunity_profiles" in query:
             return Result(self.profiles)
@@ -93,7 +97,8 @@ class BriefData:
         if "from sync_runs" in query:
             return Result()
         if "max(occurred_at) as last" in query:
-            return Result([{"company_id": d["company_id"], "last": NOW - timedelta(days=2)} for d in self.deals])
+            return Result([{"company_id": d["company_id"], "last": NOW - timedelta(days=self.last_contact_days)}
+                           for d in self.deals])
         if "created_at >" in query or "occurred_at > %s" in query:
             return Result(m for m in self.messages if m["occurred_at"] > params[1])
         if "from source_records" in query and "source = 'gmail'" in query:
@@ -388,7 +393,9 @@ def test_profile_followup_stays_out_of_deals_to_move(brief_client, with_next_mov
     profiles = [{"opportunity_id": company["id"], "generated_at": NOW, "profile": {
         "refs": refs, "recommended_actions": recommendations,
     }}]
-    client = brief_client(BriefData([company], [], insights, profiles))
+    data = BriefData([company], [], insights, profiles)
+    data.last_contact_days = 9
+    client = brief_client(data)
     response = client.post("/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"})
     assert response.status_code == 200
     result = response.json()
@@ -396,12 +403,16 @@ def test_profile_followup_stays_out_of_deals_to_move(brief_client, with_next_mov
     assert [h["move"]["text"] for h in founder["highlights"]] == ([next_move] if with_next_move else [])
     assert len(founder["followups"]) == 1
     assert founder["followups"][0]["tag"] == "Follow up"
-    assert followup in founder["followups"][0]["text"]
+    # B-10 (11/12): the check-in is not printed as written; the row says how long it has been and what to do.
+    topic = "last week's proposal" if tagged else "the proposal we sent last week"
+    nudge = f"Prospect Co: 9 days since the last contact on record - follow up this week (re: {topic})."
+    assert founder["followups"][0]["text"] == nudge
     assert not founder["waiting"]
-    for body, wording in ((result["html"], html.escape(followup)), (result["text"], followup)):
+    for body, wording in ((result["html"], html.escape(nudge)), (result["text"], nudge)):
         assert body.count(wording) == 1
         assert body.index("Follow-ups that may be needed") < body.index(wording)
         assert (next_move in body) == with_next_move
+        assert followup not in body and html.escape(followup) not in body
 
 
 # ---- finding 15 (11/09 evals): a vendor's support ticket was reported as "Delta: Customer replied"
@@ -506,3 +517,34 @@ def test_guest_domain_matching_needs_one_distinctive_company_and_respects_workin
     found = {m["title"]: m["deal"] for m in result["payload"]["sections"][0]["meetings"]}
     # "Grupo" alone is too common to pick a deal; a working client's meeting stays out; a learned domain links.
     assert found == {"Bimbo intro": None, "Whitespace review": "FEMSA MX"}
+
+
+# ---- B-10 / B-11 (11/12): weekly "follow up this week" nudge; Paused suggested after five unanswered emails
+
+def test_waiting_rows_nudge_weekly_and_suggest_paused_after_five_unanswered_emails(brief_client):
+    silent = [email(f"silent-{n}", "silent", "Can you confirm the pilot dates?", days=days, outgoing=True,
+                    thread="silent-thread") for n, days in enumerate((40, 33, 26, 19, 12))]
+    weekly = email("weekly-ask", "weekly", "Can you approve the proposal?", days=14, outgoing=True)
+    told = email("told-ask", "told", "Can you share the store list?", days=15, outgoing=True)
+    data = BriefData([deal("silent"), deal("weekly"), deal("told")], [*silent, weekly, told], [], [])
+    data.briefed = [NOW.date() - timedelta(days=1)]          # yesterday's brief carried "told"'s day-14 nudge
+    result = brief_client(data).post("/brief/build?dry_run=true&version=v2",
+                                     headers={"X-Ingest-Token": "test-token"}).json()
+    rows = {w["deal"]: w for w in result["payload"]["sections"][0]["waiting"]}
+    assert rows["silent"]["nudges"] == 5
+    text = result["text"]
+    assert "• silent: To Buyer · 5 emails with no reply - consider moving to Paused (12d since Oct 24)" in text
+    assert "• weekly: To Buyer · no reply yet, 2 weeks since your last email - follow up this week (14d since Oct 22)" in text
+    assert "• told: To Buyer · no reply yet (15d since Oct 21)" in text      # at most one nudge per 7 days
+
+
+def test_nudge_thresholds_are_settings(monkeypatch, brief_client):
+    monkeypatch.setattr(brief_api.settings, "brief_pause_after_emails", 2)
+    monkeypatch.setattr(brief_api.settings, "brief_nudge_every_days", 10)
+    two = [email(f"two-{n}", "two", "Can you confirm?", days=days, outgoing=True, thread="two-thread")
+           for n, days in enumerate((20, 9))]
+    ten = email("ten-ask", "ten", "Can you approve the proposal?", days=10, outgoing=True)
+    result = brief_client(BriefData([deal("two"), deal("ten")], [*two, ten], [], [])).post(
+        "/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"}).json()
+    assert "2 emails with no reply - consider moving to Paused" in result["text"]
+    assert "10 days since your last email - follow up this week" in result["text"]

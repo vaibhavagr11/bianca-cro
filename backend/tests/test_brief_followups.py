@@ -32,3 +32,23 @@ def test_detects_suggestions_that_only_nudge(text):
 ])
 def test_preserves_suggestions_with_a_separate_next_move(text):
     assert not is_followup_only(text)
+
+
+@pytest.mark.parametrize("text", [
+    "Keep following up with the buyer",                       # the bullet Nico read out on 11/12
+    "The team should keep following up with Juan on the store data.",
+    "Continue to follow up with procurement",
+    "Bianca should keep checking in with Ana",
+    "Keep chasing Franco for the signed NDA",
+])
+def test_keep_following_up_in_any_voice_is_a_nudge(text):
+    assert is_followup_only(text)
+
+
+@pytest.mark.parametrize("text", [
+    "Keep the pricing proposal updated and send it to Ana",
+    "Continue the pilot scoping with the new regional lead",
+    "The team should prepare the rollout plan and follow up",
+])
+def test_ongoing_work_is_not_a_nudge(text):
+    assert not is_followup_only(text)

@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     brief_critical_ahead_days: int = 3
     # Preferred number of active In Talks deals among the four shown per founder (not a quota).
     brief_in_talks_target: int = 2
+    # Follow-up cadence while a customer has not answered: one "follow up this week" nudge per deal every this many
+    # days since our last email, and after this many of our emails in a row with no reply, suggest Paused instead.
+    brief_nudge_every_days: int = Field(default=7, gt=0)
+    brief_pause_after_emails: int = Field(default=5, gt=0)
     # A "(complete by <date>)" note in the Sheet's Next step shows in "Needs you today" from its date until it is
     # this many days late; after that it moves to a one-line reminder to update the Sheet.
     brief_sheet_step_overdue_days: int = Field(default=14, ge=0)

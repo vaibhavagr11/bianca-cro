@@ -4,8 +4,14 @@ import re
 import unicodedata
 
 
+# "The team should keep following up": who should do it and "keep" are not part of the nudge itself.
+_LEAD = (
+    r"(?:(?:bianca|the team|we|ramiro|nico(?:las)?|the founders?)\s+(?:should|must|needs? to|need to|will)\s+)?"
+    r"(?:(?:keep on|keep|continue)\s+(?:to\s+)?)?"
+)
 _NUDGE = (
-    r"follow[ -]up|check (?:in|back)|circle back|nudge|chase|remind|ask again"
+    r"follow(?:ing)?[ -]up|check(?:ing)? (?:in|back)|circl(?:e|ing) back|nudg(?:e|ing)|chas(?:e|ing)"
+    r"|remind(?:ing)?|ask(?:ing)? again"
     r"|(?:send|write) (?:a|another) (?:gentle )?(?:reminder|follow[ -]up)"
     r"|(?:dar(?:le|les)?|hacer) seguimiento|volver a (?:preguntar|pedir|consultar|escribir)"
     r"|recordar(?:le|les)?|(?:enviar|mandar) (?:un|otro) recordatorio"
@@ -15,7 +21,7 @@ _OUTREACH = (
     r"|(?:email|message) (?:the )?(?:buyer|customer|client|prospect|contact|team)(?= to )"
     r"|call|contact|reach out to|write to|escribir(?:le|les)? a|contactar a|llamar a"
 )
-_FOLLOWUP = re.compile(rf"^(?:(?:{_OUTREACH})\b[^.!?;]*?\b(?:to|para) )?(?:{_NUDGE})\b")
+_FOLLOWUP = re.compile(rf"^{_LEAD}(?:(?:{_OUTREACH})\b[^.!?;]*?\b(?:to|para) )?(?:{_NUDGE})\b")
 
 # A coordinated action or a delivery introduced as the means of following up can still be a next move.
 _DELIVERY = (

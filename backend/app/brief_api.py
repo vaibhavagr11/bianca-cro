@@ -727,6 +727,10 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                 latest = last_reply if from_customer(m) else last_ours
                 if d["name"] not in latest or m["at"] > latest[d["name"]]:
                     latest[d["name"]] = m["at"]
+        cadence = brief_v2.Cadence(settings.brief_nudge_every_days, settings.brief_pause_after_emails, frozenset(
+            r["for_date"] for r in conn.execute(
+                "select distinct for_date from briefs where workspace_id = %s and for_date >= %s",
+                (workspace_id, today - timedelta(days=settings.brief_nudge_every_days))) if r.get("for_date")))
         waiting_candidates: list[brief_v2.Waiting] = []
         waiting: dict[str, brief_v2.Waiting] = {}
         for thread_id, msgs in threads.items():
@@ -756,7 +760,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                     w["auto_reply"] or last_auto.get(d["name"], t["occurred_at"]) > t["occurred_at"],
                     timeline.GMAIL_THREAD_URL.format(thread_id), f"Email · {sent:%b} {sent.day}",
                     thread_id, sender if sender in FOUNDER_ORDER else d["owner_code"], d["stage_rank"],
-                    action=action, evidence=evidence)
+                    action=action, evidence=evidence, nudge=cadence.due(sent.date(), today),
+                    pause_after=cadence.pause_after)
                 waiting_candidates.append(candidate)
                 if d["name"] not in waiting or sent.date() > waiting[d["name"]].sent:
                     waiting[d["name"]] = candidate
@@ -838,7 +843,11 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             blocker=blockers[0] if blockers else None,
             recommendation=recs_[0] if recs_ else None,
             recommendations=recs_,
-            summary=note(d, prof.get("summary"), prow, False), unanswered=unanswered.get(d["name"]))
+            summary=note(d, prof.get("summary"), prow, False), unanswered=unanswered.get(d["name"]),
+            last_outbound=max(sent).astimezone(tz).date() if (sent := ours_sent.get(d["name"])) else None,
+            last_reply=replied.astimezone(tz).date() if (replied := last_reply.get(d["name"])) else None,
+            unanswered_emails=sum(1 for at in ours_sent.get(d["name"], [])
+                                  if not last_reply.get(d["name"]) or at > last_reply[d["name"]]))
 
     bianca_names = {brief_v2.norm(t["full_name"]) for t in team} | {"bianca"}
 
@@ -929,7 +938,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             code, full, short, views, items, [(m, m.context) for m in meetings if code in m.attendees], today, display,
             0 if gate else hidden.get(code, 0), settings.brief_critical_ahead_days, settings.brief_in_talks_target,
             waiting=shown, more_waiting=more, waiting_candidates=waiting_candidates,
-            sheet_overdue_days=settings.brief_sheet_step_overdue_days))
+            sheet_overdue_days=settings.brief_sheet_step_overdue_days, cadence=cadence))
 
     ndl = [brief_v2.TodayRow(i.deal, views[i.deal].stage, "Due now", i.text, f"due {i.due:%b} {i.due.day}", "Nico DL",
                              i.link, i.id, i.source, f"insight:{i.id}")
