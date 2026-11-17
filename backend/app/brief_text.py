@@ -48,6 +48,7 @@ _ABBREVIATIONS = frozenset(
     "dept fig".split())
 _SENTENCE_END = re.compile(r"[.!?]+[\"'”’)\]]*(?=\s|$)")
 _OPENERS, _CLOSERS = "([{“‘", ")]}”’"
+_TOKEN_LOOKBACK = 40
 
 
 def _ends_sentence(text: str, start: int, end: int) -> bool:
@@ -64,7 +65,8 @@ def _ends_sentence(text: str, start: int, end: int) -> bool:
         return False
     if text[start] != ".":
         return True
-    token = re.search(r"[^\s(\[\"'“‘]*$", text[:start]).group()
+    # The word before the period. Only its last characters matter, so a long text is not re-read at every period.
+    token = re.search(r"[^\s(\[\"'“‘]*$", text[max(0, start - _TOKEN_LOOKBACK):start]).group()
     if token.isdigit() and len(token) <= 2:
         return False            # a stage or list number, not the end of the thought
     if len(token) == 1 and token.isupper():
@@ -86,7 +88,10 @@ def _balanced(text: str) -> bool:
 
 
 def split_sentences(text: str) -> list[str]:
-    """Complete sentences, in order. A sentence never ends inside a quote, a bracket or a numbered stage label."""
+    """Complete sentences, in order. A sentence never ends inside a quote, a bracket or a numbered stage label.
+
+    Blank text gives an empty list; use first_or_blank when the first sentence is wanted.
+    """
     text = " ".join(text.split())
     out, begin = [], 0
     for match in _SENTENCE_END.finditer(text):
@@ -96,6 +101,11 @@ def split_sentences(text: str) -> list[str]:
     if text[begin:].strip():
         out.append(text[begin:].strip())
     return out
+
+
+def first_or_blank(text: str | None) -> str:
+    """The first complete sentence, or "" for blank text. Never raises, so one empty field cannot stop a brief."""
+    return next(iter(split_sentences(text or "")), "")
 
 
 def _valid_shortening(field: TableText, text: str) -> bool:
@@ -155,7 +165,7 @@ def cut_table_text(field: TableText) -> str:
     required values. Otherwise a Situation is cut at a clause break (see _cut_situation) and any other field keeps
     whole words with an ellipsis and any required value that was cut appended."""
     text = " ".join(field.text.split())
-    first = split_sentences(text)[0]
+    first = first_or_blank(text)
     if len(first) <= TABLE_TEXT_LIMIT and all(_has(first, fact) for fact in field.required):
         return first
     if field.kind == "Situation" and not field.required:

@@ -16,7 +16,8 @@ from app.brief import (
     meeting_text_fields, meeting_text_rows, meetings_table, stage_short, verification_html, verification_text,
 )
 from app.brief_followups import is_followup_only, is_waiting_only
-from app.brief_text import TableText, read_table_text, split_sentences
+from app.brief_text import TableText, first_or_blank, read_table_text, split_sentences
+from app.pipeline import is_paused
 
 ACTIVE_DAYS = 14            # last recorded interaction within this = active
 UNCLEAR_DAYS = 45           # 15..45 days = status unclear (confirm); older = dormant
@@ -447,7 +448,7 @@ def _waiting_status(w: Waiting) -> str:
 
 
 def first_sentence(text: str, limit: int = 95) -> str:
-    parts = split_sentences(text)
+    parts = split_sentences(text) or [""]    # blank text stays blank, as before 11/17
     s = parts[0] if len(parts[0]) >= 30 or len(parts) == 1 else f"{parts[0]} {parts[1]}"  # "Call Ale." alone says too little
     return s if len(s) <= limit else s[:limit].rsplit(" ", 1)[0] + "…"
 
@@ -1177,7 +1178,7 @@ def meeting_prep(meeting: Meeting, section: "Section", view: DealView | None, to
         elif view.sheet_next:
             context = f"Sheet next step: {view.sheet_next}"
         elif view.summary and view.summary.verified:
-            context = split_sentences(view.summary.text)[0]
+            context = first_or_blank(view.summary.text)
     if not context:
         last = view.last_contact if view else None
         context = (f"No open item on record - last contact {_date(last)}" if last
@@ -1393,7 +1394,7 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, 
     if s.hidden:
         notes.append(f"{s.hidden} item(s) hidden: later emails/notes suggest they were done.")
     if s.sheet_stale:
-        names = ", ".join(f"{deal} ({_date(due)})" for deal, due in s.sheet_stale[:MAX_NAMES])
+        names = ", ".join(f"{deal} ({_long_date(due, today)})" for deal, due in s.sheet_stale[:MAX_NAMES])
         more = f" +{len(s.sheet_stale) - MAX_NAMES} more" if len(s.sheet_stale) > MAX_NAMES else ""
         notes.append(f"<b>Sheet dates long past:</b> {_e(names + more)} - update the Next step in the Sheet "
                      f"or move the deal to Paused.")

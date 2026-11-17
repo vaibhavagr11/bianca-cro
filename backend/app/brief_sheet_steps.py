@@ -26,6 +26,8 @@ _MONTHS = {name: number for number, names in enumerate((
     ("jan", "ene"), ("feb",), ("mar",), ("apr", "abr"), ("may",), ("jun",), ("jul",), ("aug", "ago"),
     ("sep", "set"), ("oct",), ("nov",), ("dec", "dic")), start=1) for name in names}
 _WORDS = re.compile(r"[^\W_]+")
+MAX_LINE = 2000        # a Next step bullet longer than this is read up to here; a whole cell holds at most 50,000
+MAX_CONTEXT = 400      # how much of the first bullet a context line (prep, quiet deals) may quote
 _FILLER = frozenset("the a an to of for and with on in at by el la los las de del un una para con y".split())
 
 
@@ -63,6 +65,8 @@ def parse_date(value: str, today: date) -> date | None:
         if len(words) not in (2, 3):
             return None
         year = int(words[2]) if len(words) == 3 else None
+        if year is not None and year < 100:
+            year += 2000                # "Nov 16, 26" is 2026, not the year 26
         day_text, month_text = (words[0], words[1]) if words[0].isdigit() else (words[1], words[0])
         month = _MONTHS.get(month_text[:3])
         if month is None or not day_text.isdigit():
@@ -78,7 +82,7 @@ def match_key(text: str) -> str:
     "We owe: Send the checklist. (owner: Nico) (complete by Nov 6, 2026)" and the extracted "Send the checklist by
     Nov 6" both reduce to "send checklist".
     """
-    text = _NOTE.sub(" ", _BULLET.sub("", text))
+    text = _NOTE.sub(" ", _BULLET.sub("", " ".join(text.split())[:MAX_LINE]))
     text = _HUB_DATE.sub(" ", _OWNER.sub(" ", text))
     text = _INLINE_DATE.sub(" ", _LABEL.sub("", text.strip()))
     plain = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower()
@@ -100,6 +104,7 @@ def parse_cell(cell: str | None, today: date) -> list[SheetStep]:
     """Every bullet of a Next step cell that carries a readable "(complete by <date>)" note, in cell order."""
     steps = []
     for line in (cell or "").splitlines():
+        line = " ".join(line.split())[:MAX_LINE]    # single spaces: the note pattern cannot backtrack over a long gap
         note = _NOTE.search(line)
         due = parse_date(note["date"], today) if note else None
         if due is None:
@@ -116,5 +121,5 @@ def first_bullet(cell: str | None) -> str:
     for line in (cell or "").splitlines():
         text = " ".join(_BULLET.sub("", line).split())
         if text:
-            return text
+            return text[:MAX_CONTEXT]
     return ""
