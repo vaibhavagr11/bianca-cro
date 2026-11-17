@@ -78,6 +78,46 @@ def test_a_sheet_date_from_another_year_is_shown_with_its_year(brief_client):
 
 # ---- a Paused deal is parked on purpose: no reminder of any kind
 
+def test_nudge_rules_for_paused_deals_and_undated_sources():
+    paused = DealView("Parked", "0. Paused", 0, "RG", TODAY - timedelta(days=30), last_outbound=TODAY - timedelta(days=21),
+                      unanswered_emails=7)
+    assert _nudge(paused, TODAY, Cadence(), "Keep following up", TODAY - timedelta(days=21), "your last email") is None
+    talks = DealView("Talks", "2. In Talks", 2, "RG", None)
+    assert _nudge(talks, TODAY, Cadence(), "Check in", date.min, "this was noted") is None  # never "105,000 weeks since"
+    assert _nudge(talks, TODAY, Cadence(), "Check in", TODAY - timedelta(days=14), "this was noted")[0] == (
+        "Talks: 2 weeks since this was noted - follow up this week.")
+    wait = Waiting("Parked", "0. Paused", "Ana", TODAY - timedelta(days=14), 14, 6, False, False, None, "", nudge=False,
+                   pause_after=None)
+    assert _waiting_status(wait) == "no reply to our 6 emails"
+
+
+# ---- the hold-back rule never hides what is due by its own date
+
+def test_split_followups_without_a_cadence_is_the_function_from_before_1117():
+    note = Item("i1", "Deal", "Follow up with Ana", None, TODAY - timedelta(days=3), None, "RG", "deal_owner", None,
+                "Notes · Nov 2", None, "undated", "next_step")
+    wait = Item("i2", "Deal", "Wait for Ana's reply", None, TODAY - timedelta(days=3), None, "RG", "deal_owner", None,
+                "Notes · Nov 2", None, "undated", "next_step")
+    view = DealView("Deal", "2. In Talks", 2, "RG", TODAY - timedelta(days=3), items=[note, wait])
+    kept, followups, pending = _split_followups(view, TODAY, set(), None)
+    assert [(m.tag, m.text, m.when) for m in followups] == [("Follow up", "Deal: Follow up with Ana", "recorded Nov 2")]
+    assert [i.id for i in kept.items] == ["i2"] and pending is True
+    kept, followups, pending = _split_followups(view, TODAY, set(), Cadence())            # the 11/17 behaviour
+    assert kept.items == [] and followups == [] and pending is True                       # day 3: no nudge due yet
+
+
+# ---- a deal with a meeting today is not "quiet"
+
+def test_quiet_batch_skips_a_deal_that_has_a_meeting_today_or_tomorrow():
+    views = {name: DealView(name, "2. In Talks", 2, "RG", None) for name in ("Meeting Co", "Quiet Co")}
+    meeting = Meeting(NOW, "Intro call", "Meeting Co", "2. In Talks", ["RG"])
+    section = build_section("RG", "Ramiro Godfrid", "Ramiro", views, [], [(meeting, "")], TODAY, {"RG": "Ramiro"},
+                            resurface=3)
+    assert [v.deal for v in section.resurfaced] == ["Quiet Co"] and section.quiet_in_talks == 1
+
+
+# ---- the 11/17 additions are extras: when one fails, the brief is sent without it
+
 def _fixture_for_isolation():
     ask = email("w-ask", "Weekly", "Can you approve the proposal?", days=14, outgoing=True)
     deals = [{**deal("Dated"), "next_step": "- Email Franco the revised deck (complete by Nov 5, 2026)"},
@@ -89,6 +129,25 @@ def _fixture_for_isolation():
 
 def _boom(*_, **__):
     raise RuntimeError("injected failure")
+
+
+def test_unreadable_archive_drops_the_quiet_batch_and_keeps_the_brief(monkeypatch, brief_client, caplog):
+    class BrokenArchive(BriefData):
+        def execute(self, query, params=()):
+            if "from briefs" in query and ("resurfaced" in query or "for_date" in query):
+                raise RuntimeError("archive unreadable")
+            return super().execute(query, params)
+
+    ask = email("w-ask", "Weekly", "Can you approve the proposal?", days=14, outgoing=True)
+    data = BrokenArchive([deal("Weekly"), deal("Quiet")], [ask], [], [])
+    data.last_contact = {"Quiet": 30}
+    with caplog.at_level("ERROR", logger="bianca_cro.brief"):
+        result = build(brief_client(data))
+    assert "Quiet In Talks deals to revisit" not in result["html"]                # no cooldown known: no batch
+    assert "• Weekly: To Buyer · no reply yet, 2 weeks since your last email - follow up this week" in result["text"]
+    assert {r.getMessage() for r in caplog.records} == {
+        "brief built without the days a brief was sent (a weekly nudge may repeat)",
+        "brief built without the quiet-deal batch (earlier batches unreadable)"}
 
 
 def test_one_unreadable_cancellation_notice_does_not_fail_the_mail_sync_or_the_other_notices(monkeypatch):

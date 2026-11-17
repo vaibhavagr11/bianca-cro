@@ -379,7 +379,8 @@ class Waiting:
     action: str | None = None      # the specific response we are waiting on
     evidence: frozenset[str] = frozenset()  # insight IDs for the specific ask
     nudge: bool = False             # today is this deal's weekly "follow up this week" day
-    pause_after: int = 5            # our unanswered emails in a row before the row suggests Paused
+    pause_after: int | None = 5     # our unanswered emails in a row before the row suggests Paused; None: never
+                                    # (the deal is already Paused, or time-based nudges are switched off)
 
 
 def waiting_on_them(thread: list[dict], internal: set[str], now: datetime) -> dict | None:
@@ -443,7 +444,8 @@ def waiting_text(w: Waiting) -> str:
 
 def _waiting_status(w: Waiting) -> str:
     """How the silence stands, then what to do about it: Paused after too many emails, else the weekly nudge."""
-    if w.nudges >= w.pause_after:
+    suggest_pause = w.pause_after is not None and w.nudges >= w.pause_after
+    if suggest_pause:
         bits = [pause_text(w.nudges)]
     elif w.replied_before:
         bits = [f"{w.nudges} emails since their last reply" if w.nudges > 1 else "no reply to our last email"]
@@ -451,7 +453,7 @@ def _waiting_status(w: Waiting) -> str:
         bits = [f"no reply to our {w.nudges} emails" if w.nudges > 1 else "no reply yet"]
     if w.auto_reply:
         bits.append("out-of-office received")
-    if w.nudge and w.nudges < w.pause_after:
+    if w.nudge and not suggest_pause:
         bits.append(nudge_text(w.days))
     return ", ".join(bits)
 
@@ -833,13 +835,15 @@ def _nudge(view: DealView, today: date, cadence: Cadence, about: str, basis: dat
     cadence.pause_after of our emails with no reply, suggest Paused; otherwise "follow up this week", shown once
     per cadence.every days. No reminder while the customer wrote last (the next move is ours, not a nudge).
     """
+    if is_paused(view.stage):
+        return None                 # a Paused deal is parked on purpose: no reminder, and nothing to move to Paused
     if view.last_reply and view.last_outbound and view.last_reply > view.last_outbound:
         return None
     if view.unanswered_emails >= cadence.pause_after:
         last = f"last email {_date(view.last_outbound)}" if view.last_outbound else _last(view, today)
         return f"{view.deal}: {pause_text(view.unanswered_emails)}.", last
-    if basis is None or not (force or cadence.due(basis, today)):
-        return None
+    if basis is None or basis == date.min or not (force or cadence.due(basis, today)):
+        return None                 # date.min: the source has no date at all, so "N weeks since" cannot be said
     days = (today - basis).days
     if about.startswith(":"):       # a proposal of ours: keep what was proposed
         tail = about.rstrip(". ") + "."
@@ -849,7 +853,7 @@ def _nudge(view: DealView, today: date, cadence: Cadence, about: str, basis: dat
     return f"{view.deal}: {elapsed(days)} since {tag_since} - follow up this week{tail}", f"{tag_since} {_date(basis)}"
 
 
-def _split_followups(view: DealView, today: date, used: set[str], cadence: Cadence = Cadence(),
+def _split_followups(view: DealView, today: date, used: set[str], cadence: Cadence | None = Cadence(),
                      has_wait: bool = False) -> tuple[DealView, list[Move], bool]:
     """Collect reminder actions and leave independent next moves available for deal selection.
 
@@ -860,8 +864,12 @@ def _split_followups(view: DealView, today: date, used: set[str], cadence: Caden
     reply", a blocker that says "no reply since Oct 21") are never printed as written or used as a deal's next
     move: what is with the customer belongs to Waiting, not to Deals to move. A deal gets
     at most one time-based reminder ("3 weeks since your last email - follow up this week"), on its weekly day,
-    and none when a Waiting row for the deal already carries it (has_wait).
+    and none when a Waiting row for the deal already carries it (has_wait). A Paused deal gets none at all.
+
+    cadence=None switches the time-based reminders off (BRIEF_FOLLOWUP_NUDGES=false): reminders are then printed as
+    written and waiting statements are left alone, exactly as before 11/17.
     """
+    timed = cadence is not None
     followups: list[Move] = []
     followup_items: set[str] = set()
     unanswered = view.unanswered
@@ -879,18 +887,25 @@ def _split_followups(view: DealView, today: date, used: set[str], cadence: Caden
                  and (view.last_contact or i.recorded) <= i.recorded]
     if proposals:
         proposal = max(proposals, key=lambda i: i.recorded)
-        nudges.append((item_move("Follow up", "", "", proposal), f": {proposal.text}",
-                       proposal.recorded, "we proposed this"))
+        if timed:
+            nudges.append((item_move("Follow up", "", "", proposal), f": {proposal.text}",
+                           proposal.recorded, "we proposed this"))
+        else:
+            followups.append(item_move("Follow up", f"{view.deal}: Check whether to follow up on our proposal. "
+                                       f"{proposal.text}", f"proposed {_date(proposal.recorded)}", proposal))
         followup_items.update(i.id for i in proposals)
 
     for i in view.items:
         if (i.kind not in ("owed", "customer_request", "next_step") or i.id in followup_items
-                or not (is_followup_only(i.text) or is_waiting_only(i.text))):
+                or not (is_followup_only(i.text) or (timed and is_waiting_only(i.text)))):
             continue
         followup_items.add(i.id)
         if i.id not in used and i.bucket not in ("stale", "old_undated"):
-            nudges.append((item_move("Follow up", "", "", i), i.text, view.last_outbound or i.recorded,
-                           "your last email" if view.last_outbound else "this was noted"))
+            if timed:
+                nudges.append((item_move("Follow up", "", "", i), i.text, view.last_outbound or i.recorded,
+                               "your last email" if view.last_outbound else "this was noted"))
+            else:
+                followups.append(item_move("Follow up", f"{view.deal}: {i.text}", f"recorded {_date(i.recorded)}", i))
 
     recommendations = list(view.recommendations)
     if view.recommendation and view.recommendation not in recommendations:
@@ -903,23 +918,29 @@ def _split_followups(view: DealView, today: date, used: set[str], cadence: Caden
         if not rec.verified:
             continue
         repeats_reminder = bool(rec.evidence & followup_items) and norm(rec.text).rstrip(".!?") in reminder_texts
-        if rec.followup_only or is_followup_only(rec.text) or is_waiting_only(rec.text) or repeats_reminder:
-            if not (rec.evidence and rec.evidence <= followup_items):
+        if (rec.followup_only or is_followup_only(rec.text) or (timed and is_waiting_only(rec.text))
+                or repeats_reminder):
+            if rec.evidence and rec.evidence <= followup_items:
+                pass                    # the item it rests on is already the reminder
+            elif timed:
                 nudges.append((note_move("Follow up", "", "", rec, rec.link, view.deal), rec.text,
                                view.last_outbound or view.last_contact,
                                "your last email" if view.last_outbound else "the last contact on record"))
+            else:
+                followups.append(note_move("Follow up", f"{view.deal}: {rec.text}", _last(view, today),
+                                           rec, rec.link, view.deal))
         else:
             deal_moves.append(rec)
 
     # A blocker that only says "no reply since ..." is the waiting state itself, not a situation with a next move.
     blocker = view.blocker
-    if blocker and blocker.verified and is_waiting_only(blocker.text):
+    if timed and blocker and blocker.verified and is_waiting_only(blocker.text):
         nudges.append((Move("Follow up", "", "", blocker.link, None, blocker.source, None, view.deal), "",
                        view.last_outbound or view.last_contact,
                        "your last email" if view.last_outbound else "the last contact on record"))
         blocker = None
 
-    if nudges and not has_wait:
+    if timed and nudges and not has_wait:
         target, about, basis, since = nudges[0]
         worded = _nudge(view, today, cadence, about, basis, since)
         if worded:
@@ -935,7 +956,7 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                   hidden: int = 0, critical_ahead: int = 3, in_talks_target: int = 2, *,
                   waiting: list[Waiting] | None = None, more_waiting: int = 0,
                   waiting_candidates: list[Waiting] | None = None, sheet_overdue_days: int = 14,
-                  cadence: Cadence = Cadence(), max_rows: int = MAX_TABLE_ROWS, resurface: int = 0,
+                  cadence: Cadence | None = Cadence(), max_rows: int = MAX_TABLE_ROWS, resurface: int = 0,
                   resurfaced_recently: frozenset[str] = frozenset()) -> Section:
     mine: dict[str, DealView] = {}
 
@@ -1096,7 +1117,8 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
     # at all), and not already in this section. Longest-untouched first; a deal listed in the last cooldown
     # period waits its turn, so the batch moves through the list instead of repeating.
     busy = (shown | in_today | sheet_dated | set(waits_by_deal)
-            | {m.deal or m.text.split(":", 1)[0] for m in follow_shown})
+            | {m.deal or m.text.split(":", 1)[0] for m in follow_shown}
+            | {m.deal for m, _ in meetings if m.deal})     # meeting it today or tomorrow is not "quiet"
     quiet = sorted((v for v in owned if v.rank == IN_TALKS_RANK and v.deal not in busy
                     and deal_status(v, today) != "active"), key=lambda v: (v.last_contact or date.min, v.deal))
     resurfaced = [v for v in quiet if v.deal not in resurfaced_recently][:max(0, resurface)]
