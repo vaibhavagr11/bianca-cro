@@ -904,3 +904,22 @@ def test_proposal_reminder_says_how_long_ago_and_keeps_what_was_proposed():
     s = section("RG", [view("Arca Peru", 2, owner="RG", last=proposal.recorded)], [proposal])
     assert [m.text for m in s.followups] == [
         "Arca Peru: 9 days since we proposed this - follow up this week: Bianca proposed reconnecting with Renzo."]
+
+
+# ---- B-02 (11/12): what is with the customer never fills a Deals-to-move row
+
+def test_waiting_statement_or_no_reply_blocker_is_never_a_deal_to_move():
+    wait_step = item("Campari", "Wait for Franco's reply on the proposal", id="w", kind="next_step", deal_owner="RG")
+    blocker = Note("No reply since Oct 21", verified=True, evidence=frozenset({"w"}), source="Email · Oct 21")
+    stuck = view("Campari", 4, owner="RG", blocker=blocker, last_outbound=TODAY - timedelta(days=7))
+    real = item("Andina", "Send the revised pricing sheet", id="p", kind="next_step", deal_owner="RG")
+    no_reply = Note("Juan has not replied to the pilot proposal", verified=True, source="Email · Oct 20")
+    andina = view("Andina", 2, owner="RG", blocker=no_reply, last_outbound=TODAY - timedelta(days=3))
+    s = build_section("RG", "RG", "Ramiro", {"Campari": stuck, "Andina": andina}, [wait_step, real], [], TODAY, DISPLAY)
+    # Campari has nothing for Bianca to do: no row, only the time-based reminder. Andina keeps its real move,
+    # and its "has not replied" blocker is not shown as the situation or turned into "Clarify next action".
+    assert [(v.deal, m.text, sit) for v, m, sit in s.highlights] == [("Andina", "Send the revised pricing sheet", None)]
+    assert [m.text for m in s.followups] == [
+        "Campari: 7 days since your last email - follow up this week (re: the proposal)."]
+    page = render([s], [], [], TODAY, 2, "c", False)
+    assert "No reply since" not in page and "Wait for Franco" not in page and "has not replied" not in page

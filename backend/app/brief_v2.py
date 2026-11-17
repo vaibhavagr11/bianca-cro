@@ -15,7 +15,7 @@ from app.brief import (
     AMBER, BLUE, FONT, INK, MUTED, RED, Meeting, VerificationNotes, _e, _empty, _h, _link, _td, _th,
     meeting_text_fields, meeting_text_rows, meetings_table, stage_short, verification_html, verification_text,
 )
-from app.brief_followups import is_followup_only
+from app.brief_followups import is_followup_only, is_waiting_only
 from app.brief_text import TableText, read_table_text, split_sentences
 
 ACTIVE_DAYS = 14            # last recorded interaction within this = active
@@ -798,7 +798,9 @@ def _split_followups(view: DealView, today: date, used: set[str], cadence: Caden
     Returns the view without its reminder material, the reminders to print today, and whether the deal has
     reminder material at all (it may be between two weekly nudges, with nothing to print today).
 
-    Nudge-only items and suggestions ("keep following up", "check in") are never printed as written. A deal gets
+    Nudge-only items and suggestions ("keep following up", "check in") and waiting statements ("wait for Franco's
+    reply", a blocker that says "no reply since Oct 21") are never printed as written or used as a deal's next
+    move: what is with the customer belongs to Waiting, not to Deals to move. A deal gets
     at most one time-based reminder ("3 weeks since your last email - follow up this week"), on its weekly day,
     and none when a Waiting row for the deal already carries it (has_wait).
     """
@@ -825,7 +827,7 @@ def _split_followups(view: DealView, today: date, used: set[str], cadence: Caden
 
     for i in view.items:
         if (i.kind not in ("owed", "customer_request", "next_step") or i.id in followup_items
-                or not is_followup_only(i.text)):
+                or not (is_followup_only(i.text) or is_waiting_only(i.text))):
             continue
         followup_items.add(i.id)
         if i.id not in used and i.bucket not in ("stale", "old_undated"):
@@ -843,13 +845,21 @@ def _split_followups(view: DealView, today: date, used: set[str], cadence: Caden
         if not rec.verified:
             continue
         repeats_reminder = bool(rec.evidence & followup_items) and norm(rec.text).rstrip(".!?") in reminder_texts
-        if rec.followup_only or is_followup_only(rec.text) or repeats_reminder:
+        if rec.followup_only or is_followup_only(rec.text) or is_waiting_only(rec.text) or repeats_reminder:
             if not (rec.evidence and rec.evidence <= followup_items):
                 nudges.append((note_move("Follow up", "", "", rec, rec.link, view.deal), rec.text,
                                view.last_outbound or view.last_contact,
                                "your last email" if view.last_outbound else "the last contact on record"))
         else:
             deal_moves.append(rec)
+
+    # A blocker that only says "no reply since ..." is the waiting state itself, not a situation with a next move.
+    blocker = view.blocker
+    if blocker and blocker.verified and is_waiting_only(blocker.text):
+        nudges.append((Move("Follow up", "", "", blocker.link, None, blocker.source, None, view.deal), "",
+                       view.last_outbound or view.last_contact,
+                       "your last email" if view.last_outbound else "the last contact on record"))
+        blocker = None
 
     if nudges and not has_wait:
         target, about, basis, since = nudges[0]
@@ -858,7 +868,7 @@ def _split_followups(view: DealView, today: date, used: set[str], cadence: Caden
             followups.append(replace(target, text=worded[0], when=worded[1], deal=view.deal))
 
     return (replace(view, items=[i for i in view.items if i.id not in followup_items], unanswered=unanswered,
-                    recommendation=next(iter(deal_moves), None), recommendations=deal_moves),
+                    blocker=blocker, recommendation=next(iter(deal_moves), None), recommendations=deal_moves),
             followups, bool(followups or nudges))
 
 

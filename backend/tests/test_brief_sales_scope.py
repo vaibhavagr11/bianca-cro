@@ -548,3 +548,34 @@ def test_nudge_thresholds_are_settings(monkeypatch, brief_client):
         "/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"}).json()
     assert "2 emails with no reply - consider moving to Paused" in result["text"]
     assert "10 days since your last email - follow up this week" in result["text"]
+
+
+# ---- B-02 (11/12): an item in "Waiting on their reply" never also appears in "Deals to move"
+
+@pytest.mark.parametrize("verification", ["off", "shadow"])
+def test_waiting_deal_with_only_waiting_statements_has_no_deals_to_move_row(monkeypatch, brief_client, verification):
+    monkeypatch.setattr(brief_api, "create_gate", lambda *_: PassingGate())
+    ask = email("proposal-ask", "farmater", "Can you approve the proposal?", days=9, outgoing=True)
+    ask["reply_expectation"].update(evidence_quote=ask["body"], response="Customer to approve the proposal")
+    insights = [
+        insight("approval", "farmater", "Customer to approve the proposal", SALES, type_="next_step", origin=ask,
+                quote=ask["body"], owner_side="customer", dated=False),
+        insight("waiting-note", "farmater", "Wait for the buyer's reply on the proposal", SALES, type_="next_step",
+                dated=False),
+        insight("silence", "farmater", "No reply since Oct 27", SALES, type_="blocker", owner_side=None, dated=False),
+    ]
+    profiles = [{"opportunity_id": "farmater-opportunity", "generated_at": NOW, "profile": {
+        "refs": {"I1": "silence", "I2": "waiting-note"},
+        "blockers": [{"text": "No reply since Oct 27", "evidence": ["I1"]}],
+        "recommended_actions": [{"action": "Keep following up with the buyer", "evidence": ["I2"],
+                                 "action_scope": SALES}]}}]
+    client = brief_client(BriefData([deal("farmater")], [ask], insights, profiles))
+    result = client.post(f"/brief/build?dry_run=true&version=v2&verification={verification}",
+                         headers={"X-Ingest-Token": "test-token"}).json()
+    founder = result["payload"]["sections"][0]
+    assert [w["deal"] for w in founder["waiting"]] == ["farmater"]
+    assert founder["highlights"] == [] and founder["followups"] == [] and founder["today"] == []
+    for body in (result["html"], result["text"]):
+        assert body.count("farmater") == 1               # one row: the Waiting row
+        for leak in ("No reply since", "Wait for the buyer", "Keep following up", "Check where this deal stands"):
+            assert leak not in body

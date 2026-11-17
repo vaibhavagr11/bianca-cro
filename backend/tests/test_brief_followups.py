@@ -52,3 +52,39 @@ def test_keep_following_up_in_any_voice_is_a_nudge(text):
 ])
 def test_ongoing_work_is_not_a_nudge(text):
     assert not is_followup_only(text)
+
+
+# ---- B-02 (11/12): a row that "literally says no reply since" is a waiting state, not a deal to move
+
+from app.brief_followups import is_waiting_only  # noqa: E402
+
+
+@pytest.mark.parametrize("text", [
+    "Wait for Franco's reply on the proposal",
+    "Waiting on the buyer to confirm the pilot dates.",
+    "No reply since Oct 21",
+    "No response from procurement yet",
+    "Franco has not replied to the Oct 21 proposal",
+    "The buyer hasn't responded since the demo",
+    "Still waiting for the signed NDA",
+    "Pending their reply on pricing",
+    "Await customer feedback on the deck",
+    "Esperar respuesta de Compras",
+    "Sin respuesta desde el 21 de octubre",
+    "Juan no ha respondido el correo",
+    "The customer went quiet after the pricing call",
+])
+def test_statements_that_only_say_we_are_waiting(text):
+    assert is_waiting_only(text)
+
+
+@pytest.mark.parametrize("text", [
+    "Wait for the NDA, then send the pricing sheet",
+    "Send the revised pricing sheet",
+    "No budget approved for this year",
+    "Ask the buyer to approve the updated proposal.",
+    "Legal has not approved the NDA wording we need to change",
+    "Prepare the waiting-list analysis for the buyer",
+])
+def test_real_work_or_other_blockers_are_not_waiting_statements(text):
+    assert not is_waiting_only(text)
