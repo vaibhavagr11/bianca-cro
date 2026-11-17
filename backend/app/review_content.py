@@ -9,11 +9,15 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-from datetime import date, datetime
+import re
+import unicodedata
+from datetime import date, datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
 from app import extractor
+from app.brief_v2 import is_automated
+from app.gmail import domain
 from app.review_deadlines import normalize_deadline
 
 
@@ -101,37 +105,148 @@ def _supporting_record(insight: dict, passage: str, records: dict[str, dict]) ->
     return matches[0] if len(matches) == 1 else None
 
 
-def proposal_content(records: list[dict], insights: list[dict]) -> Content:
-    """Build sales review bullets and attribute each one to the source of its quote."""
-    groups: dict[str, list[str]] = {destination: [] for destination in DESTINATIONS}
-    lineage: dict[str, list[dict]] = {destination: [] for destination in DESTINATIONS}
-    positions: dict[tuple[str, str], int] = {}
-    sources: dict[str, dict] = {}
+def _when(value: Any) -> datetime | None:
+    """A source time as a UTC instant; anything unreadable cannot prove an order of events."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+
+
+def is_email_ask(insight: dict) -> bool:
+    """A next step for Bianca taken from one email message - what the daily brief lists as "Customer asked"."""
+    return (insight.get("type") == "next_step" and insight.get("owner_side") == "bianca"
+            and insight.get("source") == "gmail" and insight.get("origin_record_id") is not None)
+
+
+def _mail_direction(message: dict, internal_domains: frozenset[str]) -> str:
+    """Who wrote an email: the customer ("inbound"), Bianca to someone outside ("outbound"), or neither."""
+    people = message.get("participants") or {}
+    senders = [str(p.get("address") or "").lower() for p in people.get("from") or [] if p.get("address")]
+    recipients = [str(p.get("address") or "").lower() for field in ("to", "cc") for p in people.get(field) or []
+                  if p.get("address")]
+    if not senders or is_automated(senders, message.get("subject")):
+        return "other"  # an out-of-office or a bounce answers nothing
+    if all(domain(address) not in internal_domains for address in senders):
+        return "inbound"
+    if (all(domain(address) in internal_domains for address in senders)
+            and any(domain(address) not in internal_domains for address in recipients)):
+        return "outbound"
+    return "other"
+
+
+def answered_email_asks(insights: list[dict], messages: list[dict], internal_domains: frozenset[str], *,
+                        thread_done: dict[str, Any] | None = None,
+                        not_sales: frozenset[str] = frozenset()) -> frozenset[str]:
+    """Ids of emailed asks to Bianca that their own thread shows were already answered.
+
+    The daily brief lists what a customer asked by email only while the customer wrote last in that thread.
+    Once Bianca has written back there, or a founder marked the thread done in the brief, the ask leaves the
+    brief. The hub applies the same rule so it does not suggest a reply that was already sent:
+
+    - the step is a next step for Bianca taken from a customer's email (never a meeting note or our own email);
+    - and a later email in the same thread was sent by Bianca to someone outside Bianca, or a founder marked
+      that thread done in the brief at or after the customer's email.
+
+    Automatic replies, internal forwards and emails whose extracted items are all outside sales (`not_sales`)
+    do not count as an answer. Anything this cannot prove stays on the card.
+    """
+    internal = frozenset(value.lower() for value in internal_domains)
+    by_id = {str(message["id"]): message for message in messages}
+    done = thread_done or {}
+    answered = set()
+    for insight in insights:
+        origin = by_id.get(str(insight.get("origin_record_id"))) if is_email_ask(insight) else None
+        asked_at = _when(origin.get("occurred_at")) if origin else None
+        thread = origin.get("thread_id") if origin else None
+        if asked_at is None or not thread or _mail_direction(origin, internal) != "inbound":
+            continue
+        closed_at = _when(done.get(thread))
+        replied = any(message.get("thread_id") == thread and str(message["id"]) not in not_sales
+                      and (sent_at := _when(message.get("occurred_at"))) is not None and sent_at > asked_at
+                      and _mail_direction(message, internal) == "outbound" for message in messages)
+        if replied or (closed_at is not None and closed_at >= asked_at):
+            answered.add(str(insight["id"]))
+    return frozenset(answered)
+
+
+_SUBJECT = r"(?:\S+(?: \S+)? (?:to|should|must|will|needs? to|has to|have to) )?"
+_AGAIN = r"(?P<again>(?:keep(?: on)?|continu(?:e|ing)(?: to)?|still|seguir|continuar) )?"
+_NUDGE = (r"(?:follow(?:ing)?[ -]?up|check(?:ing)? (?:in|back)|circl(?:e|ing) back|(?:stay|keep)(?:ing)? in touch"
+          r"|(?:hacer|haciendo|dar|dando|con el|el) seguimiento)")
+_NUDGE_MAIL = (r"send(?:ing)? (?P<another>a|another|one more) (?:gentle |quick |short )?"
+               r"(?:follow[ -]?up|reminder|nudge)(?: (?:e-?mail|message|note))?")
+_RECIPIENT = r"(?: (?:with|to|a|con) (?P<who>[^.,;:]{1,60}?))?"
+_NO_NEWS = (r"(?: (?:again|periodically|regularly|consistently|as needed|if needed|for now"
+            r"|until (?:they|he|she|the (?:customer|client|team)) (?:repl(?:y|ies)|responds?|answers?|gets? back(?: to us)?)"
+            r"|for an? (?:response|reply|answer|update)))*")
+_VAGUE_FOLLOWUP = re.compile(rf"{_SUBJECT}(?:{_AGAIN}{_NUDGE}|{_NUDGE_MAIL})(?: again)?{_RECIPIENT}{_NO_NEWS}", re.IGNORECASE)
+_ANYONE = frozenset("them him her the their our customer client prospect contact contacts buyer team company account "
+                    "lead and y & ellos el la cliente equipo".split())
+
+
+def is_vague_followup(text: str) -> bool:
+    """True only for a step that says nothing beyond "keep following up".
+
+    Founders asked the hub not to show these (11/12/2026): the brief's "Waiting on their reply" section already
+    says how long a thread has been quiet. The whole step must be a nudge with no topic and no date:
+    "Keep following up with Andina", "Continue to follow up", "Send a follow-up", "Follow up with the customer".
+    Anything with a subject matter or a time ("Follow up on the pricing proposal", "Follow up next week",
+    "Follow up with Renzo about the walkthrough") is a real step and stays. A bare "Follow up with Renzo" also
+    stays, because it names who to write to; a named person is only ignored when the step is plainly a repeat
+    ("keep", "continue", "another").
+    """
+    plain = "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
+    plain = " ".join(plain.split()).lstrip("-•* ").rstrip(" .!")
+    match = _VAGUE_FOLLOWUP.fullmatch(plain)
+    if not match:
+        return False
+    words = (match["who"] or "").split()
+    if all(word.casefold() in _ANYONE for word in words):
+        return True
+    repeat = bool(match["again"]) or (match["another"] or "").casefold() in ("another", "one more") \
+        or bool(re.search(r"\bagain\b", plain, re.IGNORECASE))
+    return repeat and len(words) <= 4 and all(word.casefold() in _ANYONE or word[:1].isupper() for word in words)
+
+
+_OWNER_ORDER = {"bianca": 0, None: 1, "customer": 2}
+_SIDES = {0: "bianca", 1: "unassigned", 2: "customer", 3: "blocker"}
+WAITING_SIDES = frozenset({"customer", "blocker"})
+_BLOCKER_ORDER = 3
+_WORD = re.compile(r"[^\W_]+", re.UNICODE)
+_FILLER = frozenset("a an and are as at be by for from in is it of on or that the their them they this to was "
+                    "we were will with bianca customer".split())
+
+
+def _terms(text: str) -> frozenset[str]:
+    return frozenset(word for word in _WORD.findall(text.casefold()) if len(word) > 2 and word not in _FILLER)
+
+
+def _same_step(left: frozenset[str], right: frozenset[str]) -> bool:
+    """Two wordings of one step: at least three in four meaningful words of the shorter one appears in the other."""
+    smaller = min(len(left), len(right))
+    return smaller >= 4 and len(left & right) / smaller >= 0.75
+
+
+def reviewed_content(records: list[dict], insights: list[dict], *, max_next_steps: int | None = None,
+                     max_context: int | None = None,
+                     answered: frozenset[str] = frozenset()) -> tuple[Content, list[dict]]:
+    """Build the review bullets, and name the source versions whose only bullets were left off the card.
+
+    Next Step leads with Bianca's own actions, newest first; customer-owed items and blockers follow.
+    Two wordings of the same step become one bullet with both sources. When a limit is set, the newest
+    bullets stay. Sources that supported only removed bullets are returned separately so a decision on
+    the card can also retire them, instead of the old bullets returning on the next build.
+    `answered` holds the ids of emailed asks already answered in their thread (`answered_email_asks`);
+    like items marked done, they are not suggested.
+    """
     by_id = {str(record["id"]): record for record in records}
-
-    def evidence(record: dict, passage: str) -> str:
-        version = source_version(record)
-        identifier = source_id(record)
-        entry = {"id": identifier, "recordId": str(record["id"]), "source": record["source"],
-                 "externalId": str(record["external_id"]), "version": version["version"],
-                 "type": SOURCE_NAMES[record["source"]],
-                 "date": _stamp(record.get("occurred_at"))[:10] or "Undated",
-                 "recordedAt": _stamp(record.get("created_at")), "subject": str(record.get("subject") or ""),
-                 "url": _source_link(record), "quotes": [passage], "quote": passage}
-        sources[identifier] = _merge_source(sources[identifier], entry) if identifier in sources else entry
-        return identifier
-
-    def add(text: str, destination: str, identifier: str) -> None:
-        key = (destination, _squash(text))
-        if not key[1]:
-            return
-        if key in positions:
-            node = lineage[destination][positions[key]]
-            node["sourceIds"] = _union(node["sourceIds"], [identifier])
-            return
-        positions[key] = len(groups[destination])
-        groups[destination].append(text)
-        lineage[destination].append({"bulletId": bullet_id(destination, text), "text": text, "sourceIds": [identifier]})
+    candidates: dict[str, list[dict]] = {destination: [] for destination in DESTINATIONS}
+    positions: dict[tuple[str, str], dict] = {}
 
     ordered = sorted(insights, key=lambda item: (item["type"] in ("commitment", "next_step"),
                                                _stamp(item.get("occurred_at")), item["text"]))
@@ -142,9 +257,15 @@ def proposal_content(records: list[dict], insights: list[dict]) -> Content:
             continue
         if not text or insight.get("status") in ("done", "dismissed", "possibly_done"):
             continue
+        if str(insight.get("id")) in answered:
+            continue
+        if (kind in ("commitment", "next_step") and insight.get("owner_side") != "customer"
+                and not insight.get("due_date") and is_vague_followup(text)):
+            continue  # "keep following up" with no topic or date tells a founder nothing
         passage = insight.get("quote") or ""
         if not (record := _supporting_record(insight, passage, by_id)):
             continue
+        terms = _terms(text)
         prefix = CONTEXT_NAMES.get(kind)
         owner_side = insight.get("owner_side")
         if kind == "commitment":
@@ -160,9 +281,100 @@ def proposal_content(records: list[dict], insights: list[dict]) -> Content:
             label = "requested by" if kind == "next_step" else "due"
             text += f" — {label} {_stamp(insight['due_date'])[:10]}"
         destination = "nextStep" if kind in ACTION_TYPES else "clientContext"
-        add(text, destination, evidence(record, passage))
+        key = (destination, _squash(text))
+        if not key[1]:
+            continue
+        day = _stamp(insight.get("occurred_at"))[:10]
+        rank = (_BLOCKER_ORDER if kind == "blocker" else _OWNER_ORDER.get(owner_side, 1)) if destination == "nextStep" else 0
+        entry = positions.get(key)
+        if entry is None:
+            entry = {"text": text, "terms": terms, "day": day, "rank": rank, "evidence": []}
+            positions[key] = entry
+            candidates[destination].append(entry)
+        entry["day"] = max(entry["day"], day)
+        entry["evidence"].append((record, passage))
 
-    return groups["nextStep"], groups["clientContext"], list(sources.values()), lineage
+    # Prefer Bianca's own wording, then the newer source, when two bullets describe the same step.
+    steps: list[dict] = []
+    for entry in sorted(candidates["nextStep"], key=lambda item: (item["rank"], _reverse(item["day"]), item["text"])):
+        twin = next((kept for kept in steps if _same_step(kept["terms"], entry["terms"])), None)
+        if twin is None:
+            steps.append(entry)
+        else:
+            twin["day"] = max(twin["day"], entry["day"])
+            twin["evidence"].extend(entry["evidence"])
+    candidates["nextStep"] = steps
+
+    removed: list[dict] = []
+    for destination, limit in zip(DESTINATIONS, (max_next_steps, max_context)):
+        entries = candidates[destination]
+        if limit is not None and limit > 0 and len(entries) > limit:
+            newest = sorted(entries, key=lambda item: (_reverse(item["day"]), item["rank"], item["text"]))
+            keep = {id(item) for item in newest[:limit]}
+            removed.extend(item for item in entries if id(item) not in keep)
+            entries = [item for item in entries if id(item) in keep]
+        if destination == "nextStep":
+            entries = sorted(entries, key=lambda item: (item["rank"], _reverse(item["day"]), item["text"]))
+        candidates[destination] = entries
+
+    groups: dict[str, list[str]] = {destination: [] for destination in DESTINATIONS}
+    lineage: dict[str, list[dict]] = {destination: [] for destination in DESTINATIONS}
+    sources: dict[str, dict] = {}
+
+    def evidence(record: dict, passage: str) -> str:
+        version = source_version(record)
+        identifier = source_id(record)
+        entry = {"id": identifier, "recordId": str(record["id"]), "source": record["source"],
+                 "externalId": str(record["external_id"]), "version": version["version"],
+                 "type": SOURCE_NAMES[record["source"]],
+                 "date": _stamp(record.get("occurred_at"))[:10] or "Undated",
+                 "recordedAt": _stamp(record.get("created_at")), "subject": str(record.get("subject") or ""),
+                 "url": _source_link(record), "quotes": [passage], "quote": passage}
+        sources[identifier] = _merge_source(sources[identifier], entry) if identifier in sources else entry
+        return identifier
+
+    for destination in DESTINATIONS:
+        for entry in candidates[destination]:
+            identifiers = sorted({evidence(record, passage) for record, passage in entry["evidence"]})
+            groups[destination].append(entry["text"])
+            node = {"bulletId": bullet_id(destination, entry["text"]), "text": entry["text"], "sourceIds": identifiers}
+            if destination == "nextStep":
+                # Who the step is with, known here from the insight's owner; the page never reads it from the wording.
+                node["side"] = _SIDES[entry["rank"]]
+            lineage[destination].append(node)
+
+    retired: dict[str, dict] = {}
+    for entry in removed:
+        for record, _ in entry["evidence"]:
+            if source_id(record) not in sources:
+                retired[source_id(record)] = source_version(record)
+    content = groups["nextStep"], groups["clientContext"], list(sources.values()), lineage
+    return content, sorted(retired.values(), key=lambda item: (item["source"], item["external_id"], item["version"]))
+
+
+def is_waiting_on_them(lineage: Any) -> bool | None:
+    """Whether a card is only waiting: every Next Step bullet is owed by the customer or is a blocker.
+
+    None when the card cannot say - no Next Step bullets, or it was built before bullets recorded their side.
+    """
+    nodes = lineage.get("nextStep") if isinstance(lineage, dict) else None
+    if not isinstance(nodes, list) or not nodes:
+        return None
+    sides = [node.get("side") if isinstance(node, dict) else None for node in nodes]
+    if any(side not in _SIDES.values() for side in sides):
+        return None
+    return all(side in WAITING_SIDES for side in sides)
+
+
+def _reverse(day: str) -> tuple[int, ...]:
+    """Sort key that puts the latest ISO day first and undated items last."""
+    return tuple(-ord(char) for char in day) if day else (1,)
+
+
+def proposal_content(records: list[dict], insights: list[dict], *, max_next_steps: int | None = None,
+                     max_context: int | None = None) -> Content:
+    """Build sales review bullets and attribute each one to the source of its quote."""
+    return reviewed_content(records, insights, max_next_steps=max_next_steps, max_context=max_context)[0]
 
 
 def validate_lineage(next_steps: list[str], context: list[str], sources: list[dict], lineage: dict,
@@ -294,7 +506,8 @@ def approved_lineage(proposal: dict, next_steps: list[str], context: list[str], 
             source_ids = list(previous["sourceIds"]) if previous else []
             if destination == "nextStep" and text in formatted_sources:
                 source_ids = _union(source_ids, formatted_sources[text])
-            result[destination].append({"bulletId": bullet_id(destination, text), "text": text,
-                                        "sourceIds": source_ids,
-                                        "origin": "source" if source_ids else "founder_edit"})
+            node = {"bulletId": bullet_id(destination, text), "text": text, "sourceIds": source_ids}
+            if previous and "side" in previous:
+                node["side"] = previous["side"]  # an unedited step keeps who it is with in the audit
+            result[destination].append({**node, "origin": "source" if source_ids else "founder_edit"})
     return result

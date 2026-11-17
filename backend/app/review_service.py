@@ -21,10 +21,12 @@ from psycopg.errors import UniqueViolation
 
 from app import db
 from app.config import settings
+from app.extractor import SALES_SCOPES
 from app.pipeline import PipelineRow, TRACKED_FIELDS, is_working_client, normalize_name
 from app.review_sheets import SheetsClient, SheetConflict, SheetError, SheetWorkingClient, SheetWriteUncertain
 from app.review_content import (
-    Content, approved_lineage, proposal_content, review_next_step_bullets, source_id, source_version, validate_lineage,
+    Content, answered_email_asks, approved_lineage, is_email_ask, is_waiting_on_them, proposal_content, reviewed_content,
+    review_next_step_bullets, source_id, source_version, validate_lineage,
 )
 
 
@@ -220,13 +222,74 @@ def _proposal_data(row: dict) -> dict:
             "revision": row["revision"], "status": row["status"]}
 
 
-def _current_content(conn, workspace_id, deal: dict, records: list[dict]) -> Content:
+def _card_limit(name: str) -> int | None:
+    value = getattr(settings, name, None)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _answered_asks(conn, workspace_id, company_id, insights: list[dict], cutoff) -> frozenset[str]:
+    """Emailed asks on this card that Bianca already answered in the same thread (see `answered_email_asks`).
+
+    Only mail and brief Done clicks stored by `cutoff` - the start of the review cycle that built the card -
+    are read, so the approval re-check sees exactly what the build saw. Without a cutoff the queue's current
+    cycle start is used.
+    """
+    origins = [i["origin_record_id"] for i in insights if is_email_ask(i)]
+    if not origins:
+        return frozenset()
+    if cutoff is None:
+        state = conn.execute("select cycle_started_at from review_queue_state where workspace_id = %s",
+                             (workspace_id,)).fetchone()
+        cutoff = state["cycle_started_at"] if state else None
+        if cutoff is None:
+            return frozenset()
+    messages = conn.execute(
+        "select id, thread_id, occurred_at, subject, participants from source_records where workspace_id = %s"
+        " and company_id = %s and source = 'gmail' and status = 'classified'"
+        " and classification->>'is_commercial' = 'true' and occurred_at is not null and created_at <= %s"
+        " and thread_id in (select thread_id from source_records where workspace_id = %s and id = any(%s::uuid[])"
+        " and source = 'gmail' and thread_id is not null) order by occurred_at, id",
+        (workspace_id, company_id, cutoff, workspace_id, origins)).fetchall()
+    threads = sorted({m["thread_id"] for m in messages})
+    if not threads:
+        return frozenset()
+    workspace = conn.execute("select internal_domains from workspaces where id = %s", (workspace_id,)).fetchone()
+    internal = frozenset({d.lower() for d in (workspace or {}).get("internal_domains") or []}
+                         | {d.lower() for d in getattr(settings, "project_team_domains", None) or []})
+    # As in the brief: an email whose extracted items are all outside sales is not an answer to a sales ask.
+    scopes: dict[str, set] = {}
+    for row in conn.execute("select origin_record_id, action_scope from insights where workspace_id = %s"
+                            " and origin_record_id = any(%s::uuid[])", (workspace_id, [m["id"] for m in messages])):
+        scopes.setdefault(str(row["origin_record_id"]), set()).add(row["action_scope"])
+    not_sales = frozenset(record_id for record_id, found in scopes.items() if not found & set(SALES_SCOPES))
+    # A founder's "Mark as complete" on the thread in the brief; an Undo after it reopens the ask.
+    # The table arrives with the brief's migrations; a workspace without it simply has no such clicks.
+    done = {}
+    if conn.execute("select to_regclass('brief_actions') as found").fetchone()["found"] is not None:
+        done = {row["ref"]: row["created_at"] for row in conn.execute(
+            "select distinct on (ref) ref, action, created_at from brief_actions where workspace_id = %s"
+            " and kind = 'thread' and ref = any(%s::text[]) and created_at <= %s order by ref, created_at desc",
+            (workspace_id, threads, cutoff)) if row["action"] == "done"}
+    return answered_email_asks(insights, messages, internal, thread_done=done, not_sales=not_sales)
+
+
+def _current_content(conn, workspace_id, deal: dict, records: list[dict], *,
+                     cutoff=None) -> tuple[Content, list[dict]]:
+    """Current card content, plus the versions of every source the card accounts for.
+
+    The versions include sources whose only bullets fell outside the card limits, so a decision retires them too.
+    `cutoff` is the review cycle start the build is working from; the approval re-check leaves it out and
+    reads the same value from the queue state.
+    """
     insights = conn.execute(
         "select * from insights where workspace_id = %s and company_id = %s and opportunity_id = %s"
         " and source_record_ids && %s::uuid[] order by id",
         (workspace_id, deal["company_id"], deal["opportunity_id"], [r["id"] for r in records]),
     ).fetchall() if records else []
-    return proposal_content(records, insights)
+    answered = _answered_asks(conn, workspace_id, deal["company_id"], insights, cutoff)
+    content, retired = reviewed_content(records, insights, max_next_steps=_card_limit("review_max_next_steps"),
+                                        max_context=_card_limit("review_max_context"), answered=answered)
+    return content, sorted(_content_versions(content[2]) + retired, key=_source_key)
 
 
 def _content_versions(sources: list[dict]) -> list[dict]:
@@ -276,11 +339,11 @@ def build_proposals(conn, workspace_id, *, force: bool = False) -> dict:
                    and _source_key(source_version(r)) + (str(deal["company_id"]),) not in receipts
                    and (state["bootstrap_completed"] or _in_bootstrap_window(r, state))]
         # Re-extraction can change an insight's scope without changing its source version.
-        next_steps, context, sources, lineage = _current_content(conn, workspace_id, deal, records)
+        (next_steps, context, sources, lineage), versions = _current_content(
+            conn, workspace_id, deal, records, cutoff=state["cycle_started_at"])
         if not existing and not (next_steps or context):
             counts["unchanged"] += 1
             continue
-        versions = _content_versions(sources)
         baseline = _cells(deal["last_progress"], deal["next_step"], deal.get("client_context"))
         data = {"company_name": deal["company_name"], "owner_code": deal["owner_code"], "stage": deal["stage"],
                 "country": deal["country"], "bullets": next_steps + context, "sources": sources, "source_versions": versions,
@@ -371,7 +434,8 @@ def workspace_view(conn, workspace_id) -> dict:
         if row["status"] == "applying":
             intent = conn.execute(
                 "select idempotency_key, revision, next_step_bullets, client_context_bullets, routing_version,"
-                " sheet_target, error, bullet_lineage, lineage_version from review_decisions where workspace_id = %s"
+                " sheet_target, error, bullet_lineage, lineage_version, proposal_id, request_hash"
+                " from review_decisions where workspace_id = %s"
                 " and proposal_id = %s and status = 'applying'", (workspace_id, row["id"])).fetchone()
             if intent and row.get("routing_version") == ROUTING_VERSION and intent.get("routing_version") == ROUTING_VERSION:
                 item["nextStepBullets"] = intent["next_step_bullets"]
@@ -382,6 +446,9 @@ def workspace_view(conn, workspace_id) -> dict:
                     item["retry"] = {"idempotency_key": intent["idempotency_key"], "revision": intent["revision"],
                                      "next_step_bullets": intent["next_step_bullets"],
                                      "client_context_bullets": intent["client_context_bullets"]}
+                    if _saved_next_step_mode(intent) == "append":
+                        # Older pages ignore this field; their retry is then refused, never applied as a replace.
+                        item["retry"]["next_step_mode"] = "append"
                     item["error"] = intent.get("error") or "Sheet update awaiting confirmation. Retry the same approval."
                 else:
                     item["error"] = "The saved approval targets a different Sheet configuration. An operator must reconcile it before retrying."
@@ -396,6 +463,10 @@ def workspace_view(conn, workspace_id) -> dict:
                 formatted = _review_next_steps(row, dated_source_ids)
                 if formatted != item["nextStepBullets"]:
                     item["reviewNextStepBullets"] = formatted
+                # H-10: the agenda lists cards that are only waiting on the customer below the ones needing action.
+                waiting = is_waiting_on_them(row.get("bullet_lineage"))
+                if waiting is not None:
+                    item["waiting"] = waiting
         proposals.append(item)
     rows = [{"id": str(r["id"]), "company": r["name"], "owner": r["owner_code"] or "", "stage": r["stage"] or "",
              "lastProgress": _cell(r["last_progress"]), "nextStep": _cell(r["next_step"]),
@@ -412,7 +483,66 @@ def workspace_view(conn, workspace_id) -> dict:
                      f"?gid={target['sheet_id']}#gid={target['sheet_id']}")
     return {"proposals": proposals, "rows": rows, "activity": activity, "sheetUrl": sheet_url,
             "routingVersion": ROUTING_VERSION, "clientContextMode": settings.review_client_context_mode,
+            "statusOptions": status_options(statuses),
             "owners": [{"code": "RG", "name": "Ramiro"}, {"code": "NC", "name": "Nico"}, {"code": "NDL", "name": "Nico"}]}
+
+
+def status_options(statuses: dict[str, str | None]) -> list[str]:
+    """The statuses a founder may choose: exactly the labels already used in the Sheet's Status column."""
+    return sorted({status.strip() for status in statuses.values() if isinstance(status, str) and status.strip()})
+
+
+def change_status(workspace_id, row_id: str, actor: str, expected_status: str, new_status: str) -> dict:
+    """A founder's explicit Status change for one pipeline company. Writes that one Sheet cell and nothing else."""
+    if actor not in ("RG", "NC", "NDL"):
+        raise ValueError("A valid founder is required.")
+    if not isinstance(expected_status, str) or not isinstance(new_status, str) or not new_status.strip():
+        raise ValueError("Choose a status.")
+    new_status = new_status.strip()
+    with db.connect() as conn:
+        conn.row_factory = dict_row
+        lookup = ("select o.*, c.name, c.country from opportunities o join companies c on c.id = o.company_id"
+                  " where o.workspace_id = %s and o.id::text = %s")
+        row = conn.execute(lookup, (workspace_id, row_id)).fetchone()
+        if not row or row["removed_at"] is not None:
+            raise ReviewNotFound("This company is not in the active Pipeline sheet.")
+        conn.commit()  # hold no database lock while the Sheet is read and written
+        try:
+            sheets = SheetsClient()
+            options = status_options(sheets.read_company_statuses())
+            if new_status not in options:
+                raise ValueError("Choose one of the statuses already used in the Pipeline sheet.")
+            live = sheets.set_status(row["name"], expected_status, new_status)
+        except SheetConflict as exc:
+            raise ReviewConflict(str(exc)) from exc
+        except SheetWriteUncertain as exc:
+            raise ReviewUnavailable(str(exc)) from exc
+        except SheetError as exc:
+            raise ReviewUnavailable("The Sheet could not be reached. Refresh to check the Status before trying again.") from exc
+        # The Sheet now holds the new status. Bring the pipeline cache in step unless a sync moved it meanwhile.
+        company = row["name"]
+        row = conn.execute(lookup + " for update of o", (workspace_id, row_id)).fetchone() or {"name": company}
+        previous = _cell(row.get("stage"))
+        mirror_refreshed = (row.get("id") is not None and row.get("removed_at") is None
+                            and previous.strip() in (expected_status.strip(), new_status))
+        if mirror_refreshed and previous.strip() != new_status:
+            # Keep the pipeline cache and its history in step, exactly as the next full sync would record it.
+            fields = {k: (str(row[k]).strip() or None) if row.get(k) is not None else None for k in TRACKED_FIELDS}
+            fields["stage"] = new_status
+            pipeline_row = PipelineRow(row["name"], normalize_name(row["name"]), fields)
+            conn.execute("update opportunities set stage = %s, row_hash = %s where id = %s",
+                         (new_status, pipeline_row.row_hash, row["id"]))
+            run = conn.execute(
+                "insert into sync_runs (workspace_id, source, status, rows_received, rows_updated, finished_at)"
+                " values (%s, %s, 'succeeded', 1, 1, now()) returning id",
+                (workspace_id, f"sheet_review_status:{actor}")).fetchone()
+            conn.execute(
+                "insert into opportunity_changes (workspace_id, opportunity_id, sync_run_id, field, old_value, new_value)"
+                " values (%s, %s, %s, 'stage', %s, %s)", (workspace_id, row["id"], run["id"], row.get("stage"), new_status))
+        conn.commit()
+        return {"rowId": row_id, "company": company, "previous": expected_status.strip(),
+                "status": live.status, "actor": actor, "mirror_refreshed": mirror_refreshed,
+                "inSalesPipeline": not is_working_client(live.status)}
 
 
 def _sheet_target() -> dict:
@@ -426,14 +556,38 @@ def _target_is_pinned(target: dict | None) -> bool:
             and bool(target["sheet_tab"]) and type(target.get("sheet_id")) is int and target["sheet_id"] >= 0)
 
 
-def _request_hash(proposal_id: str, action: str, revision: int, next_steps: list[str], context: list[str]) -> str:
-    return _hash({"proposal_id": str(proposal_id), "action": action, "revision": revision,
-                  "next_step_bullets": next_steps, "client_context_bullets": context,
-                  "routing_version": ROUTING_VERSION})
+NEXT_STEP_MODES = ("replace", "append")
+
+
+def _request_hash(proposal_id: str, action: str, revision: int, next_steps: list[str], context: list[str],
+                  next_step_mode: str = "replace") -> str:
+    """Identity of one decision. The write mode is part of it, so a key cannot be reused to switch modes.
+
+    Replace is hashed exactly as before the mode existed, so approvals saved earlier stay retryable.
+    """
+    identity = {"proposal_id": str(proposal_id), "action": action, "revision": revision,
+                "next_step_bullets": next_steps, "client_context_bullets": context,
+                "routing_version": ROUTING_VERSION}
+    if next_step_mode != "replace":
+        identity["next_step_mode"] = next_step_mode
+    return _hash(identity)
+
+
+def _saved_next_step_mode(intent: dict) -> str:
+    """The mode a saved approval was made with, recovered from its request hash (no column stores it)."""
+    for mode in NEXT_STEP_MODES:
+        if intent.get("request_hash") == _request_hash(intent.get("proposal_id"), "approve", intent.get("revision"),
+                                                       intent.get("next_step_bullets"),
+                                                       intent.get("client_context_bullets"), mode):
+            return mode
+    return "replace"
 
 
 def _append_context(existing: str, bullets: list[str]) -> str:
-    """Preserve existing bytes and append only genuinely new normalized bullet lines."""
+    """Preserve existing bytes and append only genuinely new normalized bullet lines.
+
+    Used for Client Context, and for Next step when the founder chose Keep current bullets + add these.
+    """
     seen = {_squash(_BULLET.sub("", line.strip())) for line in existing.splitlines() if line.strip()}
     additions = []
     for bullet in bullets:
@@ -509,10 +663,10 @@ def _require_current_content(conn, workspace_id, proposal: dict) -> list[dict]:
     if any(key not in by_version for key in expected):
         raise ReviewConflict("The source material changed since this card was generated. Refresh the review queue before deciding.")
     records = [by_version[key] for key in expected]
-    next_steps, context, sources, lineage = _current_content(conn, workspace_id, proposal, records)
+    (next_steps, context, sources, lineage), versions = _current_content(conn, workspace_id, proposal, records)
     if (not (next_steps or context) or next_steps != proposal["next_step_bullets"]
             or context != proposal["client_context_bullets"] or lineage != proposal["bullet_lineage"]
-            or _content_versions(sources) != proposal["source_versions"]):
+            or versions != proposal["source_versions"]):
         raise ReviewConflict("The sales evidence changed since this card was generated. Refresh the review queue before deciding.")
     return records
 
@@ -525,7 +679,8 @@ def _require_live_sales_status(sheets: SheetsClient, company: str) -> None:
 
 def _prepare(conn, workspace_id, proposal_id: str, actor: str, action: str, revision: int,
              idempotency_key: str, next_step_bullets: list[str] | None,
-             client_context_bullets: list[str] | None, sheets: SheetsClient) -> tuple[dict, dict, bool]:
+             client_context_bullets: list[str] | None, sheets: SheetsClient,
+             next_step_mode: str = "replace") -> tuple[dict, dict, bool]:
     proposal = conn.execute(
         "select p.*, o.removed_at, o.stage as current_stage, c.name as current_company_name"
         " from review_proposals p join opportunities o on o.id = p.opportunity_id join companies c on c.id = o.company_id"
@@ -546,7 +701,7 @@ def _prepare(conn, workspace_id, proposal_id: str, actor: str, action: str, revi
                                allow_empty=True)
         if not next_steps and not context:
             raise ValueError("Provide at least one Next Step or Client Context bullet.")
-    request_hash = _request_hash(proposal_id, action, revision, next_steps, context)
+    request_hash = _request_hash(proposal_id, action, revision, next_steps, context, next_step_mode)
     intent = conn.execute(
         "select * from review_decisions where workspace_id = %s and idempotency_key = %s for update",
         (workspace_id, idempotency_key)).fetchone()
@@ -591,7 +746,12 @@ def _prepare(conn, workspace_id, proposal_id: str, actor: str, action: str, revi
         if not _same_cells(before, exact_live):
             raise ReviewConflict("The Sheet row changed since this card was generated. Resync the Pipeline sheet and reload before approving.")
         before, after = exact_live, dict(exact_live)
-        if next_steps:
+        if next_steps and next_step_mode == "append":
+            # Keep current bullets + add these: Last progress is not touched and nothing already there is rewritten.
+            after["nextStep"] = _append_context(before["nextStep"], next_steps)
+            if len(after["nextStep"]) > 50_000:
+                raise ValueError("The resulting Next step exceeds one Sheet cell. Shorten the steps or replace the cell instead.")
+        elif next_steps:
             after.update(lastProgress=before["nextStep"], nextStep="\n".join("- " + b for b in next_steps))
         if context:
             after["clientContext"] = (_append_context(before["clientContext"], context)
@@ -657,10 +817,17 @@ class _LazySheets:
 
 
 def decide(workspace_id, proposal_id: str, actor: str, action: str, revision: int, idempotency_key: str,
-           next_step_bullets: list[str] | None = None, client_context_bullets: list[str] | None = None) -> dict:
-    """An explicit founder decision. Fixed intents and locks make retries recoverable, not a second rotation."""
+           next_step_bullets: list[str] | None = None, client_context_bullets: list[str] | None = None,
+           next_step_mode: str = "replace") -> dict:
+    """An explicit founder decision. Fixed intents and locks make retries recoverable, not a second rotation.
+
+    ``next_step_mode`` is "replace" (approved steps become Next step, the old Next step moves to Last progress)
+    or "append" (approved steps are added below the existing Next step text; Last progress is left alone).
+    """
     if action not in ("approve", "ignore") or actor not in ("RG", "NC", "NDL"):
         raise ValueError("A valid founder and decision are required.")
+    if next_step_mode not in NEXT_STEP_MODES or (action == "ignore" and next_step_mode != "replace"):
+        raise ValueError("Choose whether to replace Next step or add to it.")
     if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
         raise ValueError("A valid proposal revision is required.")
     if not isinstance(idempotency_key, str) or not 8 <= len(idempotency_key) <= 128 or idempotency_key.strip() != idempotency_key:
@@ -676,7 +843,8 @@ def decide(workspace_id, proposal_id: str, actor: str, action: str, revision: in
         sheets = _LazySheets()
         try:
             proposal, intent, finished = _prepare(conn, workspace_id, proposal_id, actor, action, revision,
-                                                  idempotency_key, next_step_bullets, client_context_bullets, sheets)
+                                                  idempotency_key, next_step_bullets, client_context_bullets, sheets,
+                                                  next_step_mode)
         except SheetConflict as exc:
             raise ReviewConflict(str(exc)) from exc
         except SheetError as exc:

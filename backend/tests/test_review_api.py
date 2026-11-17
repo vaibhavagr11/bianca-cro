@@ -113,7 +113,11 @@ def test_mcp_initialization_and_notification():
 
 def test_mcp_tools_are_narrow_and_include_review_version():
     tools = rpc("tools/list").json()["result"]["tools"]
-    assert {t["name"] for t in tools} == {"bianca_review_workspace", "bianca_approve_update", "bianca_ignore_update"}
+    assert {t["name"] for t in tools} == {"bianca_review_workspace", "bianca_approve_update", "bianca_ignore_update",
+                                        "bianca_set_status"}
+    status = next(t for t in tools if t["name"] == "bianca_set_status")
+    assert set(status["inputSchema"]["required"]) == {"row_id", "expected_status", "status"}
+    assert "actor" not in status["inputSchema"]["properties"]
     approval = next(t for t in tools if t["name"] == "bianca_approve_update")
     assert set(approval["inputSchema"]["required"]) == {
         "proposal_id", "revision", "idempotency_key", "next_step_bullets", "client_context_bullets"}
@@ -284,3 +288,85 @@ def test_publish_keeps_independent_results_and_rejects_timed_out(monkeypatch):
     assert client.post("/process/publish", headers={"X-Ingest-Token": "test-token"}).status_code == 409
     conn.stage, conn.pending = "done", True
     assert client.post("/process/publish", headers={"X-Ingest-Token": "test-token"}).status_code == 409
+
+
+def test_status_change_uses_the_authenticated_founder_over_rest_and_mcp(monkeypatch):
+    calls = []
+    def change(workspace_id, row_id, actor, expected_status, new_status):
+        calls.append((row_id, actor, expected_status, new_status))
+        return {"rowId": row_id, "company": "Diageo", "previous": expected_status, "status": new_status}
+    @contextmanager
+    def connect():
+        yield object()
+    monkeypatch.setattr(review_api.db, "connect", connect)
+    monkeypatch.setattr(review_api, "_workspace_id", lambda conn: "workspace")
+    monkeypatch.setattr(review_service, "change_status", change)
+    row = str(uuid4())
+    body = {"expected_status": "1. Opening", "status": "0. Paused"}
+    rest = client.post(f"/review/rows/{row}/status", json=body, headers=HEADERS)
+    assert rest.status_code == 200 and rest.json()["status"] == "0. Paused"
+    tool = rpc("tools/call", {"name": "bianca_set_status", "arguments": {"row_id": row, **body}})
+    assert tool.json()["result"]["isError"] is False
+    assert calls == [(row, "NDL", "1. Opening", "0. Paused")] * 2
+    assert client.post(f"/review/rows/{row}/status", json=body).status_code == 401
+    assert client.post(f"/review/rows/{row}/status", json={**body, "actor": "RG"}, headers=HEADERS).status_code == 422
+    assert client.post(f"/review/rows/{row}/status", json={"expected_status": "1. Opening", "status": ""},
+                       headers=HEADERS).status_code == 422
+
+
+@pytest.mark.parametrize("error, code", [(review_service.ReviewConflict("changed"), 409),
+                                         (review_service.ReviewNotFound("gone"), 404),
+                                         (review_service.ReviewUnavailable("down"), 503), (ValueError("bad"), 422)])
+def test_status_change_errors_map_to_clear_http_codes(monkeypatch, error, code):
+    @contextmanager
+    def connect():
+        yield object()
+    def change(*args):
+        raise error
+    monkeypatch.setattr(review_api.db, "connect", connect)
+    monkeypatch.setattr(review_api, "_workspace_id", lambda conn: "workspace")
+    monkeypatch.setattr(review_service, "change_status", change)
+    body = {"expected_status": "1. Opening", "status": "0. Paused"}
+    assert client.post(f"/review/rows/{uuid4()}/status", json=body, headers=HEADERS).status_code == code
+
+
+# ---- H-16: Keep current bullets + add these
+
+def test_append_mode_is_optional_validated_and_forwarded_by_rest_and_the_connector(monkeypatch):
+    calls = []
+    monkeypatch.setattr(review_api, "_workspace_id", lambda conn: "workspace")
+    @contextmanager
+    def connect():
+        yield object()
+    monkeypatch.setattr(review_api.db, "connect", connect)
+    def decide(*args, **kwargs):
+        calls.append((args[1], args[3], kwargs))
+        return {"status": "approved"}
+    monkeypatch.setattr(review_service, "decide", decide)
+    proposal_id = str(uuid4())
+    body = {"revision": 2, "idempotency_key": KEY, "next_step_bullets": ["Send scope."], "client_context_bullets": []}
+    route = f"/review/proposals/{proposal_id}/approve"
+    assert client.post(route, json=body, headers=HEADERS).status_code == 200
+    assert client.post(route, json={**body, "next_step_mode": "replace"}, headers=HEADERS).status_code == 200
+    assert client.post(route, json={**body, "next_step_mode": "append"}, headers=HEADERS).status_code == 200
+    r = rpc("tools/call", {"name": "bianca_approve_update",
+                           "arguments": {**body, "proposal_id": proposal_id, "next_step_mode": "append"}})
+    assert r.json()["result"]["isError"] is False
+    assert calls == [(proposal_id, "approve", {}), (proposal_id, "approve", {}),
+                     (proposal_id, "approve", {"next_step_mode": "append"}),
+                     (proposal_id, "approve", {"next_step_mode": "append"})]
+    assert client.post(route, json={**body, "next_step_mode": "merge"}, headers=HEADERS).status_code == 422
+    ignore = {"revision": 2, "idempotency_key": KEY, "next_step_mode": "append"}
+    assert client.post(f"/review/proposals/{proposal_id}/ignore", json=ignore, headers=HEADERS).status_code == 422
+    assert len(calls) == 4
+
+
+def test_connector_schema_documents_the_optional_next_step_mode():
+    tool = next(t for t in review_api._tools() if t["name"] == "bianca_approve_update")
+    schema = tool["inputSchema"]
+    assert schema["properties"]["next_step_mode"]["enum"] == ["replace", "append"]
+    assert schema["properties"]["next_step_mode"]["default"] == "replace"
+    assert "next_step_mode" not in schema["required"]
+    assert "Last progress is left unchanged" in tool["description"]
+    ignore = next(t for t in review_api._tools() if t["name"] == "bianca_ignore_update")
+    assert "next_step_mode" not in ignore["inputSchema"]["properties"]

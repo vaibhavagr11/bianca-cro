@@ -933,6 +933,15 @@ def test_workspace_recovery_exposes_exact_split_payload_and_not_legacy_or_redire
     ]
     assert pending["bulletLineage"] == store.data["proposal"]["bullet_lineage"]
     assert not sheets.calls
+    # H-10: the view says whether a card is only waiting on the customer; a card built earlier cannot say.
+    assert pending["waiting"] is False
+    ours = copy.deepcopy(store.data["proposal"]["bullet_lineage"])
+    for side, expected in (("customer", True), ("blocker", True), ("unassigned", False)):
+        store.data["proposal"]["bullet_lineage"]["nextStep"][0]["side"] = side
+        assert review.workspace_view(WorkspaceConnection(), WORKSPACE)["proposals"][0]["waiting"] is expected
+    del store.data["proposal"]["bullet_lineage"]["nextStep"][0]["side"]
+    assert "waiting" not in review.workspace_view(WorkspaceConnection(), WORKSPACE)["proposals"][0]
+    store.data["proposal"]["bullet_lineage"] = ours
 
     store.source_record["meta"]["date_inferred"] = True
     estimated = review.workspace_view(WorkspaceConnection(), WORKSPACE)["proposals"][0]
@@ -951,6 +960,13 @@ def test_workspace_recovery_exposes_exact_split_payload_and_not_legacy_or_redire
                                        "client_context_bullets": ["Customer need: Updated context."]}
     assert proposal_view["nextStepBullets"] == [edited_action]
     assert proposal_view["clientContextBullets"] == ["Customer need: Updated context."]
+    # H-16: a saved Keep + add approval tells the page its mode, so the retry keeps the same request identity.
+    saved = store.data["intents"][0]
+    replace_hash = saved["request_hash"]
+    saved["request_hash"] = review._request_hash(PROPOSAL, "approve", 1, saved["next_step_bullets"],
+                                                  saved["client_context_bullets"], "append")
+    assert review.workspace_view(WorkspaceConnection(), WORKSPACE)["proposals"][0]["retry"]["next_step_mode"] == "append"
+    saved["request_hash"] = replace_hash
     assert "reviewNextStepBullets" not in proposal_view
     assert "bullets" not in proposal_view
     assert view["routingVersion"] == 1
@@ -1148,9 +1164,10 @@ def test_still_qualified_pending_bullets_survive_more_than_14_days_and_grow(monk
     conn.records["company-0"].append(dated_record(9, conn.now, created=conn.now))
     assert review.build_proposals(conn, WORKSPACE)["updated"] == 1
     pending = conn.proposals["company-0"]
-    assert pending["next_step_bullets"][:len(old["next_step_bullets"])] == old["next_step_bullets"]
+    assert set(old["next_step_bullets"]) < set(pending["next_step_bullets"])
+    assert pending["next_step_bullets"][0] == "We owe: New commercial item 9."  # newest first
     assert len(pending["next_step_bullets"]) == len(old["next_step_bullets"]) + 1
-    assert pending["bullet_lineage"]["nextStep"][0] == old["bullet_lineage"]["nextStep"][0]
+    assert old["bullet_lineage"]["nextStep"][0] in pending["bullet_lineage"]["nextStep"]
     assert review.build_proposals(conn, WORKSPACE)["skipped"] is True
 
 
@@ -1274,3 +1291,447 @@ def test_edited_text_has_no_false_source_edges_in_the_durable_decision_audit(ser
         assert lineage[destination][0]["sourceIds"] == []
         assert lineage[destination][0]["origin"] == "founder_edit"
     assert store.data["intents"][0]["bullet_lineage"] == lineage
+
+
+def test_card_limit_keeps_the_newest_step_and_a_decision_retires_the_older_sources(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20, review_max_next_steps=1))
+    conn = BuildConnection(1)
+    review.build_proposals(conn, WORKSPACE)
+    conn.now += timedelta(days=3)
+    newer = dated_record(9, conn.now, created=conn.now)
+    conn.records["company-0"].append(newer)
+    assert review.build_proposals(conn, WORKSPACE)["updated"] == 1
+    pending = conn.proposals["company-0"]
+    assert pending["next_step_bullets"] == ["We owe: New commercial item 9."]
+    assert [source["externalId"] for source in pending["sources"]] == ["dated-9"]
+    # Both versions are recorded on the card, so approving or ignoring it also retires the older email.
+    assert {version["external_id"] for version in pending["source_versions"]} == {"company-0", "dated-9"}
+    assert pending["observed_source_versions"] == pending["source_versions"]
+    conn.receipts = [{"company_id": "company-0", **version} for version in pending["source_versions"]]
+    conn.proposals.clear()
+    conn.now += timedelta(days=1)
+    assert review.build_proposals(conn, WORKSPACE)["created"] == 0
+
+
+class StatusConnection:
+    def __init__(self, stage="1. Opening", removed=None):
+        self.row = {"id": OPPORTUNITY, "name": "Diageo", "country": "MEX", "stage": stage, "removed_at": removed,
+                    "owner_code": "RG", "primary_buyer": None, "contacts_text": None, "last_progress": None,
+                    "next_step": "- last push", "client_context": None, "row_hash": "old-hash"}
+        self.changes, self.runs, self.committed = [], [], False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def commit(self):
+        self.committed = True
+
+    def execute(self, sql, params=()):
+        q = " ".join(sql.split())
+        if q.startswith("select o.*, c.name"):
+            return Result([dict(self.row)] if params == (WORKSPACE, OPPORTUNITY) else [])
+        if q.startswith("update opportunities set stage"):
+            self.row["stage"], self.row["row_hash"] = params[0], params[1]
+            return Result([])
+        if q.startswith("insert into sync_runs"):
+            self.runs.append(params[1])
+            return Result([{"id": "run-1"}])
+        if q.startswith("insert into opportunity_changes"):
+            self.changes.append(params[3:])
+            return Result([])
+        raise AssertionError(q)
+
+
+class StatusSheets:
+    statuses = {"diageo": "1. Opening", "campari": "4. Pilot", "bees": "0. Paused", "delta": "5. Working client"}
+    calls = []
+    error = None
+
+    def read_company_statuses(self):
+        return dict(self.statuses)
+
+    def set_status(self, company, expected, new):
+        if self.error:
+            raise self.error
+        type(self).calls.append((company, expected, new))
+        return SimpleNamespace(status=new)
+
+
+@pytest.fixture
+def status_service(monkeypatch):
+    conn = StatusConnection()
+    StatusSheets.calls, StatusSheets.error = [], None
+    monkeypatch.setattr(review.db, "connect", lambda: conn)
+    monkeypatch.setattr(review, "SheetsClient", StatusSheets)
+    return conn
+
+
+def test_status_change_writes_the_sheet_then_mirrors_the_stage_with_history(status_service):
+    result = review.change_status(WORKSPACE, OPPORTUNITY, "RG", "1. Opening", " 0. Paused ")
+    assert StatusSheets.calls == [("Diageo", "1. Opening", "0. Paused")]
+    assert result["status"] == "0. Paused" and result["company"] == "Diageo" and result["inSalesPipeline"] is True
+    assert status_service.row["stage"] == "0. Paused" and status_service.row["row_hash"] != "old-hash"
+    assert status_service.changes == [("1. Opening", "0. Paused")]
+    assert status_service.runs == ["sheet_review_status:RG"] and status_service.committed
+
+
+def test_status_change_allows_only_statuses_already_in_the_sheet_and_valid_founders(status_service):
+    for bad in ("9. Won", "", "paused"):
+        with pytest.raises(ValueError):
+            review.change_status(WORKSPACE, OPPORTUNITY, "RG", "1. Opening", bad)
+    with pytest.raises(ValueError):
+        review.change_status(WORKSPACE, OPPORTUNITY, "someone", "1. Opening", "0. Paused")
+    with pytest.raises(review.ReviewNotFound):
+        review.change_status(WORKSPACE, PROPOSAL, "RG", "1. Opening", "0. Paused")
+    assert not StatusSheets.calls and not status_service.changes
+
+
+def test_status_change_conflict_or_outage_leaves_the_mirror_untouched(status_service):
+    StatusSheets.error = SheetConflict("changed")
+    with pytest.raises(review.ReviewConflict):
+        review.change_status(WORKSPACE, OPPORTUNITY, "RG", "1. Opening", "0. Paused")
+    StatusSheets.error = SheetWriteUncertain("unverified")
+    with pytest.raises(review.ReviewUnavailable):
+        review.change_status(WORKSPACE, OPPORTUNITY, "RG", "1. Opening", "0. Paused")
+    assert status_service.row["stage"] == "1. Opening" and not status_service.changes
+
+
+def test_status_change_does_not_overwrite_a_mirror_that_a_newer_sync_already_moved(status_service):
+    status_service.row["stage"] = "2. In Talks"
+    result = review.change_status(WORKSPACE, OPPORTUNITY, "NC", "1. Opening", "0. Paused")
+    assert result["mirror_refreshed"] is False
+    assert status_service.row["stage"] == "2. In Talks" and not status_service.changes
+
+
+def test_moving_a_deal_to_working_client_reports_that_it_left_the_sales_pipeline(status_service):
+    result = review.change_status(WORKSPACE, OPPORTUNITY, "RG", "1. Opening", "5. Working client")
+    assert result["inSalesPipeline"] is False
+    assert review.status_options({"a": "4. Pilot", "b": None, "c": " 4. Pilot ", "d": "0. Paused", "e": ""}) == [
+        "0. Paused", "4. Pilot"]
+
+
+# ---- H-16: Keep current bullets + add these (next_step_mode="append")
+
+def test_append_mode_leaves_last_progress_alone_and_adds_below_the_existing_next_step(service):
+    store, sheets = service
+    sheets.next_step = store.data["proposal"]["snapshot_next_step"] = "  -pusheado 2-nov\r\n* Ask for the signed agreement.  "
+    old_last, old_next = sheets.last_progress, sheets.next_step
+    result = approve(["ask for the  signed agreement.", "Send the revised scope."], next_step_mode="append")
+    assert sheets.last_progress == old_last
+    assert sheets.next_step == old_next + "\n- Send the revised scope."
+    assert result["activity"]["before"] == {"lastProgress": old_last, "nextStep": old_next, "clientContext": ""}
+    assert result["activity"]["after"] == {"lastProgress": old_last, "nextStep": sheets.next_step, "clientContext": ""}
+    # The same durable intent and write path as a replace: one planned three-cell write, sources consumed.
+    assert sheets.calls == [("Pernod Ricard", old_last, old_next, old_last, sheets.next_step, "", "")]
+    assert store.data["intents"][0]["next_step_bullets"] == ["ask for the  signed agreement.", "Send the revised scope."]
+    assert store.data["proposal"]["status"] == "approved" and len(store.data["receipts"]) == 1
+    assert store.events.index("commit", 1) < store.events.index("sheet-write")
+
+
+def test_append_mode_on_an_empty_next_step_writes_the_bullets_without_rotating(service):
+    store, sheets = service
+    sheets.next_step = store.data["proposal"]["snapshot_next_step"] = ""
+    approve(["Send scope.", "Book the review."], next_step_mode="append", client_context_bullets=["Customer need: Reporting."])
+    assert sheets.last_progress == "Pilot terms agreed."
+    assert sheets.next_step == "- Send scope.\n- Book the review."
+    assert sheets.client_context == "- Customer need: Reporting."
+
+
+def test_default_mode_is_still_replace_and_the_mode_is_part_of_the_request_identity(service):
+    store, sheets = service
+    assert review._request_hash(PROPOSAL, "approve", 1, ["Send scope."], []) == review._request_hash(
+        PROPOSAL, "approve", 1, ["Send scope."], [], "replace")
+    assert review._request_hash(PROPOSAL, "approve", 1, ["Send scope."], [], "append") != review._request_hash(
+        PROPOSAL, "approve", 1, ["Send scope."], [])
+    old_next = sheets.next_step
+    result = approve(["Send scope."], next_step_mode="append")
+    assert sheets.next_step == old_next + "\n- Send scope."
+    # The same key cannot be reused to turn the saved append into a replace, or the reverse.
+    with pytest.raises(review.ReviewConflict, match="different decision"):
+        approve(["Send scope."])
+    assert approve(["Send scope."], next_step_mode="append")["activity"] == result["activity"]
+    assert len(sheets.calls) == 1
+    for invalid in ("merge", "", None):
+        with pytest.raises(ValueError):
+            approve(["Send scope."], next_step_mode=invalid)
+    with pytest.raises(ValueError):
+        review.decide(WORKSPACE, PROPOSAL, "NDL", "ignore", 1, "ignore-key-1", next_step_mode="append")
+
+
+def test_uncertain_append_is_retried_from_the_saved_plan_and_never_appends_twice(service):
+    store, sheets = service
+    old_last, old_next = sheets.last_progress, sheets.next_step
+    sheets.uncertain = True
+    with pytest.raises(review.ReviewUnavailable):
+        approve(["Send scope."], next_step_mode="append")
+    assert store.data["proposal"]["status"] == "applying"
+    intent = store.data["intents"][0]
+    assert review._saved_next_step_mode(intent) == "append"
+    with pytest.raises(review.ReviewConflict, match="different decision"):
+        approve(["Send scope."])  # A retry that lost the mode is refused, never applied as a replace.
+    assert approve(["Send scope."], next_step_mode="append")["status"] == "approved"
+    assert (sheets.last_progress, sheets.next_step) == (old_last, old_next + "\n- Send scope.")
+    assert sheets.calls[0] == sheets.calls[1] and intent["after_cells"]["lastProgress"] == old_last
+
+
+def test_append_of_steps_already_in_the_cell_changes_nothing_but_still_closes_the_card(service):
+    store, sheets = service
+    before = (sheets.last_progress, sheets.next_step, sheets.client_context)
+    result = approve(["Ask for the signed agreement."], next_step_mode="append")
+    assert (sheets.last_progress, sheets.next_step, sheets.client_context) == before
+    assert result["status"] == "approved" and result["activity"]["before"] == result["activity"]["after"]
+
+
+def test_append_checks_the_live_row_first_and_an_oversized_result_is_refused_before_any_intent(service):
+    store, sheets = service
+    sheets.next_step = "Edited by a founder in the Sheet."
+    with pytest.raises(review.ReviewConflict, match="Sheet row changed"):
+        approve(["Send scope."], next_step_mode="append")
+    sheets.next_step = store.data["proposal"]["snapshot_next_step"] = "x" * 49_990
+    with pytest.raises(ValueError, match="exceeds one Sheet cell"):
+        approve(["Send the revised scope."], next_step_mode="append")
+    assert not store.data["intents"] and not sheets.calls
+
+
+def test_saved_replace_approvals_are_recognised_as_replace():
+    intent = {"proposal_id": PROPOSAL, "revision": 3, "next_step_bullets": ["A"], "client_context_bullets": [],
+              "request_hash": review._request_hash(PROPOSAL, "approve", 3, ["A"], [])}
+    assert review._saved_next_step_mode(intent) == "replace"
+    assert review._saved_next_step_mode({**intent, "request_hash": "unknown"}) == "replace"
+
+
+# ---- H-06: an emailed ask already answered in its thread is not suggested, at build and at approval alike
+
+ASK_RECORD = "66666666-6666-6666-6666-666666666666"
+REPLY_RECORD = "77777777-7777-7777-7777-777777777777"
+
+
+def customer_email(**overrides):
+    values = {"id": ASK_RECORD, "external_id": "message-ask", "thread_id": "thread-ask", "company_id": COMPANY,
+              "body": "Does Wednesday morning work for the meeting? We also need the store list.",
+              "participants": {"from": [{"address": "ana@redbull.com"}], "to": [{"address": "nico@bianca-ai.com"}]}}
+    return record(**{**values, **overrides})
+
+
+def our_reply(**overrides):
+    values = {"id": REPLY_RECORD, "external_id": "message-reply", "thread_id": "thread-ask", "company_id": COMPANY,
+              "body": "Wednesday 11 AM works for us.", "occurred_at": NOW + timedelta(hours=2),
+              "participants": {"from": [{"address": "nico@bianca-ai.com"}], "to": [{"address": "ana@redbull.com"}]}}
+    return record(**{**values, **overrides})
+
+
+def email_asks():
+    base = dict(source="gmail", type="next_step", owner_side="bianca", owner_name=None, due_date=None,
+                source_record_ids=[ASK_RECORD], origin_record_id=ASK_RECORD, action_scope="deal_progression")
+    return [insight(id="ask-meeting", text="Confirm a time on Wednesday morning.",
+                    quote="Does Wednesday morning work for the meeting?", **base),
+            insight(id="ask-stores", text="Send the store list.", quote="We also need the store list.",
+                    **{**base, "type": "commitment"})]
+
+
+class Mail:
+    """What the answered-ask check reads: the company's mail, later insights, brief clicks, the cycle start."""
+    def __init__(self, messages, *, cycle_started_at=NOW + timedelta(days=1), clicks=(), insights=(), has_clicks_table=True):
+        self.messages, self.cycle_started_at, self.clicks = list(messages), cycle_started_at, list(clicks)
+        self.insights, self.has_clicks_table, self.queries = list(insights), has_clicks_table, []
+
+    def answer(self, q, params):
+        if q.startswith("select cycle_started_at from review_queue_state"):
+            return Result([{"cycle_started_at": self.cycle_started_at}])
+        if q.startswith("select id, thread_id, occurred_at, subject, participants from source_records"):
+            assert "created_at <= %s" in q and "status = 'classified'" in q and "is_commercial" in q
+            workspace, company, cutoff, _, origins = params
+            threads = {m["thread_id"] for m in self.messages if m["id"] in origins}
+            found = [m for m in self.messages if m["thread_id"] in threads and m.get("company_id", company) == company
+                     and review._instant(m["created_at"]) <= cutoff]
+            self.queries.append(("mail", cutoff))
+            return Result(copy.deepcopy(sorted(found, key=lambda m: m["occurred_at"])))
+        if q.startswith("select internal_domains from workspaces"):
+            return Result([{"internal_domains": ["bianca-ai.com"]}])
+        if q.startswith("select origin_record_id, action_scope from insights"):
+            return Result([i for i in self.insights if i["origin_record_id"] in params[1]])
+        if q.startswith("select to_regclass('brief_actions')"):
+            return Result([{"found": "brief_actions" if self.has_clicks_table else None}])
+        if q.startswith("select distinct on (ref) ref, action, created_at from brief_actions"):
+            latest = {}
+            for click in sorted(self.clicks, key=lambda c: c["created_at"]):
+                if click["ref"] in params[1] and click["created_at"] <= params[2]:
+                    latest[click["ref"]] = click
+            return Result(list(latest.values()))
+        return None
+
+
+class MailBuild(BuildConnection):
+    def __init__(self, mail_data):
+        super().__init__(1)
+        self.mail = mail_data
+
+    def execute(self, sql, params=()):
+        return self.mail.answer(" ".join(sql.split()), params) or super().execute(sql, params)
+
+
+def build_settings(monkeypatch):
+    monkeypatch.setattr(review, "settings", SimpleNamespace(review_build_batch=20, project_team_domains=["kellogg.northwestern.edu"]))
+
+
+def ask_build(messages, **mail_options):
+    conn = MailBuild(Mail(messages, **mail_options))
+    conn.records = {"company-0": [customer_email(company_id="company-0")]}
+    conn.insights = email_asks()
+    return conn
+
+
+def test_builder_drops_an_emailed_ask_bianca_already_answered_and_keeps_the_rest_of_the_card(monkeypatch):
+    build_settings(monkeypatch)
+    unanswered = ask_build([customer_email(company_id="company-0")])
+    review.build_proposals(unanswered, WORKSPACE)
+    assert unanswered.proposals["company-0"]["next_step_bullets"] == [
+        "Next step: Confirm a time on Wednesday morning.", "We owe: Send the store list."]
+    answered = ask_build([customer_email(company_id="company-0"), our_reply(company_id="company-0")])
+    review.build_proposals(answered, WORKSPACE)
+    card = answered.proposals["company-0"]
+    # The reply answers the question; the promised store list is a deliverable and stays.
+    assert card["next_step_bullets"] == ["We owe: Send the store list."]
+    assert review.validate_lineage(card["next_step_bullets"], card["client_context_bullets"], card["sources"], card["bullet_lineage"])
+    # The build judges from what was stored when its cycle started.
+    assert answered.mail.queries == [("mail", answered.queue_state["cycle_started_at"])]
+
+
+def test_builder_makes_no_card_when_the_only_suggestion_was_already_answered(monkeypatch):
+    build_settings(monkeypatch)
+    conn = ask_build([customer_email(company_id="company-0"), our_reply(company_id="company-0")])
+    conn.insights = email_asks()[:1]
+    assert review.build_proposals(conn, WORKSPACE)["created"] == 0 and not conn.proposals
+    # A later build withdraws a pending card whose only step has since been answered.
+    pending = ask_build([customer_email(company_id="company-0")])
+    pending.insights = email_asks()[:1]
+    review.build_proposals(pending, WORKSPACE)
+    pending.mail.messages.append(our_reply(company_id="company-0"))
+    pending.now = NOW + timedelta(days=1, hours=1)
+    assert review.build_proposals(pending, WORKSPACE)["updated"] == 1
+    assert pending.proposals["company-0"]["status"] == "superseded" and not pending.receipts
+
+
+def test_reply_stored_after_the_cycle_started_waits_for_the_next_build(monkeypatch):
+    build_settings(monkeypatch)
+    late = our_reply(company_id="company-0", created_at=NOW + timedelta(hours=6))
+    conn = ask_build([customer_email(company_id="company-0"), late])
+    review.build_proposals(conn, WORKSPACE)
+    assert len(conn.proposals["company-0"]["next_step_bullets"]) == 2
+    conn.now = NOW + timedelta(days=1)
+    review.build_proposals(conn, WORKSPACE)
+    assert conn.proposals["company-0"]["next_step_bullets"] == ["We owe: Send the store list."]
+
+
+def test_brief_done_click_on_the_thread_answers_the_ask_and_an_undo_reopens_it(monkeypatch):
+    build_settings(monkeypatch)
+    done = {"ref": "thread-ask", "action": "done", "created_at": NOW + timedelta(hours=1)}
+    conn = ask_build([customer_email(company_id="company-0")], clicks=[done])
+    review.build_proposals(conn, WORKSPACE)
+    # A click made after this cycle started is picked up by the next build, like any newer evidence.
+    assert len(conn.proposals["company-0"]["next_step_bullets"]) == 2
+    conn.now = NOW + timedelta(days=1)
+    review.build_proposals(conn, WORKSPACE)
+    assert conn.proposals["company-0"]["next_step_bullets"] == ["We owe: Send the store list."]
+    undone = ask_build([customer_email(company_id="company-0")],
+                       clicks=[done, {"ref": "thread-ask", "action": "undone", "created_at": NOW + timedelta(hours=2)}])
+    undone.now = NOW + timedelta(days=1)
+    review.build_proposals(undone, WORKSPACE)
+    assert len(undone.proposals["company-0"]["next_step_bullets"]) == 2
+    no_table = ask_build([customer_email(company_id="company-0")], clicks=[done], has_clicks_table=False)
+    no_table.now = NOW + timedelta(days=1)
+    review.build_proposals(no_table, WORKSPACE)
+    assert len(no_table.proposals["company-0"]["next_step_bullets"]) == 2
+
+
+def test_a_reply_about_delivery_work_only_or_from_another_company_does_not_answer(monkeypatch):
+    build_settings(monkeypatch)
+    delivery = [{"origin_record_id": REPLY_RECORD, "action_scope": "delivery"}]
+    conn = ask_build([customer_email(company_id="company-0"), our_reply(company_id="company-0")], insights=delivery)
+    review.build_proposals(conn, WORKSPACE)
+    assert len(conn.proposals["company-0"]["next_step_bullets"]) == 2
+    other = ask_build([customer_email(company_id="company-0"), our_reply(company_id="another-company")])
+    review.build_proposals(other, WORKSPACE)
+    assert len(other.proposals["company-0"]["next_step_bullets"]) == 2
+
+
+class MailStore(Store):
+    """The decision store, plus the mail the answered-ask check reads."""
+    def __init__(self, mail_data):
+        self.mail = mail_data
+        self.source_record = customer_email()
+        self.insights = email_asks()
+        answered = review.answered_email_asks(self.insights, [m for m in mail_data.messages
+                                                              if m["created_at"] <= mail_data.cycle_started_at],
+                                              frozenset({"bianca-ai.com"}))
+        (steps, context, sources, lineage), versions = review.reviewed_content([self.source_record], self.insights, answered=answered)
+        super().__init__(proposal(bullets=steps + context, next_step_bullets=steps, client_context_bullets=context,
+                                  sources=sources, bullet_lineage=lineage,
+                                  source_versions=[review.source_version(self.source_record)],
+                                  observed_source_versions=[review.source_version(self.source_record)]))
+        self.source_record, self.insights = customer_email(), email_asks()
+
+    def connect(self):
+        store = self
+
+        class Connection(DecisionConnection):
+            def execute(self, sql, params=()):
+                return store.mail.answer(" ".join(sql.split()), params) or super().execute(sql, params)
+        return Connection(self)
+
+
+@pytest.fixture
+def mail_service(monkeypatch):
+    def make(mail_data):
+        store = MailStore(mail_data)
+        sheets = FakeSheets(store)
+        monkeypatch.setattr(review, "settings", SimpleNamespace(
+            review_spreadsheet_id="14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw", review_sheet_tab="Pipeline",
+            review_sheet_id=1869050409, review_client_context_mode="append", review_build_batch=20,
+            project_team_domains=["kellogg.northwestern.edu"]))
+        monkeypatch.setattr(review.db, "connect", store.connect)
+        monkeypatch.setattr(review, "SheetsClient", lambda: sheets)
+        monkeypatch.setattr(review, "_mirror_approval", lambda *args: True)
+        return store, sheets
+    return make
+
+
+def test_approval_recheck_applies_the_same_answered_rule_as_the_build(mail_service):
+    store, sheets = mail_service(Mail([customer_email(), our_reply()], cycle_started_at=NOW + timedelta(days=1)))
+    assert store.data["proposal"]["next_step_bullets"] == ["We owe: Send the store list."]
+    assert approve()["status"] == "approved"
+    assert sheets.next_step == "- We owe: Send the store list."
+
+
+def test_a_reply_that_arrives_after_the_build_does_not_block_the_card_until_the_next_cycle(mail_service):
+    late = our_reply(created_at=NOW + timedelta(days=2))
+    store, sheets = mail_service(Mail([customer_email(), late], cycle_started_at=NOW + timedelta(days=1)))
+    assert len(store.data["proposal"]["next_step_bullets"]) == 2
+    assert approve()["status"] == "approved"  # same cycle start as the build: the late reply is not read yet
+
+
+def test_card_built_before_a_newer_cycle_saw_the_reply_is_refused_until_rebuilt(mail_service):
+    store, sheets = mail_service(Mail([customer_email(), our_reply()], cycle_started_at=NOW - timedelta(days=1)))
+    assert len(store.data["proposal"]["next_step_bullets"]) == 2   # built before the reply was stored
+    store.mail.cycle_started_at = NOW + timedelta(days=1)          # a newer cycle now counts the reply
+    with pytest.raises(review.ReviewConflict, match="sales evidence changed"):
+        approve()
+    assert not sheets.calls and not store.data["intents"]
+
+
+# ---- H-11: what one approval costs in Sheet calls (kept as is; see docs/gsheet-updates.md)
+
+def test_one_approval_reads_the_live_row_once_to_plan_and_makes_no_other_sheet_call_before_the_write(service):
+    """Plan read (exact live text for the saved before/after values) + apply_update's check, write and read-back.
+
+    Each of the three reads has its own job, so none is removed: the plan needs the Sheet's exact bytes before the
+    intent is saved, the check must sit right before the write, and the read-back confirms what was written.
+    """
+    store, sheets = service
+    approve()
+    before_write = store.events[:store.events.index("sheet-write")]
+    assert before_write.count("sheet-read") == 1 and "status-read" not in store.events
+    assert store.events.count("sheet-write") == 1 and len(sheets.calls) == 1

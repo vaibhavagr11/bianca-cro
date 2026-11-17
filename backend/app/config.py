@@ -76,6 +76,10 @@ class Settings(BaseSettings):
     review_sheets_webhook_url: str | None = None
     review_sheets_webhook_secret: SecretStr | None = None
     review_build_batch: int = 20
+    # Most bullets one card may suggest per column; the newest stay. 0 turns a limit off.
+    # Client Context is kept whole by default: older customer needs stay useful.
+    review_max_next_steps: int = 4
+    review_max_context: int = 0
 
 
 settings = Settings()

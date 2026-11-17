@@ -201,7 +201,7 @@ function fakePage(connector,pathname='/artifact'){
   const fakeWindow={biancaConnector:connector,addEventListener:(name,handler)=>{events['window:'+name]=handler;},scrollTo:()=>{}};
   const page=vm.createContext({document:fakeDocument,window:fakeWindow,location:{pathname,protocol:'https:'},crypto:{randomUUID:()=> 'new-key'},setTimeout:()=>0,clearTimeout:()=>{},Event,fetch:()=>{throw Error('Unexpected direct network call');}});
   for(const script of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g))vm.runInContext(script[1],page);
-  return {get,events};
+  return {get,events,context:page};
 }
 
 test('The actual live UI starts empty and explains missing connector access',()=>{
@@ -240,26 +240,25 @@ test('Header and cards follow the connected Pipeline Sheet and clear invalid or 
   }
 });
 
-test('Company cards display escaped source labels in closed disclosures without exposing source quotes',async()=>{
+test('Company cards show each source with a short, escaped excerpt of at most 15 words',async()=>{
   const s=snapshot();
+  const long='one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen';
   s.proposals[0].sources=[
     {id:'email-scope',type:'Meeting notes',date:'2026-09-28',subject:'Pilot notes',quote:'Notes quotation.'},
-    {id:'email-review',type:'Email',date:'2026-10-06',subject:'Review request',quote:'Email quotation.'},
+    {id:'email-review',type:'Email',date:'2026-10-06',subject:'Review request',quote:long,quotes:[long,'Second passage.']},
     {id:'calendar-kickoff',type:'Calendar',date:'2026-10-07',subject:'<script>Calendar',quote:'<img src=x> Calendar quotation.'},
-    {id:'undated-email',type:'Email',date:'',subject:'Additional update',quote:'Fourth excerpt.'}
+    {id:'undated-email',type:'Email',date:'',subject:'Additional update',quote:''}
   ];
   const page=fakePage({callTool:async()=>({structuredContent:s})});
   await new Promise(resolve=>setImmediate(resolve));
   const card=page.get('#review-list').innerHTML;
-  for(const [title,label] of [
-    ['Pilot notes','Source: Notes, Sep 28'],
-    ['Review request','Source: Email, Oct 6'],
-    ['&lt;script&gt;Calendar','Source: Calendar, Oct 7']
-  ])assert.ok(card.includes(`<details><summary><span>${title}</span><span class="src">${label}</span></summary><div class="ctx">${title}</div></details>`),label);
-  for(const source of s.proposals[0].sources)assert.equal(card.includes(source.quote),false);
-  assert.equal(card.includes('Fourth excerpt.'),false);
+  assert.ok(card.includes('<details><summary><span>Pilot notes</span><span class="src">Source: Notes, Sep 28</span></summary><div class="ctx"><p>&ldquo;Notes quotation.&rdquo;</p></div></details>'));
+  assert.ok(card.includes('<span>Review request</span><span class="src">Source: Email, Oct 6</span></summary><div class="ctx"><p>&ldquo;one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen ...&rdquo;</p><p>&ldquo;Second passage.&rdquo;</p></div>'));
+  assert.equal(card.includes('sixteen'),false,'An excerpt stops at 15 words.');
+  assert.ok(card.includes('<span>&lt;script&gt;Calendar</span><span class="src">Source: Calendar, Oct 7</span></summary><div class="ctx"><p>&ldquo;&lt;img src=x&gt; Calendar quotation.&rdquo;</p></div>'));
   assert.equal(card.includes('<img src=x>'),false);
-  assert.equal(card.includes('<script>'),false);
+  // A source with no passage is a plain line, never an empty dropdown.
+  assert.ok(card.includes('<li class="plain"><span>Additional update</span>'));
 });
 
 test('Current Next steps is a collapsed native dropdown using the latest matching company row',async()=>{
@@ -273,7 +272,7 @@ test('Current Next steps is a collapsed native dropdown using the latest matchin
   const details=card.match(/<details[^>]*class="current-next-steps"[^>]*>([\s\S]*?)<\/details>/);
   assert.ok(details,'Current Next steps uses a native details element.');
   assert.equal(/\sopen(?:[\s=>])/.test(details[0].slice(0,details[0].indexOf('>'))),false);
-  assert.ok(details[1].includes('<summary>Current Sheet cells</summary>'));
+  assert.ok(details[1].includes('<summary>Current Sheet cells<span class="cells-hint">Next step, Last progress and Client Context as they are now</span></summary>'));
   assert.ok(details[1].includes('<h4>Next step (now)</h4>'));
   assert.ok(details[1].includes('- Current action &amp; details.\n- &lt;img src=x&gt; Follow up.'));
   assert.equal(card.includes('Outdated proposal context'),false);
@@ -341,7 +340,7 @@ test('The pending card, editor and approval use the same loaded deadline',async(
     page.events.click({target:{closest:()=>button}});
     if(flow!=='card'){
       const editor=page.get('#ns-rows').innerHTML;
-      assert.ok(editor.includes('value="2026-11-21"'));
+      assert.ok(editor.includes('placeholder="dd/mm/yyyy" value="21/11/2026"'));
       assert.ok(editor.includes(`>${body}</textarea>`));
       assert.equal(editor.includes('(complete by'),false);
       assert.ok(page.get('#ns-preview').innerHTML.includes(formatted));
@@ -357,7 +356,7 @@ test('The pending card, editor and approval use the same loaded deadline',async(
   }
 });
 
-test('Appending keeps current Sheet bullets and writes one copy of matching normalized suggestions',async()=>{
+test('Keep + add sends only the new steps with the append mode and leaves the current Sheet bullets to the server',async()=>{
   const s=snapshot(),p=s.proposals[0],formatted='Confirm the scope. (complete by Nov 21, 2026)';
   s.rows[0].nextStep='- Received the previous proposal on Nov 8.';
   p.nextStepBullets=['Confirm the scope by Nov 21.','Confirm the scope on Nov 21.'];
@@ -375,7 +374,100 @@ test('Appending keeps current Sheet bullets and writes one copy of matching norm
   page.events.click({target:{closest:()=>button}});
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(writes.length,1);
-  assert.deepEqual(writes[0].next_step_bullets,['Received the previous proposal on Nov 8.',formatted]);
+  // H-16 (11/17/2026): the page used to re-send the current Sheet bullets; the server now appends, so only new steps go.
+  assert.deepEqual(writes[0].next_step_bullets,[formatted]);
+  assert.equal(writes[0].next_step_mode,'append');
+  assert.ok(page.get('#review-list').innerHTML.includes('Last progress does not change.'));
+});
+
+test('Replace stays the default and sends no mode field, so an older service accepts it',async()=>{
+  const s=snapshot(),writes=[];
+  const page=fakePage({callTool:async(name,args)=>{if(name===core.TOOLS.workspace)return {structuredContent:s};writes.push(json(args));return {structuredContent:{status:'approved'}};}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.ok(page.get('#review-list').innerHTML.includes('The old Next Step moves to Last progress.'));
+  const article={dataset:{id:'p-1'}},button={dataset:{action:'approve'},closest:()=>article};
+  page.events.click({target:{closest:()=>button}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(writes,[{proposal_id:'p-1',revision:2,idempotency_key:'new-key',next_step_bullets:['Confirm the scope.'],client_context_bullets:[]}]);
+});
+
+test('The write mode is part of the request: validated, kept on an uncertain retry and replayed from a saved approval',async()=>{
+  assert.throws(()=>core.groups({nextStepBullets:['A'],clientContextBullets:[],nextStepMode:'merge'}),/replace Next Step or add/);
+  assert.deepEqual(json(core.groups({nextStepBullets:['A'],clientContextBullets:[],nextStepMode:'append'})),{nextStepBullets:['A'],clientContextBullets:[],nextStepMode:'append'});
+  // Nothing to add means nothing to append: a context-only approval never carries the mode.
+  assert.deepEqual(json(core.groups({nextStepBullets:[],clientContextBullets:['C'],nextStepMode:'append'})),{nextStepBullets:[],clientContextBullets:['C']});
+  assert.deepEqual(json(core.groups({nextStepBullets:['A'],clientContextBullets:[],nextStepMode:'replace'})),{nextStepBullets:['A'],clientContextBullets:[]});
+  const s=snapshot(),writes=[];let fail=true;
+  const client=core.createClient(async(name,args)=>{if(name===core.TOOLS.workspace)return s;writes.push(json(args));if(fail){fail=false;throw new core.ReviewError('Sheet update not confirmed.',503);}return {status:'approved'};});
+  await client.refresh();
+  const update={nextStepBullets:['Send scope.'],clientContextBullets:[],nextStepMode:'append'};
+  await assert.rejects(client.decide('p-1','approve',update),/not confirmed/);
+  // The same founder decision cannot silently become a replace while its first request is unresolved.
+  await assert.rejects(client.decide('p-1','approve',{...update,nextStepMode:'replace'}),/may still be saving/);
+  await client.decide('p-1','approve',update);
+  assert.equal(writes.length,2);
+  assert.deepEqual(writes[0],writes[1]);
+  assert.equal(writes[0].next_step_mode,'append');
+  const saved=snapshot('applying');saved.proposals[0].retry={idempotency_key:'durable-key',revision:1,next_step_bullets:['Send scope.'],client_context_bullets:[],next_step_mode:'append'};
+  const replayed=[];
+  const later=core.createClient(async(name,args)=>{if(name===core.TOOLS.workspace)return saved;replayed.push(json(args));return {status:'approved'};});
+  await later.refresh();await later.decide('p-1','approve',undefined);
+  assert.deepEqual(replayed,[{proposal_id:'p-1',idempotency_key:'durable-key',revision:1,next_step_bullets:['Send scope.'],client_context_bullets:[],next_step_mode:'append'}]);
+  saved.proposals[0].retry.next_step_mode='merge';
+  await assert.rejects(core.createClient(async()=>saved).refresh(),/administrator to check/);
+});
+
+test('The REST route carries the append mode in the approve body',async()=>{
+  const calls=[];
+  const transport=core.restTransport(async(url,options)=>{calls.push({url,options});return {ok:true,status:200,json:async()=>({status:'approved'})};},()=> 'founder-access-secret');
+  await transport(core.TOOLS.approve,{proposal_id:'p-1',revision:3,idempotency_key:'intent-1',next_step_bullets:['One action'],client_context_bullets:[],next_step_mode:'append'});
+  assert.equal(calls[0].url,'/review/proposals/p-1/approve');
+  assert.deepEqual(JSON.parse(calls[0].options.body),{revision:3,idempotency_key:'intent-1',next_step_bullets:['One action'],client_context_bullets:[],next_step_mode:'append'});
+});
+
+test('The editor says what each mode will do in the Sheet and Save & approve sends the chosen mode',async()=>{
+  assert.equal(html.includes('Either way the previous Next Step is copied to Last progress'),false);
+  const s=snapshot(),p=s.proposals[0],writes=[];
+  s.rows[0].nextStep='* confirm the  SCOPE.\n-pusheado 2-nov';
+  p.nextStepBullets=['Confirm the scope.','Send the proposal.'];
+  p.bulletLineage.nextStep=p.nextStepBullets.map((text,i)=>({bulletId:'scope-'+i,text,sourceIds:['email-scope']}));
+  const page=fakePage({callTool:async(name,args)=>{if(name===core.TOOLS.workspace)return {structuredContent:s};writes.push(json(args));return {structuredContent:{status:'approved'}};}});
+  await new Promise(resolve=>setImmediate(resolve));
+  const article={dataset:{id:p.id}},button={dataset:{action:'edit'},closest:()=>article};
+  page.events.click({target:{closest:()=>button}});
+  assert.equal(page.get('#rotation-last-progress').textContent,'the current Next Step (when Next Step bullets are approved)');
+  assert.ok(page.get('#rotation-explain').textContent.includes('the previous Next Step replaces Last progress'));
+  assert.ok(page.get('#ns-preview').innerHTML.startsWith('<b>Written to Next Step</b>- Confirm the scope.'));
+  // The switch inside the editor has no card id of its own; it applies to the card being edited.
+  page.events.click({target:{closest:selector=>selector.includes('[data-mode-pick]')?{dataset:{modePick:'append'}}:null}});
+  assert.equal(page.get('#rotation-last-name').textContent,'Last progress');
+  assert.ok(page.get('#rotation-last-progress').textContent.startsWith('stays as it is'));
+  assert.ok(page.get('#rotation-explain').textContent.includes('Last progress does not change.'));
+  const preview=page.get('#ns-preview').innerHTML;
+  assert.ok(preview.startsWith('<b>Added to Next Step, below what is already in the Sheet</b>- Send the proposal.'));
+  assert.equal(preview.includes('- Confirm the scope.'),false);
+  assert.ok(preview.includes('1 step is already in the cell and will not be repeated.'));
+  page.get('#edit-form').handlers.submit({preventDefault(){}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(writes.length,1);
+  assert.deepEqual(writes[0].next_step_bullets,['Confirm the scope.','Send the proposal.']);
+  assert.equal(writes[0].next_step_mode,'append');
+});
+
+test('Keep + add with no steps left is a context-only approval without a mode',async()=>{
+  const s=snapshot();s.proposals[0].clientContextBullets=['Customer need: Reporting.'];s.proposals[0].bulletLineage.clientContext=[{bulletId:'context-original',text:'Customer need: Reporting.',sourceIds:['email-scope']}];
+  const writes=[];
+  const page=fakePage({callTool:async(name,args)=>{if(name===core.TOOLS.workspace)return {structuredContent:s};writes.push(json(args));return {structuredContent:{status:'approved'}};}});
+  await new Promise(resolve=>setImmediate(resolve));
+  page.events.click({target:{closest:selector=>selector.includes('[data-mode-pick]')?{dataset:{modePick:'append',modeFor:'p-1'}}:null}});
+  const article={dataset:{id:'p-1'}},button={dataset:{action:'edit'},closest:()=>article};
+  page.events.click({target:{closest:()=>button}});
+  page.get('#edit-content').value='';
+  page.get('#edit-form').handlers.submit({preventDefault(){}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(writes.length,1);
+  assert.deepEqual(writes[0].next_step_bullets,[]);
+  assert.equal('next_step_mode' in writes[0],false);
 });
 
 test('An invalid completion date in an older suggestion does not prefill the field',async()=>{
@@ -386,7 +478,7 @@ test('An invalid completion date in an older suggestion does not prefill the fie
   await new Promise(resolve=>setImmediate(resolve));
   const article={dataset:{id:p.id}},button={dataset:{action:'edit'},closest:()=>article};
   page.events.click({target:{closest:()=>button}});
-  assert.equal([...page.get('#ns-rows').innerHTML.matchAll(/type="date" class="ns-date" value=""/g)].length,2);
+  assert.equal([...page.get('#ns-rows').innerHTML.matchAll(/type="text" class="ns-date"[^>]*placeholder="dd\/mm\/yyyy" value=""/g)].length,2);
 });
 
 test('The hosted page offers in-memory sign-in without calling the service before sign-in',()=>{
@@ -559,7 +651,7 @@ test('Cards show separate destination sections and read-only current Client Cont
   assert.ok(card.includes('Suggested next steps'));
   assert.ok(card.includes('data-destination="nextStep"'));
   assert.ok(card.includes('data-destination="clientContext"'));
-  assert.ok(card.includes('<summary>Current Sheet cells</summary>'));
+  assert.ok(card.includes('<summary>Current Sheet cells<span class="cells-hint">Next step, Last progress and Client Context as they are now</span></summary>'));
   assert.ok(card.includes('<h4>Client context (now)</h4>'));
   assert.ok(card.includes('- Current context &amp; details.\n- &lt;img src=x&gt; Escaped.'));
   assert.equal(card.includes('Older proposal context'),false);
@@ -679,11 +771,11 @@ test('The source-selection handler highlights only associated bullets without a 
   assert.equal(writes,0);
 });
 
-test('Same-date sources remain distinct native disclosures with descriptive summaries',async()=>{
+test('Same-date sources with different subjects remain distinct lines',async()=>{
   const page=fakePage({callTool:async()=>({structuredContent:tracedWorkspace()})});await new Promise(resolve=>setImmediate(resolve));
   const card=articleHtml(page);
-  assert.ok(card.includes('<details><summary><span>Revised store list</span><span class="src">Source: Email, Nov 2</span></summary>'));
-  assert.ok(card.includes('<details><summary><span>Launch confirmation</span><span class="src">Source: Email, Nov 2</span></summary>'));
+  assert.ok(card.includes('<li class="plain"><span>Revised store list</span><span class="src">Source: Email, Nov 2</span></li>'));
+  assert.ok(card.includes('<li class="plain"><span>Launch confirmation</span><span class="src">Source: Email, Nov 2</span></li>'));
   sourceClick(page,'p-1','email-b');
   const selected=articleHtml(page);
   assert.equal(highlighted(selected,'action-codes'),false);
@@ -778,6 +870,267 @@ test('An entirely founder-edited saved approval explains its missing attribution
   assert.ok(card.includes('These founder-edited bullets have no source attribution.'));
   assert.equal(card.includes('class="source-highlight"'),false);
   assert.ok(card.includes('data-action="retry"'));
+});
+
+test('The complete-by field reads dates day first and explains an impossible date',()=>{
+  const page=fakePage(undefined);
+  const day=(text)=>json(vm.runInContext(`BiancaWarRoom.parseDay(${JSON.stringify(text)},new Date(2026,10,16))`,page.context));
+  for(const text of ['16/11/2026','16-11-2026','16.11.26','16/11','16 Nov','16 nov 2026','16 de noviembre de 2026','Nov 16, 2026','2026-11-16'])assert.deepEqual(day(text),{iso:'2026-11-16'},text);
+  assert.deepEqual(day('05/11/2026'),{iso:'2026-11-05'});
+  assert.deepEqual(day('1 dic'),{iso:'2026-12-01'});
+  assert.deepEqual(day('3/2'),{iso:'2027-02-03'});
+  assert.deepEqual(day(''),{iso:''});
+  assert.equal(day('31/11/2026').error,'November 2026 has 30 days, so 31/11 is not a date.');
+  assert.equal(day('29/2/2027').error,'February 2027 has 28 days, so 29/2 is not a date.');
+  assert.equal(day('11/16/2026').error,'There is no month 16. Dates here are day/month/year, for example 16/11/2026.');
+  assert.equal(day('next week').error,'Use day/month/year, for example 16/11/2026.');
+  assert.equal(day('16 Smarch').error,'"Smarch" is not a month. Use day/month/year, for example 16/11/2026.');
+});
+
+test('An impossible date blocks Save and approve before any request is made',async()=>{
+  const calls=[],s=snapshot();
+  const page=fakePage({callTool:async(name,args)=>{calls.push(name);return {structuredContent:s};}});
+  await new Promise(resolve=>setImmediate(resolve));
+  const article={dataset:{id:s.proposals[0].id}},button={dataset:{action:'edit'},closest:()=>article};
+  page.events.click({target:{closest:()=>button}});
+  const row={dataset:{row:'0'}};
+  page.events.input({target:{closest:()=>row,classList:{contains:key=>key==='ns-date'},value:'31/11/2026'}});
+  let prevented=false,stopped=false;
+  page.events.submit({target:{id:'edit-form'},preventDefault(){prevented=true;},stopImmediatePropagation(){stopped=true;}});
+  assert.ok(prevented&&stopped);
+  assert.equal(page.get('#edit-error').textContent,'Next step 1: November 2026 has 30 days, so 31/11 is not a date.');
+  assert.equal(page.get('#edit-error').hidden,false);
+  assert.deepEqual(calls,[core.TOOLS.workspace]);
+  // A corrected date clears the block and is written in the Sheet's unambiguous text form.
+  page.events.input({target:{closest:()=>row,classList:{contains:key=>key==='ns-date'},value:'1/12/2026'}});
+  prevented=false;
+  page.events.submit({target:{id:'edit-form'},preventDefault(){prevented=true;},stopImmediatePropagation(){}});
+  assert.equal(prevented,false);
+  assert.ok(page.get('#edit-content').value.endsWith('(complete by Dec 1, 2026)'));
+});
+
+test('A status change posts the row, the status the founder saw and the new one, then reloads',async()=>{
+  const requests=[];
+  const fetcher=async(url,options)=>{requests.push({url,method:options.method,body:options.body&&JSON.parse(options.body),auth:options.headers.Authorization});
+    return {ok:true,status:200,json:async()=>url==='/review/workspace'?{...completed(),statusOptions:['0. Paused','4. Pilot',7,'']}:{rowId:'r-1',company:'A real company',status:'0. Paused',inSalesPipeline:true}};};
+  const changes=[];
+  const client=core.createClient(core.restTransport(fetcher,()=> 'founder-access-secret'),{onChange:next=>changes.push(next)});
+  const first=await client.refresh();
+  assert.deepEqual(json(first.statusOptions),['0. Paused','4. Pilot']);
+  const result=await client.setStatus('r-1','4. Pilot',' 0. Paused ');
+  assert.equal(result.status,'0. Paused');
+  assert.deepEqual(json(requests[1]),{url:'/review/rows/r-1/status',method:'POST',body:{expected_status:'4. Pilot',status:'0. Paused'},auth:'Bearer founder-access-secret'});
+  assert.equal(requests[2].url,'/review/workspace');
+  assert.equal(changes.length,2);
+  await assert.rejects(client.setStatus('r-1','4. Pilot',''),/Choose a status/);
+  await assert.rejects(core.restTransport(fetcher,()=> 'token')(core.TOOLS.status,{expected_status:'a',status:'b'}),/missing its identifier/);
+  assert.equal(requests.length,3);
+});
+
+test('The card shows the current Sheet status with a change control that starts disabled',async()=>{
+  const s=snapshot();
+  s.statusOptions=['0. Paused','1. Opening','4. Pilot'];
+  s.rows=[{id:'r-1',company:s.proposals[0].company,owner:'NDL',stage:'1. Opening',lastProgress:'',nextStep:'',revision:0}];
+  const calls=[];
+  const page=fakePage({callTool:async(name,args)=>{calls.push([name,args]);return {structuredContent:name===core.TOOLS.status?{status:'0. Paused',inSalesPipeline:true}:s};}});
+  await new Promise(resolve=>setImmediate(resolve));
+  const card=articleHtml(page);
+  assert.ok(card.includes('<span class="stage stage-1">1. Opening</span>'));
+  assert.ok(card.includes('data-status-current="1. Opening"'));
+  assert.ok(card.includes('<option value="1. Opening" selected>1. Opening</option><option value="4. Pilot">4. Pilot</option>')||card.includes('<option value="0. Paused">0. Paused</option><option value="1. Opening" selected>1. Opening</option>'));
+  assert.ok(card.includes('data-action="set-status" disabled'));
+  // Choosing the same status does nothing; a different one sends exactly one status call.
+  const select={value:'1. Opening',dataset:{statusCurrent:'1. Opening'}};
+  const article={dataset:{id:s.proposals[0].id},querySelector:()=>select,querySelectorAll:()=>[]};
+  const button={dataset:{action:'set-status'},closest:selector=>selector==='article'?article:selector==='[data-action]'?button:article};
+  page.events.click({target:{closest:()=>button}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(calls.filter(([name])=>name===core.TOOLS.status).length,0);
+  select.value='0. Paused';
+  page.events.click({target:{closest:()=>button}});
+  await new Promise(resolve=>setImmediate(resolve));
+  const sent=calls.filter(([name])=>name===core.TOOLS.status);
+  assert.deepEqual(json(sent),[[core.TOOLS.status,{row_id:'r-1',expected_status:'1. Opening',status:'0. Paused'}]]);
+});
+
+// ---- H-10 (11/17/2026): cards that only wait on the customer sit in a second agenda group
+function agendaSnapshot(flags){
+  const s=snapshot(),base=s.proposals[0];
+  s.proposals=Object.entries(flags).map(([company,[date,waiting]],i)=>({...json(base),id:'p-'+(i+1),company,sources:[{...base.sources[0],date}],...(waiting===undefined?{}:{waiting})}));
+  s.rows=s.proposals.map((p,i)=>({...json(s.rows[0]),id:'r-'+(i+1),company:p.company}));
+  return s;
+}
+function warRoomPage(s){
+  const page=fakePage({callTool:async()=>({structuredContent:s})});
+  page.context.document.body={dataset:{theme:'war-room'}};
+  return page;
+}
+const agendaOrder=html=>[...html.matchAll(/data-select="([^"]+)"/g)].map(m=>m[1]);
+
+test('The workspace keeps the waiting flag as a strict boolean and treats older data as needing action',()=>{
+  const s=agendaSnapshot({Alpha:['2026-11-10',true],Beta:['2026-11-10',false],Gamma:['2026-11-10'],Delta:['2026-11-10','yes']});
+  assert.deepEqual(core.workspace(s).proposals.map(p=>p.waiting),[true,false,false,false]);
+});
+
+test('The agenda lists cards needing action first and waiting cards in a second group, in the order Next and Prev follow',async()=>{
+  // Andina is the newest, but it is only waiting on the customer, so it goes below the two action cards.
+  const s=agendaSnapshot({Andina:['2026-11-16',true],Campari:['2026-11-12',false],Bimbo:['2026-11-14'],Chifles:['2026-11-01',true]});
+  const page=warRoomPage(s);
+  await new Promise(resolve=>setImmediate(resolve));
+  let list=page.get('#review-list').innerHTML;
+  assert.deepEqual(agendaOrder(list),['p-3','p-2','p-1','p-4']);
+  assert.ok(list.indexOf('<span>Needs your action</span><span>2</span>')<list.indexOf('data-select="p-3"'));
+  const waitingHeader=list.indexOf('<span>Waiting on them</span><span>2</span>');
+  assert.ok(waitingHeader>list.indexOf('data-select="p-2"')&&waitingHeader<list.indexOf('data-select="p-1"'));
+  // The first card shown is the first action card, and the counts keep their meaning: every pending card.
+  assert.ok(list.includes('Card 1 of 4 ·'));
+  assert.ok(list.includes('aria-labelledby="title-p-3"'));
+  assert.ok(list.includes('<span>4 to review</span>'));
+  assert.equal(page.get('#wr-strip-pending').textContent,4);
+  assert.equal(page.get('#pending-count').textContent,4);
+  assert.equal([...list.matchAll(/class="wr-row[^"]* wait"/g)].length,2);
+  // Opening a waiting card says so next to its position.
+  page.events.click({target:{closest:()=>({dataset:{action:'wr-select',select:'p-1'},closest:()=>null})}});
+  list=page.get('#review-list').innerHTML;
+  assert.ok(list.includes('Card 3 of 4 · waiting on them ·'));
+  assert.ok(list.includes('aria-labelledby="title-p-1"'));
+});
+
+test('Without waiting cards the agenda is one list with no group headings',async()=>{
+  const page=warRoomPage(agendaSnapshot({Andina:['2026-11-16'],Campari:['2026-11-12',false]}));
+  await new Promise(resolve=>setImmediate(resolve));
+  const list=page.get('#review-list').innerHTML;
+  assert.deepEqual(agendaOrder(list),['p-1','p-2']);
+  assert.equal(list.includes('Needs your action'),false);
+  assert.equal(list.includes('Waiting on them'),false);
+});
+
+test('When every card is waiting they are still listed and reviewable',async()=>{
+  const page=warRoomPage(agendaSnapshot({Andina:['2026-11-16',true]}));
+  await new Promise(resolve=>setImmediate(resolve));
+  const list=page.get('#review-list').innerHTML;
+  assert.deepEqual(agendaOrder(list),['p-1']);
+  assert.ok(list.includes('<span>Waiting on them</span><span>1</span>'));
+  assert.equal(list.includes('Needs your action'),false);
+  assert.ok(list.includes('data-action="approve"'));
+});
+// ---- H-11 (11/17/2026): the click is visibly taken until the service answers, and cannot be sent twice
+function fakeArticle(id){
+  const classes=new Set(),attrs={},make=(dataset={},cls=[])=>({dataset,disabled:false,classList:{contains:c=>cls.includes(c)},parentElement:null});
+  const buttons={approve:make({action:'approve'}),edit:make({action:'edit'}),ignore:make({action:'ignore-menu'}),blocked:make({reviewBlocked:'true'})};
+  const article={dataset:{id},classes,attrs,buttons,classList:{toggle:(c,on)=>{if(on)classes.add(c);else classes.delete(c);}},setAttribute:(k,v)=>{attrs[k]=v;},removeAttribute:k=>{delete attrs[k];},querySelectorAll:()=>Object.values(buttons),querySelector:()=>null};
+  return article;
+}
+function pendingWrites(s){
+  const writes=[],release=[];
+  const page=fakePage({callTool:(name,args)=>{
+    if(name===core.TOOLS.workspace)return Promise.resolve({structuredContent:s});
+    writes.push({name,args:json(args)});
+    return new Promise((resolve,reject)=>release.push({resolve:()=>resolve({structuredContent:{status:'approved'}}),reject}));
+  }});
+  const article=fakeArticle('p-1');
+  page.context.document.querySelectorAll=selector=>selector==='article[data-id]'?[article]:[];
+  return {page,writes,release,article};
+}
+const tick=()=>new Promise(resolve=>setImmediate(resolve));
+
+test('Approve shows Saving to Sheet on the card until the service answers and a second click sends nothing',async()=>{
+  assert.ok(html.includes('<span class="btn-saving">Saving to Sheet...</span>'));
+  assert.ok(html.includes('.review-card.is-saving .btn-saving{display:inline-flex}'));
+  const s=snapshot(),{page,writes,release,article}=pendingWrites(s);
+  await tick();
+  const button={dataset:{action:'approve'},closest:()=>article};
+  page.events.click({target:{closest:()=>button}});
+  page.events.click({target:{closest:()=>button}});
+  await tick();
+  assert.equal(writes.length,1);
+  assert.deepEqual([...article.classes].sort(),['is-busy','is-saving']);
+  assert.equal(article.attrs['aria-busy'],'true');
+  assert.ok(Object.values(article.buttons).every(b=>b.disabled===true));
+  assert.equal(page.get('#announcer').textContent,'Saving A real company to the Pipeline Sheet...');
+  // A re-render while it is in flight (a filter change, a mode pick) keeps the card busy.
+  page.get('#owner-filter').handlers.change();
+  assert.ok(article.classes.has('is-saving'));
+  page.events.click({target:{closest:()=>button}});
+  assert.equal(writes.length,1);
+  // When the service refuses, the card is usable again and still shows the reason.
+  release[0].reject(new core.ReviewError('Sheet update not confirmed.',503));
+  await tick();
+  assert.equal(article.classes.size,0);
+  assert.equal('aria-busy' in article.attrs,false);
+  assert.equal(article.buttons.approve.disabled,false);
+  assert.equal(article.buttons.blocked.disabled,true);
+  page.events.click({target:{closest:()=>button}});
+  await tick();
+  assert.equal(writes.length,2);
+  assert.deepEqual(writes[0],writes[1]);
+});
+
+test('Ignore marks the card busy without claiming a Sheet write',async()=>{
+  const s=snapshot(),{page,writes,article}=pendingWrites(s);
+  await tick();
+  const button={dataset:{action:'ignore'},closest:()=>article};
+  page.events.click({target:{closest:()=>button}});
+  page.events.click({target:{closest:()=>button}});
+  await tick();
+  assert.equal(writes.length,1);
+  assert.equal(writes[0].name,core.TOOLS.ignore);
+  assert.deepEqual([...article.classes],['is-busy']);
+});
+
+test('Save and approve shows Saving to Sheet in the editor, cannot be submitted twice and recovers after a failure',async()=>{
+  assert.ok(/\.dialog-actions\{[^}]*position:sticky;bottom:0/.test(html));
+  const s=snapshot(),{page,writes,release,article}=pendingWrites(s);
+  await tick();
+  page.events.click({target:{closest:()=>({dataset:{action:'edit'},closest:()=>article})}});
+  const save=page.get('#save-approve'),form=page.get('#edit-form');
+  assert.equal(save.textContent,'Save & approve');
+  assert.equal(save.disabled,false);
+  form.handlers.submit({preventDefault(){}});
+  form.handlers.submit({preventDefault(){}});
+  await tick();
+  assert.equal(writes.length,1);
+  assert.equal(save.textContent,'Saving to Sheet...');
+  assert.equal(save.disabled,true);
+  assert.ok(article.classes.has('is-saving'));
+  release[0].reject(new core.ReviewError('Sheet update not confirmed.',503));
+  await tick();
+  assert.equal(save.textContent,'Save & approve');
+  assert.equal(save.disabled,false);
+  assert.equal(page.get('#edit-error').textContent,'Sheet update not confirmed.');
+  assert.equal(page.get('#edit-dialog').open,true);
+  assert.equal(article.classes.size,0);
+  // The same edit can then be sent again and reuses its request key.
+  form.handlers.submit({preventDefault(){}});
+  await tick();
+  assert.equal(writes.length,2);
+  assert.deepEqual(writes[0],writes[1]);
+});
+
+test('Disconnecting while a save is in flight leaves no stuck saving state',async()=>{
+  const s=snapshot(),{page,article}=pendingWrites(s);
+  await tick();
+  page.events.click({target:{closest:()=>({dataset:{action:'edit'},closest:()=>article})}});
+  page.get('#edit-form').handlers.submit({preventDefault(){}});
+  await tick();
+  assert.equal(page.get('#save-approve').disabled,true);
+  page.get('#disconnect').onclick();
+  assert.equal(page.get('#save-approve').disabled,false);
+  assert.equal(page.get('#save-approve').textContent,'Save & approve');
+});
+test('Messages of one thread on one day show as a single What\'s new line',async()=>{
+  const s=snapshot();
+  s.proposals[0].sources=[
+    {id:'m-1',type:'Email',date:'2026-11-16',subject:'Re: Ramiro <> Allison',quote:'First passage.'},
+    {id:'m-2',type:'Email',date:'2026-11-16',subject:'Re: Ramiro <> Allison',quote:'Second passage.'},
+    {id:'n-1',type:'Meeting notes',date:'2026-11-05',subject:'Freestyle Snacks',quote:'Notes passage.'}
+  ];
+  const page=fakePage({callTool:async()=>({structuredContent:s})});
+  await new Promise(resolve=>setImmediate(resolve));
+  const card=page.get('#review-list').innerHTML;
+  assert.equal(card.split('<span>Re: Ramiro &lt;&gt; Allison</span>').length-1,1);
+  assert.ok(card.includes('<div class="ctx"><p>&ldquo;First passage.&rdquo;</p><p>&ldquo;Second passage.&rdquo;</p></div>'));
+  assert.ok(card.includes('<span>Freestyle Snacks</span><span class="src">Source: Notes, Nov 5</span></summary><div class="ctx"><p>&ldquo;Notes passage.&rdquo;</p></div>'));
 });
 
 
