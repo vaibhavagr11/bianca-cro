@@ -279,10 +279,16 @@ AUTO_SENDER_RE = re.compile(
     r"|@([^@]*\.)?notifications?\.)", re.I)
 # A help-desk ticket update ("[Acme Help Center] Request #48213", "Ticket #991 updated") is a system notice from
 # whoever runs the ticket, usually a vendor. It is never the customer answering us.
+# A desk's own label in brackets is enough on its own. A bare ticket number is not: a buyer's "Solicitud N° 4521 -
+# alta de proveedor" or our "Re: Purchase request #7731" is a person writing, so the number counts only when the
+# sender is a help-desk host or a support mailbox.
 TICKET_SUBJECT_RE = re.compile(
     r"\[[^\]]{0,80}\b(help ?cent(?:er|re)|help ?desk|service ?desk|support (?:cent(?:er|re)|portal|team)|"
-    r"centro de ayuda|mesa de ayuda|soporte)\b[^\]]{0,40}\]"
-    r"|\b(?:request|ticket|solicitud|incidente?)\s*(?:#|n[°ºo]\.?\s*)\s*\d{2,}", re.I)
+    r"centro de ayuda|mesa de ayuda|soporte)\b[^\]]{0,40}\]", re.I)
+TICKET_NUMBER_RE = re.compile(r"\b(?:request|ticket|solicitud|incidente?)\s*(?:#|n[°ºo]\.?\s*)\s*\d{2,}", re.I)
+SUPPORT_MAILBOX_RE = re.compile(
+    r"^(?:support|soporte|help|ayuda|help-?desk|service-?desk|mesa-?de-?ayuda|tickets?|customer-?(?:care|service|success)"
+    r"|atencion(?:alcliente)?)(?:[+._-][^@]*)?@", re.I)
 # Hosts that send mail for another company's support desk. An address there is never a customer's own domain.
 HELPDESK_HOSTS = ("zendesk.com", "freshdesk.com", "helpscout.net", "helpscoutapp.com", "intercom-mail.com",
                   "intercom.io", "atlassian.net", "service-now.com", "servicenow.com", "zohodesk.com", "hubspot.com",
@@ -291,8 +297,11 @@ WAITING_DAYS = (7, 60)      # whole elapsed days since our latest real outbound 
 
 
 def is_automated(senders: list[str], subject: str | None) -> bool:
-    return (bool(AUTO_SUBJECT_RE.match(subject or "")) or bool(TICKET_SUBJECT_RE.search(subject or ""))
-            or any(AUTO_SENDER_RE.search(a or "") for a in senders))
+    subject = subject or ""
+    return (bool(AUTO_SUBJECT_RE.match(subject)) or bool(TICKET_SUBJECT_RE.search(subject))
+            or any(AUTO_SENDER_RE.search(a or "") for a in senders)
+            or (bool(TICKET_NUMBER_RE.search(subject))
+                and any(helpdesk_host(a) or SUPPORT_MAILBOX_RE.match(a or "") for a in senders)))
 
 
 def helpdesk_host(address: str | None) -> bool:

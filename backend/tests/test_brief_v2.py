@@ -841,6 +841,27 @@ def test_ordinary_subjects_are_not_ticket_notices(subject):
     assert not is_automated(["juan@andina.cl"], subject)
 
 
+@pytest.mark.parametrize("senders,subject", [
+    (["compras@molinos.com.ar"], "Solicitud N° 4521 - alta de proveedor Bianca"),      # a buyer's procurement request
+    (["ramiro@bianca-ai.com"], "Re: Purchase request #7731 - Bianca pilot"),           # our own reply in that thread
+    (["ana@delta.com"], "Fwd: ticket #88 from our IT team, can you look?"),
+    ([], "Request #123"),
+])
+def test_a_ticket_number_alone_does_not_make_a_persons_email_a_system_notice(senders, subject):
+    """Review 11/17: the bare-number rule dropped real customer threads from Reply needed and Waiting."""
+    assert not is_automated(senders, subject)
+
+
+@pytest.mark.parametrize("senders,subject", [
+    (["support@datavendor.com"], "Request #48213 updated"),
+    (["tickets+4410@proveedor.com.ar"], "Solicitud n° 4410 actualizada"),
+    (["agent@acme.zendesk.com"], "Ticket #17 solved"),
+    (["juan@andina.cl"], "Re: [Andina Service Desk] acceso al portal"),
+])
+def test_a_ticket_number_from_a_support_mailbox_or_a_desk_label_is_a_system_notice(senders, subject):
+    assert is_automated(senders, subject)
+
+
 def test_customer_replied_is_only_said_for_the_customers_own_senders():
     own = {"delta.com"}
     assert reply_origin(["ana@delta.com"], own, set()) is None
