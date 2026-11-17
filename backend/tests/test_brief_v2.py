@@ -945,3 +945,12 @@ def test_blocker_older_than_the_customers_latest_reply_is_not_presented_as_untou
                                      "recorded - read the reply and check whether it still stands")
     quiet = view("Campari", 4, owner="RG", blocker=blocker, last_reply=date(2026, 10, 20))
     assert primary_move(quiet, TODAY, set()).text == "No recorded action or suggestion addresses this blocker yet"
+
+
+# ---- finding 19 (11/09 evals): "10 without a reliable event date" did not say what those records were
+
+def test_undated_developments_are_explained_and_their_deals_named():
+    from app.brief_v2 import undated_note
+    assert undated_note(10, ["Andina", "Campari", "Farmater", "Pernod"]) == (
+        "Also not shown as new: 10 item(s) from meeting notes whose heading has no date (Andina, Campari, Farmater "
+        "+1 more). Add the meeting date to the heading in the notes doc to have them listed.")

@@ -693,6 +693,19 @@ def describe_change(type_: str, owner_side: str | None, kind: str | None, title_
     return cat, f"{CHANGE_LABELS.get(cat, cat)}: {text}"
 
 
+def undated_note(count: int, deals: list[str], from_notes: bool = True) -> str:
+    """Say what the undated developments are, so the count is not a riddle (11/09 evals, finding 19).
+
+    They almost always come from meeting-notes sections with no date in their heading: the day is a guess, so they
+    are never listed as new. The deals are named so a founder can check the notes doc.
+    """
+    names = ", ".join(deals[:MAX_NAMES]) + (f" +{len(deals) - MAX_NAMES} more" if len(deals) > MAX_NAMES else "")
+    if not from_notes:
+        return f"Also not shown as new: {count} item(s) whose source has no reliable date ({names})."
+    return (f"Also not shown as new: {count} item(s) from meeting notes whose heading has no date ({names}). "
+            f"Add the meeting date to the heading in the notes doc to have them listed.")
+
+
 def change_group(rank: int | None) -> int:
     """0: prospects and pilots, 1: customers, 2: early or paused."""
     return 0 if rank in (2, 3, 4) else 1 if rank == CUSTOMER_RANK else 2

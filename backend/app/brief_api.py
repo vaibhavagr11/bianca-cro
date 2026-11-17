@@ -1044,6 +1044,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
     changes = brief_v2.select_changes(changes, max_rows)
     more_changes = all_changes - len(changes)
     backfill_events = [(r, rec) for r, rec, kind in events if kind == "backfill"]
+    undated = sorted({deals[str(r["company_id"])]["name"] for r, _, kind in events if kind == "undated"})
     undated_events = sum(1 for _, _, kind in events if kind == "undated")
     backfill = None
     if backfill_events:
@@ -1052,7 +1053,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                     f"(events from {dates[0]:%b} {dates[0].day} to {dates[-1]:%b} {dates[-1].day}, "
                     f"more than {lookback} days before the last brief).")
     if undated_events:
-        backfill = (backfill + " " if backfill else "") + f"{undated_events} without a reliable event date."
+        from_notes = all(rec["source"] == "notes" for _, rec, kind in events if kind == "undated")
+        backfill = (backfill + " " if backfill else "") + brief_v2.undated_note(undated_events, undated, from_notes)
 
     coverage = ("Sources: pipeline Sheet, Ramiro's and Nico's Gmail and Calendar, meeting notes. Not connected: "
                 "WhatsApp, so missing activity is not proof nothing happened." if NICO_INBOX_CONNECTED else
