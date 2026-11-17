@@ -1720,3 +1720,18 @@ def test_card_built_before_a_newer_cycle_saw_the_reply_is_refused_until_rebuilt(
     with pytest.raises(review.ReviewConflict, match="sales evidence changed"):
         approve()
     assert not sheets.calls and not store.data["intents"]
+
+
+# ---- H-11: what one approval costs in Sheet calls (kept as is; see docs/gsheet-updates.md)
+
+def test_one_approval_reads_the_live_row_once_to_plan_and_makes_no_other_sheet_call_before_the_write(service):
+    """Plan read (exact live text for the saved before/after values) + apply_update's check, write and read-back.
+
+    Each of the three reads has its own job, so none is removed: the plan needs the Sheet's exact bytes before the
+    intent is saved, the check must sit right before the write, and the read-back confirms what was written.
+    """
+    store, sheets = service
+    approve()
+    before_write = store.events[:store.events.index("sheet-write")]
+    assert before_write.count("sheet-read") == 1 and "status-read" not in store.events
+    assert store.events.count("sheet-write") == 1 and len(sheets.calls) == 1

@@ -1015,5 +1015,109 @@ test('When every card is waiting they are still listed and reviewable',async()=>
   assert.equal(list.includes('Needs your action'),false);
   assert.ok(list.includes('data-action="approve"'));
 });
+// ---- H-11 (11/17/2026): the click is visibly taken until the service answers, and cannot be sent twice
+function fakeArticle(id){
+  const classes=new Set(),attrs={},make=(dataset={},cls=[])=>({dataset,disabled:false,classList:{contains:c=>cls.includes(c)},parentElement:null});
+  const buttons={approve:make({action:'approve'}),edit:make({action:'edit'}),ignore:make({action:'ignore-menu'}),blocked:make({reviewBlocked:'true'})};
+  const article={dataset:{id},classes,attrs,buttons,classList:{toggle:(c,on)=>{if(on)classes.add(c);else classes.delete(c);}},setAttribute:(k,v)=>{attrs[k]=v;},removeAttribute:k=>{delete attrs[k];},querySelectorAll:()=>Object.values(buttons),querySelector:()=>null};
+  return article;
+}
+function pendingWrites(s){
+  const writes=[],release=[];
+  const page=fakePage({callTool:(name,args)=>{
+    if(name===core.TOOLS.workspace)return Promise.resolve({structuredContent:s});
+    writes.push({name,args:json(args)});
+    return new Promise((resolve,reject)=>release.push({resolve:()=>resolve({structuredContent:{status:'approved'}}),reject}));
+  }});
+  const article=fakeArticle('p-1');
+  page.context.document.querySelectorAll=selector=>selector==='article[data-id]'?[article]:[];
+  return {page,writes,release,article};
+}
+const tick=()=>new Promise(resolve=>setImmediate(resolve));
+
+test('Approve shows Saving to Sheet on the card until the service answers and a second click sends nothing',async()=>{
+  assert.ok(html.includes('<span class="btn-saving">Saving to Sheet...</span>'));
+  assert.ok(html.includes('.review-card.is-saving .btn-saving{display:inline-flex}'));
+  const s=snapshot(),{page,writes,release,article}=pendingWrites(s);
+  await tick();
+  const button={dataset:{action:'approve'},closest:()=>article};
+  page.events.click({target:{closest:()=>button}});
+  page.events.click({target:{closest:()=>button}});
+  await tick();
+  assert.equal(writes.length,1);
+  assert.deepEqual([...article.classes].sort(),['is-busy','is-saving']);
+  assert.equal(article.attrs['aria-busy'],'true');
+  assert.ok(Object.values(article.buttons).every(b=>b.disabled===true));
+  assert.equal(page.get('#announcer').textContent,'Saving A real company to the Pipeline Sheet...');
+  // A re-render while it is in flight (a filter change, a mode pick) keeps the card busy.
+  page.get('#owner-filter').handlers.change();
+  assert.ok(article.classes.has('is-saving'));
+  page.events.click({target:{closest:()=>button}});
+  assert.equal(writes.length,1);
+  // When the service refuses, the card is usable again and still shows the reason.
+  release[0].reject(new core.ReviewError('Sheet update not confirmed.',503));
+  await tick();
+  assert.equal(article.classes.size,0);
+  assert.equal('aria-busy' in article.attrs,false);
+  assert.equal(article.buttons.approve.disabled,false);
+  assert.equal(article.buttons.blocked.disabled,true);
+  page.events.click({target:{closest:()=>button}});
+  await tick();
+  assert.equal(writes.length,2);
+  assert.deepEqual(writes[0],writes[1]);
+});
+
+test('Ignore marks the card busy without claiming a Sheet write',async()=>{
+  const s=snapshot(),{page,writes,article}=pendingWrites(s);
+  await tick();
+  const button={dataset:{action:'ignore'},closest:()=>article};
+  page.events.click({target:{closest:()=>button}});
+  page.events.click({target:{closest:()=>button}});
+  await tick();
+  assert.equal(writes.length,1);
+  assert.equal(writes[0].name,core.TOOLS.ignore);
+  assert.deepEqual([...article.classes],['is-busy']);
+});
+
+test('Save and approve shows Saving to Sheet in the editor, cannot be submitted twice and recovers after a failure',async()=>{
+  assert.ok(/\.dialog-actions\{[^}]*position:sticky;bottom:0/.test(html));
+  const s=snapshot(),{page,writes,release,article}=pendingWrites(s);
+  await tick();
+  page.events.click({target:{closest:()=>({dataset:{action:'edit'},closest:()=>article})}});
+  const save=page.get('#save-approve'),form=page.get('#edit-form');
+  assert.equal(save.textContent,'Save & approve');
+  assert.equal(save.disabled,false);
+  form.handlers.submit({preventDefault(){}});
+  form.handlers.submit({preventDefault(){}});
+  await tick();
+  assert.equal(writes.length,1);
+  assert.equal(save.textContent,'Saving to Sheet...');
+  assert.equal(save.disabled,true);
+  assert.ok(article.classes.has('is-saving'));
+  release[0].reject(new core.ReviewError('Sheet update not confirmed.',503));
+  await tick();
+  assert.equal(save.textContent,'Save & approve');
+  assert.equal(save.disabled,false);
+  assert.equal(page.get('#edit-error').textContent,'Sheet update not confirmed.');
+  assert.equal(page.get('#edit-dialog').open,true);
+  assert.equal(article.classes.size,0);
+  // The same edit can then be sent again and reuses its request key.
+  form.handlers.submit({preventDefault(){}});
+  await tick();
+  assert.equal(writes.length,2);
+  assert.deepEqual(writes[0],writes[1]);
+});
+
+test('Disconnecting while a save is in flight leaves no stuck saving state',async()=>{
+  const s=snapshot(),{page,article}=pendingWrites(s);
+  await tick();
+  page.events.click({target:{closest:()=>({dataset:{action:'edit'},closest:()=>article})}});
+  page.get('#edit-form').handlers.submit({preventDefault(){}});
+  await tick();
+  assert.equal(page.get('#save-approve').disabled,true);
+  page.get('#disconnect').onclick();
+  assert.equal(page.get('#save-approve').disabled,false);
+  assert.equal(page.get('#save-approve').textContent,'Save & approve');
+});
 
 (async()=>{for(const t of tests){try{await t.fn();passed++;process.stdout.write('PASS '+t.name+'\n');}catch(error){failed++;process.stdout.write('FAIL '+t.name+'\n  '+error.stack+'\n');}}process.stdout.write(`\n${passed} passed; ${failed} failed.\n`);process.exitCode=failed?1:0;})();

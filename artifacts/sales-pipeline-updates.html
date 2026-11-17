@@ -100,7 +100,22 @@ dialog{border:1px solid #D8E0EF;border-radius:14px;box-shadow:0 22px 90px #182D5
 @media (max-width:560px){.ns-row,.ns-head{grid-template-columns:minmax(0,1fr) 132px 32px}}
 .due{display:flex;gap:10px;align-items:center;margin-top:12px;font-size:12.5px;flex-wrap:wrap}.due input{height:32px;border:1px solid var(--line);border-radius:7px;padding:0 10px;font-size:12.5px;width:150px}
 .rotation-preview{margin-top:16px;border:1px solid #E2E8F4;border-radius:8px;overflow:hidden}.rotation-preview h3{font-size:11px;font-weight:650;padding:9px 12px;background:#F4F7FC;color:#526786;border-bottom:1px solid #E2E8F4}.rotation-row{padding:9px 12px;display:grid;grid-template-columns:110px 1fr;gap:10px;font-size:12px;line-height:1.6}.rotation-row+.rotation-row{border-top:1px solid #EDF1F8}.rotation-name{font-weight:650;color:#697B9A}.rotation-content{color:#7A879E;white-space:pre-line;overflow-wrap:anywhere}.rotation-explain{font-size:10.5px;color:#98A3B6;margin-top:8px;line-height:1.7}
-.dialog-actions{padding:12px 24px;border-top:1px solid #E9EEF7;display:flex;justify-content:flex-end;gap:8px;background:#FCFDFF}
+.dialog-actions{padding:12px 24px;border-top:1px solid #E9EEF7;display:flex;justify-content:flex-end;gap:8px;background:#FCFDFF;position:sticky;bottom:0;z-index:2;box-shadow:0 -6px 14px #1B22380F}
+#save-approve{min-width:164px;min-height:40px;font-size:14px}
+.btn-label{display:inline-flex;align-items:center;gap:6px}
+.btn-saving{display:none;align-items:center;gap:8px}
+.btn-saving::before,#save-approve.is-saving::before{content:"";width:12px;height:12px;flex:none;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:wr-spin .7s linear infinite}
+.review-card.is-saving .btn-label{display:none}
+.review-card.is-saving .btn-saving{display:inline-flex}
+.review-card.is-busy{overflow:hidden}
+.review-card.is-busy>*:not(.card-footer){opacity:.5}
+.review-card.is-busy::after{content:"";position:absolute;top:0;left:-40%;width:40%;height:3px;background:var(--green);animation:wr-saving 1.1s ease-in-out infinite}
+.review-card.is-busy button:disabled,#save-approve.is-saving:disabled{opacity:1;cursor:progress}
+.review-card.is-busy .secondary:disabled,.review-card.is-busy .quiet:disabled,.review-card.is-busy .status-save:disabled,.review-card.is-busy .mode button:disabled{opacity:.45}
+#edit-form[aria-busy=true] .dialog-body{opacity:.55;pointer-events:none}
+@keyframes wr-spin{to{transform:rotate(360deg)}}
+@keyframes wr-saving{to{left:100%}}
+@media(prefers-reduced-motion:reduce){.btn-saving::before,#save-approve.is-saving::before,.review-card.is-busy::after{animation:none}.review-card.is-busy::after{left:0;width:100%}}
 .toast-region{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);z-index:20;max-width:calc(100vw - 30px);pointer-events:none}.toast{background:#17274B;border:1px solid #33456B;border-radius:8px;box-shadow:0 7px 30px #14234A26;color:#fff;padding:12px 16px;display:flex;align-items:center;gap:12px;font-size:12.5px;line-height:1.6;pointer-events:auto}.toast button{background:transparent;border:0;color:#B9CCFF;text-decoration:underline;text-underline-offset:3px;padding:4px;font-size:12px;white-space:nowrap}.toast-close{font-size:17px!important;text-decoration:none!important;color:#A5B2CF!important}
 .pending-write{opacity:.65;pointer-events:none}
 /* focus theme */
@@ -492,6 +507,8 @@ const BiancaWarRoom = (() => {
   let client=null,token='',editingId=null,editingRevision=null,toastTimer,loaded=false,refreshing=false,session=0;
   let state={proposals:[],rows:[],activity:[]};
   const mirrorPending=new Map();
+  // Cards with a decision on its way to the service: id -> 'approve' | 'ignore'. Drawn by paintSaving, also after a re-render.
+  const saving=new Map();
   const setText=(id,text)=>{$(id).textContent=text;};
   function announce(message){setText('#announcer',message);}
   function toast(message){clearTimeout(toastTimer);$('#toast-region').innerHTML=`<div class="toast"><span>${esc(message)}</span><button type="button" class="toast-close" aria-label="Dismiss notification">×</button></div>`;$('.toast-close').onclick=()=>$('#toast-region').replaceChildren();announce(message);toastTimer=setTimeout(()=>$('#toast-region').replaceChildren(),12000);}
@@ -561,6 +578,7 @@ const BiancaWarRoom = (() => {
 ${esc(a.after.nextStep)}
 `:''}${a.before.clientContext!==a.after.clientContext?`<strong>Client Context</strong>
 ${esc(a.after.clientContext)}`:''}</div></details>`:''}</div><time class="activity-time" datetime="${esc(a.at||'')}">${a.at&&Number.isFinite(Date.parse(a.at))?esc(new Date(a.at).toLocaleString([],{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})):''}</time></article>`).join('')||empty('Your decisions will appear here.','Approved and ignored suggestions are shared across your Bianca workspace.','back-to-review','Review updates');
+    for(const id of saving.keys())paintSaving(id);
   }
   function currentCell(p,field){const row=state.rows.find(r=>r.company===p.company);return row?row[field]:p[field];}
   const currentNextStep=p=>currentCell(p,'nextStep');
@@ -605,29 +623,39 @@ ${esc(a.after.clientContext)}`:''}</div></details>`:''}</div><time class="activi
 <div class="sec-label">Client context <span class="proposed">Column proposed</span></div>${bulletList(p,contextBullets,'clientContext',data)}
 ${traceNote?`<p class="approval-note trace-note" role="status">${esc(traceNote)}</p>`:''}${legacy?`<p class="approval-note legacy-note" role="status">${esc(p.error)}</p>`:''}${applying&&!legacy?`<p class="approval-note" role="status">${esc(p.error||'This approval has a saved write request. Retry checks that same request; it will not move the cells twice.')}</p>`:''}
 <details class="current-next-steps" data-current-next-steps${open?' open':''}><summary>Current Sheet cells</summary><div class="cells-grid"><div><h4>Next step (now)</h4><div class="current-next-steps-content">${esc(cellOf('nextStep'))||'<i>No Next steps are currently noted.</i>'}</div></div><div><h4>Last progress (now)</h4><div class="current-next-steps-content">${esc(cellOf('lastProgress'))||'<i>No Last progress is currently noted.</i>'}</div></div><div><h4>Client context (now)</h4><div class="current-next-steps-content">${esc(cellOf('clientContext'))||'<i>No Client Context is currently noted.</i>'}</div></div></div></details>
-<div class="card-footer"><div class="actions">${legacy?'<button type="button" class="primary" data-review-blocked="true" disabled>Rebuild required</button>':lineageBlocked?'<button type="button" class="primary" data-review-blocked="true" disabled>Rebuild required</button><button type="button" class="quiet" data-action="ignore">Ignore</button>':applying?`<button type="button" class="primary" data-action="retry" ${p.retry?'':'disabled'}>Retry approval<span class="sr-only"> ${esc(p.company)}</span></button>`:`<button type="button" class="primary" data-action="approve"><span class="approve-check" aria-hidden="true">&#10003;</span>Approve<span class="sr-only"> ${esc(p.company)}</span></button><button type="button" class="secondary" data-action="edit">Edit<span class="sr-only"> ${esc(p.company)}</span></button><button type="button" class="quiet" data-action="ignore-menu" aria-haspopup="menu">Ignore &#9662;<span class="sr-only"> options for ${esc(p.company)}</span></button><div class="ign-menu" role="menu"><div class="mh">Ignore options <span class="proposed">Proposed - all dismiss today</span></div><button type="button" class="mi" role="menuitem" data-action="ignore"><b>Not now</b><span>Comes back tomorrow with any new info</span></button><button type="button" class="mi" role="menuitem" data-action="ignore"><b>Ignore this suggestion</b><span>Dismissed for everyone; new info makes a new card</span></button><button type="button" class="mi" role="menuitem" data-action="ignore"><b>Never suggest for this deal</b><span>Mute the company until the stage changes</span></button></div>`}</div>${state.sheetUrl?`<div class="rowlink"><a href="${esc(state.sheetUrl)}" target="_blank" rel="noopener">Open in Pipeline Sheet &#8599;</a></div>`:''}</div>
+<div class="card-footer"><div class="actions">${legacy?'<button type="button" class="primary" data-review-blocked="true" disabled>Rebuild required</button>':lineageBlocked?'<button type="button" class="primary" data-review-blocked="true" disabled>Rebuild required</button><button type="button" class="quiet" data-action="ignore">Ignore</button>':applying?`<button type="button" class="primary" data-action="retry" ${p.retry?'':'disabled'}><span class="btn-label">Retry approval<span class="sr-only"> ${esc(p.company)}</span></span><span class="btn-saving">Saving to Sheet...</span></button>`:`<button type="button" class="primary" data-action="approve"><span class="btn-label"><span class="approve-check" aria-hidden="true">&#10003;</span>Approve<span class="sr-only"> ${esc(p.company)}</span></span><span class="btn-saving">Saving to Sheet...</span></button><button type="button" class="secondary" data-action="edit">Edit<span class="sr-only"> ${esc(p.company)}</span></button><button type="button" class="quiet" data-action="ignore-menu" aria-haspopup="menu">Ignore &#9662;<span class="sr-only"> options for ${esc(p.company)}</span></button><div class="ign-menu" role="menu"><div class="mh">Ignore options <span class="proposed">Proposed - all dismiss today</span></div><button type="button" class="mi" role="menuitem" data-action="ignore"><b>Not now</b><span>Comes back tomorrow with any new info</span></button><button type="button" class="mi" role="menuitem" data-action="ignore"><b>Ignore this suggestion</b><span>Dismissed for everyone; new info makes a new card</span></button><button type="button" class="mi" role="menuitem" data-action="ignore"><b>Never suggest for this deal</b><span>Mute the company until the stage changes</span></button></div>`}</div>${state.sheetUrl?`<div class="rowlink"><a href="${esc(state.sheetUrl)}" target="_blank" rel="noopener">Open in Pipeline Sheet &#8599;</a></div>`:''}</div>
 <p class="validation card-error" role="alert" hidden></p></article>`;
   }
+  function paintSaving(id){
+    const article=[...document.querySelectorAll('article[data-id]')].find(x=>x.dataset.id===id);if(!article)return;
+    const action=saving.get(id),busy=Boolean(action);
+    article.classList?.toggle('is-busy',busy);article.classList?.toggle('is-saving',action==='approve');
+    if(busy)article.setAttribute('aria-busy','true');else article.removeAttribute('aria-busy');
+    article.querySelectorAll('button,select').forEach(b=>{const pick=b.classList?.contains('status-save')?b.parentElement?.querySelector('.status-pick'):null;b.disabled=busy||b.dataset?.sourceUnavailable==='true'||b.dataset?.reviewBlocked==='true'||Boolean(pick&&pick.value===pick.dataset.statusCurrent);});
+  }
+  function editorSaving(on){const button=$('#save-approve'),form=$('#edit-form');button.disabled=on;button.textContent=on?'Saving to Sheet...':'Save & approve';button.classList?.toggle('is-saving',on);if(on)form.setAttribute('aria-busy','true');else form.removeAttribute('aria-busy');}
   function focusNext(id){const el=[...document.querySelectorAll('article[data-id]')].find(x=>x.dataset.id===id);const next=el?.nextElementSibling?.dataset.id||el?.previousElementSibling?.dataset.id;return()=>{const target=next?[...document.querySelectorAll('article[data-id]')].find(x=>x.dataset.id===next)?.querySelector('button'):$('#review-list button');target?.focus();};}
   async function decide(id,action,bullets,fromEditor=false){
-    if(!client||client.isBusy(id))return;
+    if(!client||client.isBusy(id)||saving.has(id))return;
     const p=state.proposals.find(p=>p.id===id);if(!p)return;
-    const active=client,startedSession=session,restore=focusNext(id),el=[...document.querySelectorAll('article[data-id]')].find(x=>x.dataset.id===id);
-    el?.querySelectorAll('button').forEach(b=>b.disabled=true);if(fromEditor)$('#save-approve').disabled=true;
+    const active=client,startedSession=session,restore=focusNext(id);
+    // Show that the click was taken until the service answers (an approval makes several Sheet calls).
+    saving.set(id,action);paintSaving(id);if(fromEditor)editorSaving(true);
+    if(action==='approve')announce(`Saving ${p.company} to the Pipeline Sheet...`);
     try{
       const result=await active.decide(id,action,bullets);if(startedSession!==session)return;
       if(!state.rows.some(row=>row.company===p.company)&&!state.activity.some(item=>item.company===p.company)){
-        if(fromEditor)$('#edit-dialog').close();restore();toast('Decision saved.');return;
+        if(fromEditor&&editingId===id)$('#edit-dialog').close();restore();toast('Decision saved.');return;
       }
       if(action==='approve'&&result?.mirror_refreshed===false){mirrorPending.set(p.company,{after:result.activity?.after||null,at:result.activity?.at});updateMirrorNotice();}
-      if(fromEditor)$('#edit-dialog').close();restore();toast(action==='approve'?`${p.company} approved. Written to the Pipeline Sheet.${result?.mirror_refreshed===false?' Pipeline snapshot needs a full sync.':''}`:`${p.company} ignored. Nothing written to the Pipeline Sheet.`);
+      if(fromEditor&&editingId===id)$('#edit-dialog').close();restore();toast(action==='approve'?`${p.company} approved. Written to the Pipeline Sheet.${result?.mirror_refreshed===false?' Pipeline snapshot needs a full sync.':''}`:`${p.company} ignored. Nothing written to the Pipeline Sheet.`);
     }catch(error){
       if(error.status===409)await refresh();
       if(startedSession!==session)return;const message=error.status===409?error.message+' Refresh to review the current company update.':error.message;
       if(fromEditor&&editingId===id){setText('#edit-error',message);$('#edit-error').hidden=false;}
       else {const current=[...document.querySelectorAll('article[data-id]')].find(x=>x.dataset.id===id)?.querySelector('.card-error');if(current){current.textContent=message;current.hidden=false;}toast(message);}
       setText('#connection-status','Refresh needed');
-    }finally{if(startedSession!==session)return;$('#save-approve').disabled=false;const current=[...document.querySelectorAll('article[data-id]')].find(x=>x.dataset.id===id);current?.querySelectorAll('button').forEach(b=>b.disabled=b.dataset?.sourceUnavailable==='true'||b.dataset?.reviewBlocked==='true');}
+    }finally{saving.delete(id);if(fromEditor)editorSaving(false);if(startedSession===session)paintSaving(id);}
   }
   async function changeStatus(id,button){
     const p=state.proposals.find(p=>p.id===id),row=p&&state.rows.find(r=>r.company===p.company),select=button.closest('article')?.querySelector('.status-pick');
@@ -647,7 +675,7 @@ ${traceNote?`<p class="approval-note trace-note" role="status">${esc(traceNote)}
       toast(error.message);setText('#connection-status','Refresh needed');
     }
   }
-  function openEditor(id){const p=state.proposals.find(p=>p.id===id);if(!p||p.status!=='pending'||p.routingVersion!==1||!p.lineageAvailable)return;editingId=id;editingRevision=p.revision;setText('#edit-title',`Edit ${p.company}`);$('#edit-content').value=BiancaWarRoom.suggestedNextSteps(p).map(b=>'- '+b).join('\n');$('#edit-client-context').value=p.clientContextBullets.map(b=>'- '+b).join('\n');setText('#previous-next-step',currentNextStep(p)||'(empty cell)');setText('#previous-client-context',currentCell(p,'clientContext')||'(empty cell)');$('#edit-error').hidden=true;$('#edit-content').removeAttribute('aria-invalid');$('#edit-dialog').showModal();$('#edit-content').focus();BiancaWarRoom.openRows(id,currentNextStep(p));}
+  function openEditor(id){const p=state.proposals.find(p=>p.id===id);if(!p||p.status!=='pending'||p.routingVersion!==1||!p.lineageAvailable)return;editingId=id;editingRevision=p.revision;setText('#edit-title',`Edit ${p.company}`);$('#edit-content').value=BiancaWarRoom.suggestedNextSteps(p).map(b=>'- '+b).join('\n');$('#edit-client-context').value=p.clientContextBullets.map(b=>'- '+b).join('\n');setText('#previous-next-step',currentNextStep(p)||'(empty cell)');setText('#previous-client-context',currentCell(p,'clientContext')||'(empty cell)');$('#edit-error').hidden=true;$('#edit-content').removeAttribute('aria-invalid');editorSaving(saving.has(id));$('#edit-dialog').showModal();$('#edit-content').focus();BiancaWarRoom.openRows(id,currentNextStep(p));}
   document.addEventListener('click',event=>{const button=event.target.closest('[data-action]');if(!button)return;const action=button.dataset.action,id=button.closest('[data-id]')?.dataset.id;
     if(action==='source'){selectSource(id,button.dataset.sourceId);return;}
     if(action==='approve'){const p=state.proposals.find(p=>p.id===id);if(p?.status==='pending')decide(id,'approve',{...BiancaWarRoom.nextStepUpdate(id,BiancaWarRoom.suggestedNextSteps(p)),clientContextBullets:p.clientContextBullets});}
@@ -667,12 +695,12 @@ ${traceNote?`<p class="approval-note trace-note" role="status">${esc(traceNote)}
   $('#refresh-updates').onclick=refresh;
   $('#sign-in-form').hidden=!hosted;
   $('#sign-in-form').addEventListener('submit',async event=>{event.preventDefault();token=$('#access-token').value.trim();$('#access-token').value='';if(!token){connectionError('Enter your workspace access token.');return;}attach(BiancaLive.restTransport(fetch.bind(window),()=>token));await refresh();});
-  $('#disconnect').onclick=()=>{session++;refreshing=false;$('#refresh-updates').disabled=false;token='';client=null;loaded=false;state={proposals:[],rows:[],activity:[]};mirrorPending.clear();expandedNextSteps.clear();activeSources.clear();$('#connection-panel').hidden=false;$('#edit-dialog').close();setText('#connection-status','Connection needed');setText('#last-refreshed','');render();announce('Disconnected. Company data cleared from this page.');};
+  $('#disconnect').onclick=()=>{session++;saving.clear();editorSaving(false);refreshing=false;$('#refresh-updates').disabled=false;token='';client=null;loaded=false;state={proposals:[],rows:[],activity:[]};mirrorPending.clear();expandedNextSteps.clear();activeSources.clear();$('#connection-panel').hidden=false;$('#edit-dialog').close();setText('#connection-status','Connection needed');setText('#last-refreshed','');render();announce('Disconnected. Company data cleared from this page.');};
   $('#company-search').addEventListener('input',()=>{render();announce($('#results-count').textContent);});$('#owner-filter').addEventListener('change',()=>{render();announce($('#results-count').textContent);});
   document.querySelectorAll('[role=tab]').forEach(tab=>{tab.onclick=()=>setTab(tab.id);tab.onkeydown=event=>{const tabs=[...document.querySelectorAll('[role=tab]')],i=tabs.indexOf(tab);let n;if(event.key==='ArrowRight')n=(i+1)%tabs.length;else if(event.key==='ArrowLeft')n=(i+tabs.length-1)%tabs.length;else if(event.key==='Home')n=0;else if(event.key==='End')n=tabs.length-1;else return;event.preventDefault();setTab(tabs[n].id,true);};});
   $('.brand').onclick=event=>{event.preventDefault();setTab('review-tab',true);window.scrollTo({top:0,behavior:'smooth'});};
   window.addEventListener('bianca:connector-ready',()=>{client=null;token='';refresh();});
-  window.addEventListener('pagehide',()=>{session++;token='';client=null;loaded=false;state={proposals:[],rows:[],activity:[]};mirrorPending.clear();expandedNextSteps.clear();activeSources.clear();$('#edit-dialog').close();$('#connection-panel').hidden=false;setText('#connection-status','Connection needed');setText('#last-refreshed','');render();});
+  window.addEventListener('pagehide',()=>{session++;saving.clear();editorSaving(false);token='';client=null;loaded=false;state={proposals:[],rows:[],activity:[]};mirrorPending.clear();expandedNextSteps.clear();activeSources.clear();$('#edit-dialog').close();$('#connection-panel').hidden=false;setText('#connection-status','Connection needed');setText('#last-refreshed','');render();});
   render();if(window.biancaConnector?.callTool)refresh();
 })();
 
