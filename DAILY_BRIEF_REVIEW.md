@@ -54,3 +54,75 @@ uv run pytest -q
 Before approving, record the deployed revision and n8n path reviewed, the result of one staging render with approved long-field examples, the forced review outcome, and the policy for a blocked build. A successful sign-off includes a complete, faithful description at or below 160 characters, a valid destination and message body on success, and a visible operator outcome on review without a duplicate or stale send.
 
 [Core tests](backend/tests/test_brief_text.py) · [V1 display tests](backend/tests/test_brief_v1_text.py) · [V2 render and API tests](backend/tests/test_brief_v2_text.py)
+
+
+## 11/17/2026 - fixes from the 11/09 evals and the founders' 11/12 session
+
+Branch `brief-fixes-1117`. Everything below is deterministic code in the v2 brief (the version n8n requests); no prompt, migration, n8n workflow or required setting changed. All new settings have defaults in [config.py](backend/app/config.py).
+
+| What a founder sees | Rule | Where |
+| --- | --- | --- |
+| A date set in the Sheet brings the deal back | A Next step bullet ending in `(complete by Nov 16, 2026)` shows in **Needs you today** on that date, tagged **Sheet date**, source "Sheet next step". It stays, marked late, for `BRIEF_SHEET_STEP_OVERDUE_DAYS` (14), then becomes a one-line reminder to update the Sheet. Not for Paused deals or working clients. If the same step also exists as an extracted item, the item is held until the date and the Sheet row replaces it, so a step is never listed twice. Sheet rows have a Done button and are not sent to the pre-send check. | [brief_sheet_steps.py](backend/app/brief_sheet_steps.py), `brief_api._apply_sheet_dates`, `brief_v2.sheet_rows` |
+| No "keep following up" rows | Nudge-only items and suggestions are replaced by one time-based reminder per deal: "3 weeks since your last email - follow up this week", on the first brief on or after each `BRIEF_NUDGE_EVERY_DAYS` (7) mark, on the Waiting row when there is one, else under Follow-ups. After `BRIEF_PAUSE_AFTER_EMAILS` (5) of our emails in a row with no reply, that weekly line reads "5 emails with no reply - consider moving to Paused" instead: same cadence, at most once per 7 days per deal, never together with the nudge. On the days in between the row only states the silence. | `brief_v2.Cadence`, `_split_followups`, `_waiting_status` |
+| Waiting items never in Deals to move | A step or blocker that only says the customer has not answered ("Wait for Franco's reply", "No reply since Oct 21") is the waiting state, never a next move or a Situation. | `brief_followups.is_waiting_only` |
+| Shorter tables | **Needs you today always shows every row** (decision 11/17). Every other table stops at `BRIEF_MAX_TABLE_ROWS` (7) rows, and the line under it names the deals left out: "+ 3 more in the Sheet waiting on a reply: Andina Chile, Arca Peru, Chifles" (8 names, then "and N more"), in HTML and plain text. A deal already in Needs you today gets no second, generic row in Deals to move. | `brief_v2.cap_tables`, `more_line`, `select_changes` |
+| Quiet In Talks deals, a few at a time | "Quiet In Talks deals to revisit (3 of N)": In Talks, no recorded contact in over two weeks or none at all, nothing else open. `BRIEF_RESURFACE_PER_DAY` (3, 0 = off) per founder, longest-untouched first; a deal that was listed waits `BRIEF_RESURFACE_COOLDOWN_DAYS` (14), read from the archived briefs. | `brief_v2.build_section` |
+| Pilots: sales items only | On a Pilot deal, items stored before scopes existed (blank scope) are hidden (`BRIEF_PILOT_STRICT_SCOPE`, default on). | `brief_api._scoped_rows` |
+| Prep on every meeting | Written last, from rows that survived the pre-send check: who is on the invite and whether they accepted, then the most pressing row the brief shows for the deal, else its open issue, Sheet next step, summary or last contact. A meeting the classifier did not link is tied to a deal when a guest's address or domain points to exactly one pipeline company. | `brief_v2.meeting_prep`, `brief_api._deal_for_guests` |
+| Cancelled meetings | Google's "Canceled event" mail, which is never stored, now marks the stored meeting cancelled at Gmail ingest when it is newer than the latest calendar sync. | `gmail.cancellation_notices`, `ingest.apply_cancellation_notices` |
+| Situation text | Sentences no longer end at "2. In Talks", decimals, abbreviations, initials or inside a quote; a long Situation is cut at a clause break, never with an ellipsis. | `brief_text.split_sentences` |
+| "Customer replied" | Help-desk ticket notices are system mail. "Customer replied" is said only for a sender on the deal company's own domain; anyone else is named by domain. Up to 7 changes show, customer-written ones first. | `brief_v2.is_automated`, `reply_origin` |
+| Already-answered rows | Without the pre-send check, a row whose email thread we have written in since is marked "you wrote back Nov 5 - still open?" (not hidden: a later email can be a thank-you). | `brief_api.answered_after` |
+| Stable wording | A regenerated suggestion that cites the same insights and says the same thing keeps its previous wording, so rows and Done clicks stay stable. | `profiler.keep_wording` |
+
+### Check after deploy
+
+- **Sheet dates.** In a dry run (`POST /brief/build?version=v2&dry_run=true`), confirm a row dated today in the live Sheet appears as **Sheet date** and that `payload.sections[].sheet_later` lists the future ones. A slash date such as 03/04/2026 is not read (ambiguous); the Hub writes month names.
+- **Weekly nudge and quiet-deal batch.** Both read the `briefs` archive (`for_date`, `payload.sections[].resurfaced`). Dry runs do not archive, so a preview repeats the same nudge and batch until a real brief is sent.
+- **Cancelled meetings.** Only works if the n8n Gmail search returns "Canceled event" mail; check `meetings_cancelled` in the `/ingest/gmail` response. Re-fetching the calendar right before the build is still the complete fix and is an n8n change.
+- **Friday mail gap (finding 1).** Not fixed here: the Gmail search in n8n needs `newer_than:4d` instead of `newer_than:2d`. The backend already skips mail it has (`store_gmail` matches on Gmail id and Message-ID), so the longer window is safe.
+- **Pilots.** Product-work items that were extracted with a sales scope before PR #17 still show; they need a re-extraction run on Pilot deals.
+
+### Release review (11/17) - what changed after running the branch on a real database
+
+Found by building eight consecutive days of briefs against Postgres from a seeded pipeline (36 deals), first with master's code and then with this branch on the same archive. Fixed here:
+
+- **Nothing optional can stop the send.** Sheet dates, the weekly nudge, the quiet-deal batch, guest matching, meeting prep and the "wrote back" cue are extras: if one fails, the reason is logged (`brief built without ...`, `sheet dates skipped for opportunity ...`, `brief section RG rebuilt without ...`) and the brief is built without it. The archive reads run in a savepoint. At Gmail ingest a cancellation notice the database cannot read is skipped on its own; it used to fail the whole mail sync. A profile is still saved when its earlier wording cannot be carried over.
+- **Blank or huge text.** A blank insight, action or summary no longer raises in the sentence splitter (it did since 11/17; before that it gave blank text). A Next step line with a long run of spaces after "(complete by" no longer stalls the build, and a very long text is read once.
+- **Paused deals get no reminder.** No "follow up this week", no "consider moving to Paused" (the deal is already Paused) and no Follow-ups row. Their Waiting row reads as it did before 11/17.
+- **The hold-back rule never hides what is due.** An extracted item that is due (or due tomorrow) or overdue by its own date stays in the brief even when the same step carries a later date in the Sheet.
+- **Ticket numbers.** "Request #123" in a subject marks a system notice only when the sender is a help-desk host or a support mailbox. A buyer's "Solicitud N° 4521 - alta de proveedor" and our own replies in that thread are people again (they had dropped out of Reply needed and Waiting). A desk label in brackets ("[Acme Help Center]") is still enough on its own.
+- Smaller: a deal with a meeting today or tomorrow is not listed as quiet; a long-past Sheet date from another year shows its year; "Nov 16, 26" is read as 2026.
+
+Off switches (all default to the 11/17 behaviour; set the variable on the backend and the next build uses it):
+
+| Behaviour | Turn off with | With it off |
+| --- | --- | --- |
+| 7-row cap (never applies to Needs you today) | `BRIEF_MAX_TABLE_ROWS=1000` | Meetings list every row; Deals to move (6), Waiting (6) and Follow-ups (3) keep their earlier limits. What changed lists every change (the old 3 + 2 quota is gone for good). |
+| Weekly nudge and "consider Paused" | `BRIEF_FOLLOWUP_NUDGES=false` | Reminders print as written and Waiting rows carry no nudge, as before 11/17. Waiting statements ("Wait for Franco's reply") are ordinary steps again. |
+| Quiet In Talks batch | `BRIEF_RESURFACE_PER_DAY=0` | No batch; the "Confirm status" and "no record in 45+ days" lines count those deals as before. |
+| Pilot strict scope | `BRIEF_PILOT_STRICT_SCOPE=false` | Not-yet-scoped items show on Pilot deals again. |
+| Sheet dates | `BRIEF_SHEET_DATES=false` | "(complete by ...)" notes are not read. |
+| Holding the matching item until the Sheet date | `BRIEF_SHEET_HOLD_MATCHING=false` | Sheet dates still show on their day; the extracted item keeps showing by its own rules before it. |
+
+No switch (by design, they are corrections): prep lines and guest matching, cancelled meetings, "Customer replied" wording, Situation cuts, the "you wrote back" cue, kept wording, and "no second generic row for a deal already in Needs you today".
+
+### Decisions of the release owner (11/17), built on top of the review
+
+Ramiro's biggest fear is missing an email or a deadline, so nothing that needs a founder today may be hidden.
+
+- **Needs you today is never cut.** Every row shows, whatever `BRIEF_MAX_TABLE_ROWS` is. Order: a customer waiting on our reply and what is due today (then tomorrow) first, then what is overdue by its own date, most recent first, then late Sheet-date rows. `more_today` stays in the payload and is always 0.
+- **Capped tables name what they leave out** (Deals to move, Waiting, Meetings, Follow-ups, What changed), in HTML and in the plain-text part.
+- **"Consider moving to Paused" is weekly**, on the deal's nudge day and in place of the nudge.
+- **A cancellation notice that fits more than one stored meeting cancels none.** A notice carries only a title and a day; with two "30 Minute Call" bookings that day we wait for the next calendar fetch and log `cancellation notice for <day> matches N meetings with the same title`.
+- **The plain-text part** now carries the Sheet-date footers ("Sheet dates long past", "N dated Sheet step(s) not due yet") and the quiet-batch note.
+
+Documented limits (accepted, not fixed):
+
+- On an empty archive, or after a day with no brief, a deal can get its catch-up nudge (or Paused suggestion) and the next weekly one less than 7 days apart. With an archive of sent briefs the run showed at most one per 7 days.
+- A regenerated suggestion keeps its earlier wording when it cites the same insights and shares half of its meaningful words.
+- A meeting is tied to a deal by a 5+ letter fragment of the company name in the guest's domain; the prep line says "deal matched by guest domain".
+- The small "Nico de León · urgent only" table still lists at most 3 rows with no count, as it did before 11/17.
+- The plain-text part has no "What changed" table (it never had one).
+
+Tests: `cd backend && uv run pytest -q` (847 passed, 13 skipped, which need a local test database). The review's tests are in [test_brief_review_1117.py](backend/tests/test_brief_review_1117.py), the decisions' in [test_brief_decisions_1117.py](backend/tests/test_brief_decisions_1117.py). The end-to-end fixture is [test_brief_fixture_1117.py](backend/tests/test_brief_fixture_1117.py); run it with `BRIEF_FIXTURE_HTML=<path>` to save the rendered email.

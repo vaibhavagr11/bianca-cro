@@ -79,3 +79,36 @@ def test_profile_endpoints_require_token():
     client = TestClient(app)
     assert client.post("/process/profile", json={"opportunity_ids": []}).status_code == 401
     assert client.get("/opportunities/x/profile").status_code == 401
+
+
+# ---- finding 17 (11/09 evals): the Farmater suggestion was reworded Mon -> Tue with the same Nov 5 source
+
+def test_regenerated_suggestion_keeps_its_previous_wording_when_it_is_the_same_suggestion():
+    from app.profiler import keep_wording
+
+    previous = {"refs": {"I1": "need-1", "I2": "ask-2", "I7": "old-7"}, "recommended_actions": [
+        {"action": "Send Ana the pricing deck for the paid rollout", "evidence": ["I1", "I2"]},
+        {"action": "Send the pilot terms", "evidence": ["I7"]},
+    ]}
+    # The new profile numbers its insights differently and rewords everything.
+    data = {"refs": {"I3": "need-1", "I4": "ask-2", "I5": "old-7", "I6": "new-9"}, "recommended_actions": [
+        {"action": "Share the pricing deck with Ana for the paid rollout", "evidence": ["I4", "I3"]},   # same thing
+        {"action": "Confirm the buyer received the pilot terms", "evidence": ["I5"]},     # same source, moved on
+        {"action": "Book the scoping call", "evidence": ["I6"]},                           # new evidence
+    ]}
+    assert keep_wording(data, previous) == 1
+    assert [a["action"] for a in data["recommended_actions"]] == [
+        "Send Ana the pricing deck for the paid rollout",
+        "Confirm the buyer received the pilot terms",
+        "Book the scoping call",
+    ]
+    assert keep_wording(data, None) == 0 and keep_wording(data, {}) == 0
+
+
+def test_two_previous_suggestions_on_the_same_evidence_are_too_ambiguous_to_reuse():
+    from app.profiler import keep_wording
+
+    previous = {"refs": {"I1": "a"}, "recommended_actions": [
+        {"action": "Send the pricing deck", "evidence": ["I1"]}, {"action": "Send the pricing sheet", "evidence": ["I1"]}]}
+    data = {"refs": {"I1": "a"}, "recommended_actions": [{"action": "Share the pricing deck", "evidence": ["I1"]}]}
+    assert keep_wording(data, previous) == 0 and data["recommended_actions"][0]["action"] == "Share the pricing deck"

@@ -43,6 +43,30 @@ class Settings(BaseSettings):
     brief_critical_ahead_days: int = 3
     # Preferred number of active In Talks deals among the four shown per founder (not a quota).
     brief_in_talks_target: int = 2
+    # Pilot deals show only items the extractor classified as deal progression. Items from before that
+    # classification existed (blank scope) are shown on other deals until re-extracted, but not on Pilots.
+    brief_pilot_strict_scope: bool = True
+    # Quiet In Talks deals (no recorded contact in 2+ weeks, nothing else open) come back a few per founder per day,
+    # longest-untouched first, and one that was listed is not listed again for the cooldown. 0 turns this off.
+    brief_resurface_per_day: int = Field(default=3, ge=0)
+    brief_resurface_cooldown_days: int = Field(default=14, ge=0)
+    # No table in the brief lists more than this many rows; what is left out is counted on a line under the table.
+    brief_max_table_rows: int = Field(default=7, gt=0)
+    # Follow-up cadence while a customer has not answered: one "follow up this week" nudge per deal every this many
+    # days since our last email, and after this many of our emails in a row with no reply, suggest Paused instead.
+    brief_nudge_every_days: int = Field(default=7, gt=0)
+    brief_pause_after_emails: int = Field(default=5, gt=0)
+    # False switches the time-based reminders off: "keep following up" rows print as written and Waiting rows carry
+    # no "follow up this week" or "consider moving to Paused", as before 11/17.
+    brief_followup_nudges: bool = True
+    # A "(complete by <date>)" note in the Sheet's Next step shows in "Needs you today" from its date until it is
+    # this many days late; after that it moves to a one-line reminder to update the Sheet.
+    brief_sheet_step_overdue_days: int = Field(default=14, ge=0)
+    # False: the Sheet's "(complete by <date>)" notes are not read at all, as before 11/17.
+    brief_sheet_dates: bool = True
+    # While a dated Sheet step is not due yet, the extracted item that is the same step is held back until that date
+    # (never one that is due or overdue by its own date). False: such items keep showing by their own rules.
+    brief_sheet_hold_matching: bool = True
     # Turn on after n8n is configured to provide receipts and check ready_to_send.
     brief_verification_required: bool = False
     brief_verification_feeds: list[str] = ["gmail:RG", "gmail:NC", "calendar:RG", "calendar:NC", "notes", "pipeline"]

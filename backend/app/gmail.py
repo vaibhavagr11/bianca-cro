@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from datetime import date
 
 MAX_BODY_CHARS = 8000
 
@@ -20,6 +21,17 @@ _CALENDAR_SUBJECT = re.compile(
     r"^(accepted|declined|tentatively accepted|invitation|updated invitation|canceled event|cancelled event)\b.*:",
     re.I,
 )
+
+# "Canceled event: Bianca <> Campari @ Wed Nov 11, 2026 3pm - 3:30pm (ART) (ramiro@bianca-ai.com)". Google sends this
+# the moment a meeting is called off, which can be after the morning's calendar fetch.
+_CANCEL_NOTICE = re.compile(
+    r"^\s*(?:cancell?ed event|evento cancelado)(?: (?:with note|con nota))?\s*:\s*(?P<title>.+?)\s+@\s+(?P<when>.+)$", re.I)
+_NOTICE_DATE = re.compile(
+    r"\b(?P<m1>[a-záéíóú]{3,10})\.?\s+(?P<d1>\d{1,2}),\s*(?P<y1>\d{4})\b"
+    r"|\b(?P<d2>\d{1,2})\s+(?:de\s+)?(?P<m2>[a-záéíóú]{3,10})\.?,?\s+(?:de\s+)?(?P<y2>\d{4})\b", re.I)
+_NOTICE_MONTHS = {name: number for number, names in enumerate((
+    ("jan", "ene"), ("feb",), ("mar",), ("apr", "abr"), ("may",), ("jun",), ("jul",), ("aug", "ago"),
+    ("sep", "set"), ("oct",), ("nov",), ("dec", "dic")), start=1) for name in names}
 
 # Where quoted earlier messages start; everything after the first match is dropped.
 _QUOTE_MARKERS = [
@@ -116,7 +128,8 @@ def skip_reason(
     senders = addresses(message.get("from"))
     if any(_AUTOMATED_SENDER.match(s["address"]) for s in senders):
         return "automated"
-    if _CALENDAR_SUBJECT.match((message.get("subject") or "").strip()):
+    subject = (message.get("subject") or "").strip()
+    if _CALENDAR_SUBJECT.match(subject) or _CANCEL_NOTICE.match(subject):
         return "automated"
 
     everyone = senders + addresses(message.get("to")) + addresses(message.get("cc"))
@@ -129,6 +142,28 @@ def skip_reason(
     if not (message.get("text") or "").strip():
         return "empty"
     return None
+
+
+def cancellation_notices(messages: list[dict]) -> list[tuple[str, date, str]]:
+    """(meeting title, meeting day, when the notice was sent) for each calendar cancellation notice in a batch.
+
+    These messages are never stored (see skip_reason); the caller only uses them to mark the stored meeting as
+    cancelled. A notice without a readable day (a recurring series) is left out rather than guessed.
+    """
+    out = []
+    for message in messages:
+        notice = _CANCEL_NOTICE.match((message.get("subject") or "").strip())
+        found = _NOTICE_DATE.search(notice["when"]) if notice else None
+        if not found or not message.get("date"):
+            continue
+        month = _NOTICE_MONTHS.get((found["m1"] or found["m2"])[:3].lower())
+        try:
+            day = date(int(found["y1"] or found["y2"]), month, int(found["d1"] or found["d2"])) if month else None
+        except ValueError:
+            day = None
+        if day:
+            out.append((notice["title"].strip(), day, str(message["date"])))
+    return out
 
 
 def normalize_message_id(value) -> str | None:

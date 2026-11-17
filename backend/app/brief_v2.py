@@ -15,8 +15,9 @@ from app.brief import (
     AMBER, BLUE, FONT, INK, MUTED, RED, Meeting, VerificationNotes, _e, _empty, _h, _link, _td, _th,
     meeting_text_fields, meeting_text_rows, meetings_table, stage_short, verification_html, verification_text,
 )
-from app.brief_followups import is_followup_only
-from app.brief_text import TableText, read_table_text
+from app.brief_followups import is_followup_only, is_waiting_only
+from app.brief_text import TableText, first_or_blank, read_table_text, split_sentences
+from app.pipeline import is_paused
 
 ACTIVE_DAYS = 14            # last recorded interaction within this = active
 UNCLEAR_DAYS = 45           # 15..45 days = status unclear (confirm); older = dormant
@@ -25,9 +26,9 @@ PROPOSAL_FOLLOWUP_DAYS = (7, 30)   # our proposal with no reply after this many 
 UNDATED_WINDOW_DAYS = 45
 MAX_HIGHLIGHTS, MAX_FOLLOWUPS, MAX_EXCEPTIONS, MAX_NAMES = 6, 3, 1, 3
 MAX_WAITING = 6
+MAX_TABLE_ROWS = 7            # founders (11/12): 4 to 7 things per table; more only makes them stop reading
 IN_TALKS_RANK = 2
 REQUEST_FRESH_DAYS = 21       # a customer request this recent still counts as outstanding
-CHANGE_QUOTA = {0: 3, 1: 2, 2: 0}  # what changed: prospects/pilots, customers, other
 PROSPECT_RANKS, CUSTOMER_RANK = (1, 2, 3, 4), 5
 CHANGE_TYPES = {"buying_signal": "Buying signal", "blocker": "New blocker", "objection": "Objection",
                 "commitment": "New commitment", "next_step": "Next step noted", "need": "New need"}
@@ -55,6 +56,7 @@ class Item:
     link: str | None = None
     bucket: str = ""
     kind: str = "next_step"         # owed | customer_request | proposed | next_step
+    replied: date | None = None     # we wrote back in its email thread on this day, after it was asked
 
 
 @dataclass
@@ -69,6 +71,8 @@ class Note:
     source: str = ""                # newest cited evidence, e.g. "Notes · Oct 20"
     ref: str | None = None          # stable id of a suggestion, so a founder can dismiss it
     followup_only: bool = False
+    on: date | None = None          # day of the newest evidence it cites
+    replied: date | None = None     # we wrote in every email thread it cites on or before this day, after `on`
 
 
 @dataclass
@@ -89,6 +93,15 @@ class Unanswered:
         return f"thread:{self.thread_id}" if self.thread_id else None
 
 
+@dataclass(frozen=True)
+class SheetDue:
+    """A Next step bullet the founders dated in the Sheet with "(complete by <date>)"."""
+    text: str
+    due: date
+    ref: str                        # stable id of this bullet and date, so "Done" can close it
+    item_id: str | None = None      # the open extracted item that is the same step, if there is one
+
+
 @dataclass
 class DealView:
     deal: str
@@ -104,6 +117,12 @@ class DealView:
     unanswered: Unanswered | None = None
     developments: int = 0           # new or late-recorded developments since the last brief
     recommendations: list[Note] = field(default_factory=list)  # all of the profile's suggested moves
+    last_outbound: date | None = None   # our latest email to someone outside Bianca on this deal
+    last_reply: date | None = None      # the customer's latest real email on this deal
+    unanswered_emails: int = 0          # our emails in a row since their last reply
+    sheet_steps: list[SheetDue] = field(default_factory=list)  # dated Next step bullets from the Sheet
+    held: int = 0                   # extracted items held back until the date the founder set for them in the Sheet
+    sheet_next: str = ""            # first line of the Sheet's Next step cell, for context lines
 
 
 @dataclass
@@ -123,7 +142,7 @@ class Move:
 class TodayRow:
     deal: str
     stage: str | None
-    tag: str                        # Due now | Reply needed
+    tag: str                        # Due now | Sheet date | Reply needed
     text: str
     when: str
     owner: str
@@ -131,6 +150,8 @@ class TodayRow:
     item_id: str | None = None
     source: str = ""
     done: str | None = None
+    verify: bool = True             # False: a founder's own dated note in the Sheet; mail cannot confirm or close it
+    late: int = 0                   # days past its date (0 due today, -1 due tomorrow); 0 for a reply
 
 
 @dataclass
@@ -143,6 +164,7 @@ class ChangeRow:
     kind: str = "new"               # new | late | sheet
     event: date | None = None       # when it happened (from the source, not when we stored it)
     title_only: bool = False        # only the subject/title is established, not what was agreed
+    from_customer: bool = False     # the customer wrote it: a reply is the first thing a founder wants to see
 
 
 @dataclass
@@ -256,11 +278,87 @@ AUTO_SUBJECT_RE = re.compile(
 AUTO_SENDER_RE = re.compile(
     r"(no-?reply|do-?not-?reply|^mailer-daemon@|^postmaster@|^bounces?[+@-]|^gemini-notes@|^calendar-notification@"
     r"|@([^@]*\.)?notifications?\.)", re.I)
+# A help-desk ticket update ("[Acme Help Center] Request #48213", "Ticket #991 updated") is a system notice from
+# whoever runs the ticket, usually a vendor. It is never the customer answering us.
+# A desk's own label in brackets is enough on its own. A bare ticket number is not: a buyer's "Solicitud N° 4521 -
+# alta de proveedor" or our "Re: Purchase request #7731" is a person writing, so the number counts only when the
+# sender is a help-desk host or a support mailbox.
+TICKET_SUBJECT_RE = re.compile(
+    r"\[[^\]]{0,80}\b(help ?cent(?:er|re)|help ?desk|service ?desk|support (?:cent(?:er|re)|portal|team)|"
+    r"centro de ayuda|mesa de ayuda|soporte)\b[^\]]{0,40}\]", re.I)
+TICKET_NUMBER_RE = re.compile(r"\b(?:request|ticket|solicitud|incidente?)\s*(?:#|n[°ºo]\.?\s*)\s*\d{2,}", re.I)
+SUPPORT_MAILBOX_RE = re.compile(
+    r"^(?:support|soporte|help|ayuda|help-?desk|service-?desk|mesa-?de-?ayuda|tickets?|customer-?(?:care|service|success)"
+    r"|atencion(?:alcliente)?)(?:[+._-][^@]*)?@", re.I)
+# Hosts that send mail for another company's support desk. An address there is never a customer's own domain.
+HELPDESK_HOSTS = ("zendesk.com", "freshdesk.com", "helpscout.net", "helpscoutapp.com", "intercom-mail.com",
+                  "intercom.io", "atlassian.net", "service-now.com", "servicenow.com", "zohodesk.com", "hubspot.com",
+                  "salesforce.com", "kayako.com", "gorgias.com", "frontapp.com")
 WAITING_DAYS = (7, 60)      # whole elapsed days since our latest real outbound message
 
 
 def is_automated(senders: list[str], subject: str | None) -> bool:
-    return bool(AUTO_SUBJECT_RE.match(subject or "")) or any(AUTO_SENDER_RE.search(a or "") for a in senders)
+    subject = subject or ""
+    return (bool(AUTO_SUBJECT_RE.match(subject)) or bool(TICKET_SUBJECT_RE.search(subject))
+            or any(AUTO_SENDER_RE.search(a or "") for a in senders)
+            or (bool(TICKET_NUMBER_RE.search(subject))
+                and any(helpdesk_host(a) or SUPPORT_MAILBOX_RE.match(a or "") for a in senders)))
+
+
+def helpdesk_host(address: str | None) -> bool:
+    host = (address or "").rsplit("@", 1)[-1].lower()
+    return any(host == h or host.endswith("." + h) for h in HELPDESK_HOSTS)
+
+
+def reply_origin(senders: list[str], own_domains: set[str] | None, own_contacts: set[str]) -> str | None:
+    """None when the customer wrote; otherwise the sender's domain, so the row names it instead of the customer.
+
+    own_domains are the deal company's own email domains (None when we have learned none yet: then only a help-desk
+    host is ruled out). own_contacts are addresses already tied to that company, for people on free-mail domains.
+    """
+    for address in senders:
+        address = (address or "").lower()
+        host = address.rsplit("@", 1)[-1]
+        if helpdesk_host(address):
+            return host
+        if address in own_contacts or own_domains is None or host in own_domains:
+            continue
+        return host
+    return None
+
+
+@dataclass(frozen=True)
+class Cadence:
+    """How often to nudge while a customer stays silent, and when to suggest Paused instead (see config)."""
+    every: int = 7                  # days between "follow up this week" nudges for one deal
+    pause_after: int = 5            # our emails in a row with no reply before suggesting Paused
+    briefed: frozenset = frozenset()  # recent days a brief was sent, so a nudge shows once per mark
+
+    def due(self, last_sent: date, today: date) -> bool:
+        """True on the first brief on or after each `every`-day mark since our last email, and only then.
+
+        A mark that falls on a day with no brief (a weekend) is shown on the next brief day, not skipped.
+        """
+        days = (today - last_sent).days
+        if days < self.every:
+            return False
+        mark = last_sent + timedelta(days=days - days % self.every)
+        return not any(mark <= sent < today for sent in self.briefed)
+
+
+def elapsed(days: int) -> str:
+    """"9 days", "2 weeks", "5 weeks": whole weeks once it is two or more."""
+    if days < 14:
+        return f"{days} day{'' if days == 1 else 's'}"
+    return f"{days // 7} weeks"
+
+
+def nudge_text(days: int) -> str:
+    return f"{elapsed(days)} since your last email - follow up this week"
+
+
+def pause_text(emails: int) -> str:
+    return f"{emails} emails with no reply - consider moving to Paused"
 
 
 @dataclass
@@ -281,6 +379,9 @@ class Waiting:
     rank: int | None = None
     action: str | None = None      # the specific response we are waiting on
     evidence: frozenset[str] = frozenset()  # insight IDs for the specific ask
+    nudge: bool = False             # today is this deal's weekly "follow up this week" day
+    pause_after: int | None = 5     # our unanswered emails in a row before the row suggests Paused; None: never
+                                    # (the deal is already Paused, or time-based nudges are switched off)
 
 
 def waiting_on_them(thread: list[dict], internal: set[str], now: datetime) -> dict | None:
@@ -329,10 +430,17 @@ def waiting_on_them(thread: list[dict], internal: set[str], now: datetime) -> di
             "auto_reply": any(m["automated"] and m["at"] > last["at"] for m in thread)}
 
 
-def pick_waiting(waiting: list[Waiting], code: str) -> tuple[list[Waiting], int]:
+def waiting_left_out(waiting: list[Waiting], code: str, shown: list[Waiting]) -> list[str]:
+    """The deals of this founder's waits that pick_waiting did not show, in the same order."""
+    mine = sorted((w for w in waiting if w.owner == code), key=lambda w: (w.rank not in PROSPECT_RANKS, w.days, w.deal))
+    return [w.deal for w in mine if all(w is not s for s in shown)]
+
+
+def pick_waiting(waiting: list[Waiting], code: str, limit: int = MAX_TABLE_ROWS) -> tuple[list[Waiting], int]:
     """This founder's waits: prospects and pilots first, then the most recent silence (still worth a nudge)."""
     mine = sorted((w for w in waiting if w.owner == code), key=lambda w: (w.rank not in PROSPECT_RANKS, w.days, w.deal))
-    return mine[:MAX_WAITING], max(0, len(mine) - MAX_WAITING)
+    shown = min(MAX_WAITING, limit)
+    return mine[:shown], max(0, len(mine) - shown)
 
 
 def waiting_text(w: Waiting) -> str:
@@ -342,17 +450,25 @@ def waiting_text(w: Waiting) -> str:
 
 
 def _waiting_status(w: Waiting) -> str:
-    if w.replied_before:
+    """How the silence stands, then what to do about it: Paused after too many emails, else the weekly nudge."""
+    # The Paused suggestion follows the weekly cadence and takes the nudge's place on that day; on other days the
+    # row only states the silence.
+    suggest_pause = w.nudge and w.pause_after is not None and w.nudges >= w.pause_after
+    if suggest_pause:
+        bits = [pause_text(w.nudges)]
+    elif w.replied_before:
         bits = [f"{w.nudges} emails since their last reply" if w.nudges > 1 else "no reply to our last email"]
     else:
         bits = [f"no reply to our {w.nudges} emails" if w.nudges > 1 else "no reply yet"]
     if w.auto_reply:
         bits.append("out-of-office received")
+    if w.nudge and not suggest_pause:
+        bits.append(nudge_text(w.days))
     return ", ".join(bits)
 
 
 def first_sentence(text: str, limit: int = 95) -> str:
-    parts = re.split(r"(?<=[^\d\s][.!?])\s+(?=[A-Z¿¡\"'])", text.strip(), maxsplit=2)
+    parts = split_sentences(text) or [""]    # blank text stays blank, as before 11/17
     s = parts[0] if len(parts[0]) >= 30 or len(parts) == 1 else f"{parts[0]} {parts[1]}"  # "Call Ale." alone says too little
     return s if len(s) <= limit else s[:limit].rsplit(" ", 1)[0] + "…"
 
@@ -361,13 +477,74 @@ def _date(d: date) -> str:
     return f"{d:%b} {d.day}"
 
 
+SHEET_SOURCE = "Sheet next step"
+MAX_LEFT_NAMES = 8            # deals named on a "+ N more" line before "and N more"
+
+
+def sort_today(rows: list[TodayRow]) -> list[TodayRow]:
+    """What cannot wait first: a customer waiting on our reply, then what is due today (then tomorrow), then what
+    is overdue by its own date, most recent first, then late Sheet-date rows, most recent first. Stable otherwise.
+
+    "Needs you today" is never cut (founders, 11/17: missing an email or a deadline is the worst failure), so this
+    order only decides what a founder reads first.
+    """
+    def rank(r: TodayRow) -> tuple:
+        if r.tag == "Reply needed":
+            return 0, 0, 0
+        if r.late <= 0:
+            return 0, 1, -r.late
+        return (2 if r.tag == "Sheet date" else 1), r.late, 0
+    return sorted(rows, key=rank)
+
+
+def left_out_names(names) -> str:
+    """The deals a capped table does not show, each once, in order: at most MAX_LEFT_NAMES, then "and N more"."""
+    unique = list(dict.fromkeys(n for n in names if n))
+    more = f" and {len(unique) - MAX_LEFT_NAMES} more" if len(unique) > MAX_LEFT_NAMES else ""
+    return ", ".join(unique[:MAX_LEFT_NAMES]) + more
+
+
+def more_line(count: int, what: str, names) -> str:
+    """"+ 3 more in the Sheet waiting on a reply: Andina Chile, Arca Peru, Chifles" - the same in HTML and text."""
+    listed = left_out_names(names)
+    return f"+ {count} more {what}" + (f": {listed}" if listed else "")
+
+
+def sheet_rows(v: DealView, today: date, overdue_days: int, owner: str) -> tuple[list[TodayRow], list[SheetDue], list[SheetDue]]:
+    """(rows for "Needs you today", steps not yet due, steps too long past) for one deal's dated Sheet bullets.
+
+    A dated bullet shows on its date and stays, marked late, for overdue_days. Before its date it is not shown;
+    long after it, it becomes a reminder to update the Sheet rather than a daily row. If the same step also exists
+    as an extracted item, the row closes that item (so "Done" and the pre-send check work) and is the only row
+    shown for it.
+    """
+    rows, later, stale = [], [], []
+    for step in v.sheet_steps:
+        late = (today - step.due).days
+        if late < 0:
+            later.append(step)
+        elif late > overdue_days:
+            stale.append(step)
+        else:
+            when = "due today" if late == 0 else f"due {_date(step.due)}, {late}d late"
+            rows.append(TodayRow(v.deal, v.stage, "Sheet date", step.text, when, owner, None, step.item_id,
+                                 SHEET_SOURCE, f"insight:{step.item_id}" if step.item_id else f"rec:{step.ref}",
+                                 verify=step.item_id is not None, late=late))
+    return rows, later, stale
+
+
 def addresses(evidence: frozenset, blocker: Note) -> bool:
     """A move addresses a blocker when it rests on the same source evidence (shared cited insights)."""
     return bool(evidence & blocker.evidence)
 
 
+def _still_open(when: str, replied: date | None) -> str:
+    """Mark a row whose email thread we have answered since: likely handled, but only a person can say."""
+    return f"{when} · you wrote back {_date(replied)} - still open?" if replied else when
+
+
 def item_move(tag: str, text: str, when: str, i: Item) -> Move:
-    return Move(tag, text, when, i.link, i.id, i.source, f"insight:{i.id}", i.deal)
+    return Move(tag, text, _still_open(when, i.replied), i.link, i.id, i.source, f"insight:{i.id}", i.deal)
 
 
 def email_move(tag: str, text: str, when: str, u: Unanswered, deal: str | None = None) -> Move:
@@ -375,7 +552,7 @@ def email_move(tag: str, text: str, when: str, u: Unanswered, deal: str | None =
 
 
 def note_move(tag: str, text: str, when: str, n: Note, link: str | None, deal: str | None = None) -> Move:
-    return Move(tag, text, when, link, None, n.source, f"rec:{n.ref}" if n.ref else None, deal)
+    return Move(tag, text, _still_open(when, n.replied), link, None, n.source, f"rec:{n.ref}" if n.ref else None, deal)
 
 
 def recorded_move(i: Item, text: str) -> Move:
@@ -405,6 +582,12 @@ def primary_move(d: DealView, today: date, used: set[str]) -> Move:
         for r in d.recommendations:
             if r.verified and addresses(r.evidence, b):
                 return note_move("AI recommendation", r.text, _last(d, today), r, r.link)
+        if d.last_reply and b.on and d.last_reply > b.on:
+            # The customer has written since this blocker was recorded; the profile was not rebuilt because nothing
+            # new was extracted from the reply, so do not present the old blocker as untouched.
+            return Move("Clarify next action", f"The customer replied on {_date(d.last_reply)}, after this blocker "
+                        f"was recorded - read the reply and check whether it still stands",
+                        _last(d, today), b.link, None, b.source)
         return Move("Clarify next action", "No recorded action or suggestion addresses this blocker yet",
                     _last(d, today), b.link, None, b.source)
     for i in sorted((i for i in open_items if i.kind == "owed" and i.bucket in ("overdue", "week")),
@@ -562,20 +745,34 @@ def describe_change(type_: str, owner_side: str | None, kind: str | None, title_
     return cat, f"{CHANGE_LABELS.get(cat, cat)}: {text}"
 
 
+def undated_note(count: int, deals: list[str], from_notes: bool = True) -> str:
+    """Say what the undated developments are, so the count is not a riddle (11/09 evals, finding 19).
+
+    They almost always come from meeting-notes sections with no date in their heading: the day is a guess, so they
+    are never listed as new. The deals are named so a founder can check the notes doc.
+    """
+    names = ", ".join(deals[:MAX_NAMES]) + (f" +{len(deals) - MAX_NAMES} more" if len(deals) > MAX_NAMES else "")
+    if not from_notes:
+        return f"Also not shown as new: {count} item(s) whose source has no reliable date ({names})."
+    return (f"Also not shown as new: {count} item(s) from meeting notes whose heading has no date ({names}). "
+            f"Add the meeting date to the heading in the notes doc to have them listed.")
+
+
 def change_group(rank: int | None) -> int:
     """0: prospects and pilots, 1: customers, 2: early or paused."""
     return 0 if rank in (2, 3, 4) else 1 if rank == CUSTOMER_RANK else 2
 
 
-def select_changes(changes: list[ChangeRow]) -> list[ChangeRow]:
-    """Keep input order inside each group; prospects and pilots first, with a reserved share for customers."""
-    out, used = [], {0: 0, 1: 0, 2: 0}
-    for c in sorted(changes, key=lambda c: (change_group(c.rank), c.kind != "new")):  # new before late in each group
-        g = change_group(c.rank)
-        if used[g] < CHANGE_QUOTA[g]:
-            out.append(c)
-            used[g] += 1
-    return out
+def select_changes(changes: list[ChangeRow], limit: int = MAX_TABLE_ROWS) -> list[ChangeRow]:
+    """The first `limit` changes: In Talks, Proposal and Pilot deals first, then customers, then Opening and Paused.
+
+    Inside each group: what happened since the last brief before what was recorded late, and what the customer
+    wrote before the rest, so a customer's reply is not pushed out by our own notes. The caller prints how many
+    were left out. (Until 11/17 this kept 3 + 2 + 0 rows per group, which dropped replies on busy days and every
+    change on an Opening deal.)
+    """
+    ranked = sorted(changes, key=lambda c: (change_group(c.rank), c.kind != "new", not c.from_customer))
+    return ranked[:limit]
 
 
 # ---------------------------------------------------------------- assembly (pure)
@@ -611,6 +808,27 @@ class Section:
     waiting: list[Waiting] = field(default_factory=list)  # we wrote last, no answer yet
     more_waiting: int = 0
     verification: VerificationNotes | None = None
+    sheet_later: list[tuple[str, date]] = field(default_factory=list)   # (deal, date) of dated Sheet steps not yet due
+    sheet_stale: list[tuple[str, date]] = field(default_factory=list)   # (deal, date) of Sheet dates long past
+    held: int = 0                   # extracted items waiting for the Sheet date a founder gave them
+    more_today: int = 0             # always 0 since 11/17: Needs you today shows every row (key kept for callers)
+    left: dict[str, list[str]] = field(default_factory=dict)   # table -> deals its "+ N more" line names
+    more_meetings: int = 0
+    resurfaced: list[DealView] = field(default_factory=list)   # today's small batch of quiet In Talks deals
+    quiet_in_talks: int = 0         # all quiet In Talks deals this founder owns, shown today or not
+
+
+def cap_tables(section: Section, limit: int = MAX_TABLE_ROWS) -> Section:
+    """Keep Meetings to `limit` rows and name what was left out. "Needs you today" is never cut: every row shows.
+
+    Run this after the pre-send check, so the rows that survive it fill the table. The other capped tables (Deals
+    to move, Waiting, Follow-ups, What changed) are capped where they are built; each prints a "+ N more" line
+    naming the deals it left out.
+    """
+    section.more_meetings += max(0, len(section.meetings) - limit)
+    section.left["meetings"] = [m.deal or m.title for m, _ in section.meetings[limit:]]
+    section.meetings = section.meetings[:limit]
+    return section
 
 
 def _without_waiting_action(view: DealView, waiting: Waiting) -> DealView:
@@ -639,8 +857,54 @@ def _without_waiting_action(view: DealView, waiting: Waiting) -> DealView:
                    recommendation=preferred, recommendations=recommendations)
 
 
-def _split_followups(view: DealView, today: date, used: set[str]) -> tuple[DealView, list[Move]]:
-    """Collect reminder actions and leave independent next moves available for deal selection."""
+_TOPIC = re.compile(r"\b(?:on|about|regarding|re:|sobre|acerca de)\s+(?P<topic>[^.!?;]{3,70})[.!?]?\s*$", re.I)
+
+
+def _nudge(view: DealView, today: date, cadence: Cadence, about: str, basis: date | None, tag_since: str,
+           force: bool = False) -> tuple[str, str] | None:
+    """(text, when) for a deal's one time-based follow-up reminder today, or None when none is due.
+
+    Instead of repeating a vague "keep following up", say how long it has been and what to do: after
+    cadence.pause_after of our emails with no reply, suggest Paused; otherwise "follow up this week", shown once
+    per cadence.every days. No reminder while the customer wrote last (the next move is ours, not a nudge).
+    """
+    if is_paused(view.stage):
+        return None                 # a Paused deal is parked on purpose: no reminder, and nothing to move to Paused
+    if view.last_reply and view.last_outbound and view.last_reply > view.last_outbound:
+        return None
+    if view.unanswered_emails >= cadence.pause_after:
+        # Once per cadence.every days since our last email, on the day the nudge would have shown, and instead of it.
+        if not view.last_outbound or not (force or cadence.due(view.last_outbound, today)):
+            return None
+        return f"{view.deal}: {pause_text(view.unanswered_emails)}.", f"last email {_date(view.last_outbound)}"
+    if basis is None or basis == date.min or not (force or cadence.due(basis, today)):
+        return None                 # date.min: the source has no date at all, so "N weeks since" cannot be said
+    days = (today - basis).days
+    if about.startswith(":"):       # a proposal of ours: keep what was proposed
+        tail = about.rstrip(". ") + "."
+    else:                           # a nudge-only text: keep only its topic, if it names one
+        topic = _TOPIC.search(about)
+        tail = f" (re: {topic['topic'].strip()})." if topic else "."
+    return f"{view.deal}: {elapsed(days)} since {tag_since} - follow up this week{tail}", f"{tag_since} {_date(basis)}"
+
+
+def _split_followups(view: DealView, today: date, used: set[str], cadence: Cadence | None = Cadence(),
+                     has_wait: bool = False) -> tuple[DealView, list[Move], bool]:
+    """Collect reminder actions and leave independent next moves available for deal selection.
+
+    Returns the view without its reminder material, the reminders to print today, and whether the deal has
+    reminder material at all (it may be between two weekly nudges, with nothing to print today).
+
+    Nudge-only items and suggestions ("keep following up", "check in") and waiting statements ("wait for Franco's
+    reply", a blocker that says "no reply since Oct 21") are never printed as written or used as a deal's next
+    move: what is with the customer belongs to Waiting, not to Deals to move. A deal gets
+    at most one time-based reminder ("3 weeks since your last email - follow up this week"), on its weekly day,
+    and none when a Waiting row for the deal already carries it (has_wait). A Paused deal gets none at all.
+
+    cadence=None switches the time-based reminders off (BRIEF_FOLLOWUP_NUDGES=false): reminders are then printed as
+    written and waiting statements are left alone, exactly as before 11/17.
+    """
+    timed = cadence is not None
     followups: list[Move] = []
     followup_items: set[str] = set()
     unanswered = view.unanswered
@@ -652,22 +916,31 @@ def _split_followups(view: DealView, today: date, used: set[str]) -> tuple[DealV
             followup_items.add(unanswered.item_id)
         unanswered = None
 
+    nudges: list[tuple[Move, str, date | None, str]] = []   # (what closes it, its wording, since when, since what)
     proposals = [i for i in view.items if i.kind == "proposed" and i.id not in used
                  and PROPOSAL_FOLLOWUP_DAYS[0] <= (today - i.recorded).days <= PROPOSAL_FOLLOWUP_DAYS[1]
                  and (view.last_contact or i.recorded) <= i.recorded]
     if proposals:
         proposal = max(proposals, key=lambda i: i.recorded)
-        followups.append(item_move("Follow up", f"{view.deal}: Check whether to follow up on our proposal. {proposal.text}",
-                                   f"proposed {_date(proposal.recorded)}", proposal))
+        if timed:
+            nudges.append((item_move("Follow up", "", "", proposal), f": {proposal.text}",
+                           proposal.recorded, "we proposed this"))
+        else:
+            followups.append(item_move("Follow up", f"{view.deal}: Check whether to follow up on our proposal. "
+                                       f"{proposal.text}", f"proposed {_date(proposal.recorded)}", proposal))
         followup_items.update(i.id for i in proposals)
 
     for i in view.items:
         if (i.kind not in ("owed", "customer_request", "next_step") or i.id in followup_items
-                or not is_followup_only(i.text)):
+                or not (is_followup_only(i.text) or (timed and is_waiting_only(i.text)))):
             continue
         followup_items.add(i.id)
         if i.id not in used and i.bucket not in ("stale", "old_undated"):
-            followups.append(item_move("Follow up", f"{view.deal}: {i.text}", f"recorded {_date(i.recorded)}", i))
+            if timed:
+                nudges.append((item_move("Follow up", "", "", i), i.text, view.last_outbound or i.recorded,
+                               "your last email" if view.last_outbound else "this was noted"))
+            else:
+                followups.append(item_move("Follow up", f"{view.deal}: {i.text}", f"recorded {_date(i.recorded)}", i))
 
     recommendations = list(view.recommendations)
     if view.recommendation and view.recommendation not in recommendations:
@@ -680,22 +953,46 @@ def _split_followups(view: DealView, today: date, used: set[str]) -> tuple[DealV
         if not rec.verified:
             continue
         repeats_reminder = bool(rec.evidence & followup_items) and norm(rec.text).rstrip(".!?") in reminder_texts
-        if rec.followup_only or is_followup_only(rec.text) or repeats_reminder:
-            if not (rec.evidence and rec.evidence <= followup_items):
+        if (rec.followup_only or is_followup_only(rec.text) or (timed and is_waiting_only(rec.text))
+                or repeats_reminder):
+            if rec.evidence and rec.evidence <= followup_items:
+                pass                    # the item it rests on is already the reminder
+            elif timed:
+                nudges.append((note_move("Follow up", "", "", rec, rec.link, view.deal), rec.text,
+                               view.last_outbound or view.last_contact,
+                               "your last email" if view.last_outbound else "the last contact on record"))
+            else:
                 followups.append(note_move("Follow up", f"{view.deal}: {rec.text}", _last(view, today),
                                            rec, rec.link, view.deal))
         else:
             deal_moves.append(rec)
 
-    return replace(view, items=[i for i in view.items if i.id not in followup_items], unanswered=unanswered,
-                   recommendation=next(iter(deal_moves), None), recommendations=deal_moves), followups
+    # A blocker that only says "no reply since ..." is the waiting state itself, not a situation with a next move.
+    blocker = view.blocker
+    if timed and blocker and blocker.verified and is_waiting_only(blocker.text):
+        nudges.append((Move("Follow up", "", "", blocker.link, None, blocker.source, None, view.deal), "",
+                       view.last_outbound or view.last_contact,
+                       "your last email" if view.last_outbound else "the last contact on record"))
+        blocker = None
+
+    if timed and nudges and not has_wait:
+        target, about, basis, since = nudges[0]
+        worded = _nudge(view, today, cadence, about, basis, since)
+        if worded:
+            followups.append(replace(target, text=worded[0], when=worded[1], deal=view.deal))
+
+    return (replace(view, items=[i for i in view.items if i.id not in followup_items], unanswered=unanswered,
+                    blocker=blocker, recommendation=next(iter(deal_moves), None), recommendations=deal_moves),
+            followups, bool(followups or nudges))
 
 
 def build_section(code: str, name: str, short: str, views: dict[str, DealView], items: list[Item],
                   meetings: list[tuple[Meeting, str]], today: date, display: dict[str, str],
                   hidden: int = 0, critical_ahead: int = 3, in_talks_target: int = 2, *,
-                  waiting: list[Waiting] | None = None, more_waiting: int = 0,
-                  waiting_candidates: list[Waiting] | None = None) -> Section:
+                  waiting: list[Waiting] | None = None, more_waiting: int = 0, left_waiting: list[str] | None = None,
+                  waiting_candidates: list[Waiting] | None = None, sheet_overdue_days: int = 14,
+                  cadence: Cadence | None = Cadence(), max_rows: int = MAX_TABLE_ROWS, resurface: int = 0,
+                  resurfaced_recently: frozenset[str] = frozenset()) -> Section:
     mine: dict[str, DealView] = {}
 
     def view(deal: str) -> DealView:
@@ -706,7 +1003,10 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                                   blocker=src.blocker if own else None, recommendation=src.recommendation if own else None,
                                   summary=src.summary if own else None, unanswered=src.unanswered if own else None,
                                   developments=src.developments if own else 0,
-                                  recommendations=src.recommendations if own else [])
+                                  recommendations=src.recommendations if own else [],
+                                  sheet_steps=src.sheet_steps if own else [], held=src.held if own else 0,
+                                  sheet_next=src.sheet_next, last_outbound=src.last_outbound,
+                                  last_reply=src.last_reply, unanswered_emails=src.unanswered_emails)
         return mine[deal]
 
     routed = [i for i in items if i.route == code]
@@ -725,7 +1025,7 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                 late = (today - i.due).days
                 when = "due tomorrow" if late < 0 else "due today" if late == 0 else f"due {_date(i.due)}, {late}d late"
                 today_rows.append(TodayRow(v.deal, v.stage, "Due now", i.text, when, owner_label(i), i.link, i.id,
-                                           i.source, f"insight:{i.id}"))
+                                           i.source, f"insight:{i.id}", late=late))
                 used.add(i.id)
         if v.unanswered and reply_label(v.unanswered) == "reply_needed":
             u = v.unanswered
@@ -734,7 +1034,15 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                                        u.completion_ref))
             if u.item_id:
                 used.add(u.item_id)
-    today_rows.sort(key=lambda r: (r.tag != "Due now", r.when))
+    sheet_later: list[tuple[str, date]] = []
+    sheet_stale: list[tuple[str, date]] = []
+    for v in mine.values():         # the dates the founders set themselves in the Sheet's Next step
+        rows, later, stale = sheet_rows(v, today, sheet_overdue_days, display.get(code, code) + " (Sheet)")
+        today_rows += rows
+        used.update(r.item_id for r in rows if r.item_id)
+        sheet_later += [(v.deal, step.due) for step in later]
+        sheet_stale += [(v.deal, step.due) for step in stale]
+    today_rows = sort_today(today_rows)
     in_today = {r.deal for r in today_rows}
 
     # Deals to move: prospects and pilots this founder owns, active or with something pressing.
@@ -751,31 +1059,53 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
 
     action_views = {}
     reminders = {}
+    quiet_reminders: set[str] = set()   # deals whose only material is a reminder, even on a day none is printed
     for deal, v in mine.items():
         for w in waits_by_deal.get(deal, []):
             v = _without_waiting_action(v, w)
-        action_views[deal], reminders[deal] = _split_followups(v, today, used)
+        action_views[deal], reminders[deal], pending = _split_followups(v, today, used, cadence,
+                                                                        has_wait=bool(waits_by_deal.get(deal)))
+        if pending:
+            quiet_reminders.add(deal)
 
     highlight_views = []
     followup_only = set()
+    dated_only = set()
+    today_only = set()
+    sheet_dated = {r.deal for r in today_rows if r.tag == "Sheet date"} | {deal for deal, _ in sheet_later}
     primary_moves = {}
     for original in eligible:
         v = action_views[original.deal]
         move = primary_move(v, today, used)
-        has_reminder = bool(waits_by_deal.get(v.deal) or reminders[v.deal])
+        has_reminder = bool(waits_by_deal.get(v.deal) or reminders[v.deal] or v.deal in quiet_reminders)
         proposal_only = move.tag == "Confirm status" and any(i.kind == "proposed" for i in original.items)
         # A generic fallback would give a follow-up-only deal a highlight slot.
         if proposal_only or (has_reminder and move.tag in ("Confirm status", "Clarify next action")):
             followup_only.add(v.deal)
             continue
+        # The founder already dated this deal's next step in the Sheet: no "check where this stands" on top of it.
+        if move.tag == "Confirm status" and v.deal in sheet_dated:
+            dated_only.add(v.deal)
+            continue
+        # A deal whose one open thing is already in Needs you today has nothing left for a second row.
+        if move.tag == "Confirm status" and v.deal in in_today:
+            today_only.add(v.deal)
+            continue
         primary_moves[v.deal] = move
         highlight_views.append(v)
 
-    selected, audit = select_deals(highlight_views, today, in_today, critical_ahead, in_talks_target)
+    selected, audit = select_deals(highlight_views, today, in_today, critical_ahead, in_talks_target,
+                                   slots=min(MAX_HIGHLIGHTS, max_rows))
     for v in sorted(owned, key=lambda v: v.deal):  # the audit also explains prospects that were not eligible at all
         if v.deal in followup_only:
             audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
                                          "not eligible: waiting or follow-up with no separate next move"))
+        elif v.deal in dated_only:
+            audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
+                                         "not eligible: its next step is dated in the Sheet and nothing else is open"))
+        elif v.deal in today_only:
+            audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
+                                         "not eligible: already in Needs you today and nothing else is open"))
         elif v.rank in PROSPECT_RANKS and v not in eligible:
             status = deal_status(v, today)
             audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
@@ -808,13 +1138,27 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
                     i.kind in ("customer_request", "next_step") and i.bucket not in ("stale", "old_undated")):
                 if not v.unanswered or i.id != v.unanswered.item_id:
                     follow.append(recorded_move(i, f"{v.deal}: {i.text}"))
-    follow_shown = follow[:MAX_FOLLOWUPS]
+    follow_shown = follow[:min(MAX_FOLLOWUPS, max_rows)]
     used |= {m.item_id for m in follow_shown if m.item_id}
 
     # Status to confirm: owned prospects/pilots not shown whose last record is 15-45 days old (or missing).
-    unclear = sorted((v for v in owned if v.rank in PROSPECT_RANKS and v.deal not in shown
+    unclear = sorted((v for v in owned if v.rank in PROSPECT_RANKS and v.deal not in shown and v.deal not in sheet_dated
                       and deal_status(v, today) == "unclear"), key=lambda v: (-(v.rank or 0), v.deal))
-    dormant = sum(1 for v in owned if v.rank in PROSPECT_RANKS and v.deal not in shown and deal_status(v, today) == "dormant")
+    dormant = sum(1 for v in owned if v.rank in PROSPECT_RANKS and v.deal not in shown and v.deal not in sheet_dated
+                  and deal_status(v, today) == "dormant")
+
+    # Quiet In Talks deals come back in small batches (founders, 11/12: "if it is In Talks it should appear
+    # somewhere, but not 70 emails in one day"): owned, In Talks, no recorded contact in over two weeks (or none
+    # at all), and not already in this section. Longest-untouched first; a deal listed in the last cooldown
+    # period waits its turn, so the batch moves through the list instead of repeating.
+    busy = (shown | in_today | sheet_dated | set(waits_by_deal)
+            | {m.deal or m.text.split(":", 1)[0] for m in follow_shown}
+            | {m.deal for m, _ in meetings if m.deal})     # meeting it today or tomorrow is not "quiet"
+    quiet = sorted((v for v in owned if v.rank == IN_TALKS_RANK and v.deal not in busy
+                    and deal_status(v, today) != "active"), key=lambda v: (v.last_contact or date.min, v.deal))
+    resurfaced = [v for v in quiet if v.deal not in resurfaced_recently][:max(0, resurface)]
+    unclear = [v for v in unclear if v not in resurfaced]
+    dormant -= sum(1 for v in resurfaced if deal_status(v, today) == "dormant")   # named above, not counted again
 
     # Backlog: everything else still open, summarized; individual items only for promised deadlines to active deals.
     rest = [i for v in mine.values() for i in v.items if i.id not in used and i.bucket in ("stale", "old_undated")]
@@ -831,12 +1175,91 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
     return Section(code, name, short, today_rows, highlights, [r.deal for r in audit if r.position is None
                                                                 and not r.reason.startswith("not eligible")],
                    meetings, follow_shown, [], len(follow) - len(follow_shown), unclear, dormant, b,
-                   hidden, routed, audit, waiting=waiting, more_waiting=more_waiting)
+                   hidden, routed, audit, waiting=waiting, more_waiting=more_waiting,
+                   sheet_later=sorted(sheet_later, key=lambda pair: pair[1]),
+                   sheet_stale=sorted(sheet_stale, key=lambda pair: pair[1]),
+                   held=sum(v.held for v in mine.values()), resurfaced=resurfaced,
+                   quiet_in_talks=len(quiet) if resurface > 0 else 0,
+                   left={"waiting": list(left_waiting or []),
+                         "followups": [m.deal or m.text.split(":", 1)[0] for m in follow[len(follow_shown):]]})
+
+
+# ---------------------------------------------------------------- meeting prep (pure)
+
+RESPONSES = {"accepted": "accepted", "declined": "declined", "tentative": "tentative", "needsAction": "not yet answered"}
+PREP_LABELS = {"AI recommendation": "Suggested", "Follow up": "Follow up"}
+
+
+def _guest_line(guests: list[dict]) -> str:
+    """Who from outside Bianca is on the invite and whether they said yes."""
+    if not guests:
+        return ""
+    name = lambda g: g.get("name") or g["address"]
+    if all(g.get("response") == "declined" for g in guests):
+        who = name(guests[0]) + (f" +{len(guests) - 1}" if len(guests) > 1 else "")
+        return f"{who} declined the invite - confirm it is still on"
+    lead = next((g for g in guests if g.get("response") == "accepted"), guests[0])
+    answer = RESPONSES.get(lead.get("response") or "")
+    return f"With {name(lead)}" + (f" ({answer})" if answer else "") + (f" +{len(guests) - 1}" if len(guests) > 1 else "")
+
+
+def meeting_prep(meeting: Meeting, section: "Section", view: DealView | None, today: date, *, checked: bool = False) -> str:
+    """One prep line per meeting, from what the brief already knows. Never blank for a meeting tied to a deal.
+
+    Order: who is coming, then the most pressing thing on record for the deal - a row this brief already shows
+    for it (Needs you today, Deals to move, Waiting, Follow-ups), else the deal's open ask, blocker or suggestion,
+    else its summary, else when we were last in touch. With checked=True (a verified build) only rows that passed
+    the pre-send check and plain facts are used. A meeting with no pipeline deal says so and names the guest.
+    """
+    guests = _guest_line(meeting.guests)
+    if not meeting.deal:
+        return ". ".join(x for x in (guests, "No pipeline deal matched - check who this is with") if x) + "."
+    deal, context = meeting.deal, ""
+    for row in section.today:
+        if row.deal == deal:
+            context = f"{row.tag}: {row.text}"
+            break
+    if not context:
+        for v, move, note in section.highlights:
+            if v.deal != deal:
+                continue
+            if move.tag in ("Confirm status", "Clarify next action"):
+                context = f"Open issue: {note.text}" if note else ""
+            else:
+                context = f"{PREP_LABELS.get(move.tag, move.tag)}: {move.text}"
+            break
+    if not context:
+        wait = next((w for w in section.waiting if w.deal == deal), None)
+        if wait:
+            context = f"Waiting on their reply since {_date(wait.sent)}" + (f": {wait.action}" if wait.action else "")
+    if not context:
+        follow = next((m for m in section.followups if (m.deal or m.text.split(":", 1)[0]) == deal), None)
+        if follow:
+            context = follow.text.split(":", 1)[-1].strip() if follow.text.startswith(f"{deal}:") else follow.text
+    if not context and view is not None:
+        if view.unanswered and view.unanswered.action and not checked:
+            context = f"Customer asked: {view.unanswered.action}"
+        elif view.blocker and view.blocker.verified:
+            context = f"Open issue: {view.blocker.text}"
+        elif view.recommendation and view.recommendation.verified and not checked:
+            context = f"Suggested: {view.recommendation.text}"
+        elif view.sheet_next:
+            context = f"Sheet next step: {view.sheet_next}"
+        elif view.summary and view.summary.verified:
+            context = first_or_blank(view.summary.text)
+    if not context:
+        last = view.last_contact if view else None
+        context = (f"No open item on record - last contact {_date(last)}" if last
+                   else "No open item or earlier contact on record for this deal")
+    matched = f" (deal matched by guest domain {meeting.matched_by})" if meeting.matched_by else ""
+    context = context.rstrip()
+    lead = f"{guests}. " if guests else ""
+    return f"{lead}{context}{'' if context.endswith(('.', '!', '?')) else '.'}{matched}"
 
 
 # ---------------------------------------------------------------- rendering
 
-TAG_COLOR = {"Due now": RED, "Reply needed": BLUE, "We owe": INK, "Customer asked": BLUE,
+TAG_COLOR = {"Due now": RED, "Sheet date": RED, "Reply needed": BLUE, "We owe": INK, "Customer asked": BLUE,
              "Next step noted": BLUE, "AI recommendation": PURPLE, "Follow up": AMBER, "Confirm status": MUTED,
              "Clarify next action": AMBER}
 
@@ -900,6 +1323,11 @@ def _table(head: str, rows: list[str]) -> str:
             f"<tr>{head}</tr>{''.join(rows)}</table>")
 
 
+def _left_out(text: str) -> str:
+    """The line under a table that says how many rows it does not show."""
+    return f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">{_e(text)}</p>'
+
+
 def _src(source: str | None) -> str:
     """Where a row comes from and when, as plain text: "Email · Oct 6", "Notes · Sep 28"."""
     return f'<span style="white-space:nowrap">{_muted(_e(source))}</span>' if source else _muted("—")
@@ -956,7 +1384,7 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, 
     done_td = (lambda ref: _td(_done(ref, action_url))) if action_url else (lambda ref: "")
     out = [f'<p style="margin:24px 0 0;padding:6px 10px;background:#f2f4f7;border-left:3px solid {BLUE};'
            f'font:600 14px {FONT};color:{INK}">{_e(s.name)}</p>']
-    out.append(_h("Needs you today", RED, len(s.today)))
+    out.append(_h("Needs you today", RED, len(s.today) + s.more_today))
     out.append(_table(_th("Deal", "20%") + _th("What") + _th("When", "13%") + _th("Source", "12%") + done_th,
                       ["<tr>" + _td(_deal_cell(r.deal, r.stage))
                        + _td(f"{_tag(r.tag)} {_e(display(_what_text(r)))}") + _td(_muted(_e(r.when))) + _td(_src(r.source))
@@ -977,7 +1405,7 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, 
     else:
         out.append(_empty("No active prospect or pilot needs attention."))
     if s.also_active:
-        out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">Also active: {_e(", ".join(s.also_active))}</p>')
+        out.append(_left_out(more_line(len(s.also_active), "active in the Sheet", s.also_active)))
 
     if s.waiting:
         out.append(_h("Waiting on their reply", AMBER, len(s.waiting) + s.more_waiting))
@@ -986,19 +1414,28 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, 
                            + _td(_muted(_e(f"{w.days}d since {_date(w.sent)}"))) + _td(_src(w.source))
                            + done_td(f"thread:{w.thread_id}" if w.thread_id else None) + "</tr>" for w in s.waiting]))
         if s.more_waiting:
-            out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">+ {s.more_waiting} more on record</p>')
+            out.append(_left_out(more_line(s.more_waiting, "in the Sheet waiting on a reply", s.left.get("waiting", []))))
 
-    out.append(_h("Meetings today & tomorrow", BLUE, len(s.meetings)))
+    out.append(_h("Meetings today & tomorrow", BLUE, len(s.meetings) + s.more_meetings))
     out.append(meetings_table(s.meetings, display=display) if s.meetings else _empty("No customer meetings today or tomorrow."))
+    if s.more_meetings:
+        out.append(_left_out(more_line(s.more_meetings, "on your calendar", s.left.get("meetings", []))))
 
     if s.followups:
         out.append(_h("Follow-ups that may be needed", AMBER, len(s.followups) + s.more_followups))
         lines = "".join(f'<p style="margin:3px 0;font:13px/1.4 {FONT};color:{INK}">{_tag(m.tag)} {_e(display(_move_text(m)))} '
                         f'{_muted(_e(m.when + (" · " + m.source if m.source else "")))} {_done(m.done, action_url)}</p>'
                         for m in s.followups)
-        more = (f'<p style="margin:3px 0;font:12px {FONT};color:{MUTED}">+ {s.more_followups} more on record</p>'
+        more = (f'<p style="margin:3px 0;font:12px {FONT};color:{MUTED}">'
+                f'{_e(more_line(s.more_followups, "on record", s.left.get("followups", [])))}</p>'
                 if s.more_followups else "")
         out.append(lines + more)
+
+    if s.resurfaced:
+        out.append(_h(f"Quiet In Talks deals to revisit ({len(s.resurfaced)} of {s.quiet_in_talks})", MUTED))
+        out.append("".join(f'<p style="margin:3px 0;font:13px/1.4 {FONT};color:{INK}"><b>{_e(v.deal)}</b> '
+                           f'{_muted(_e(quiet_line(v, today)))}</p>' for v in s.resurfaced))
+        out.append(_left_out(RESURFACE_NOTE))
 
     notes = []
     if s.unclear:
@@ -1022,9 +1459,41 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, 
         notes.append(f"{b.delegated} item(s) on your deals name someone else (delegated).")
     if s.hidden:
         notes.append(f"{s.hidden} item(s) hidden: later emails/notes suggest they were done.")
+    notes += [(f"<b>{_e(label)}</b> " if label else "") + _e(text) for label, text in sheet_footers(s, today)]
     if notes:
         out.append("".join(f'<p style="margin:6px 0 0;font:12px/1.5 {FONT};color:{MUTED}">{n}</p>' for n in notes))
     return "".join(out) + verification_html(s.verification)
+
+
+def sheet_footers(s: Section, today: date) -> list[tuple[str, str]]:
+    """(label, text) for the lines about dated Sheet steps that are not rows today; the same in HTML and text."""
+    out = []
+    if s.sheet_stale:
+        names = ", ".join(f"{deal} ({_long_date(due, today)})" for deal, due in s.sheet_stale[:MAX_NAMES])
+        more = f" +{len(s.sheet_stale) - MAX_NAMES} more" if len(s.sheet_stale) > MAX_NAMES else ""
+        out.append(("Sheet dates long past:", f"{names}{more} - update the Next step in the Sheet or move the deal "
+                                              f"to Paused."))
+    if s.sheet_later:
+        deal, due = s.sheet_later[0]
+        held = f" ({s.held} matching item(s) held back until then)" if s.held else ""
+        out.append(("", f"{len(s.sheet_later)} dated Sheet step(s) not due yet{held}; next: {deal}, "
+                        f"{_long_date(due, today)}. Each comes back in Needs you today on its date."))
+    return out
+
+
+RESURFACE_NOTE = ("A few each day, longest-untouched first. For each: email them, set a date in the Sheet's Next step, "
+                  "or move the deal to Paused.")
+
+
+def quiet_line(v: DealView, today: date) -> str:
+    """What we know about a quiet deal: how long since the last recorded contact, and the Sheet's own next step."""
+    last = (f"last contact {_date(v.last_contact)} ({elapsed((today - v.last_contact).days)} ago)" if v.last_contact
+            else "no email, meeting or note on record")
+    return last + (f" · Sheet next step: {first_sentence(v.sheet_next, 110)}" if v.sheet_next else "")
+
+
+def _long_date(d: date, today: date) -> str:
+    return _date(d) if d.year == today.year else f"{_date(d)}, {d.year}"
 
 
 def change_label(c: ChangeRow) -> str:
@@ -1053,9 +1522,10 @@ def completable(sections: list[Section], ndl_rows: list[TodayRow]) -> dict[str, 
 
 def render(sections: list[Section], ndl_rows: list[TodayRow], changes: list[ChangeRow], today: date,
            active_deals: int, coverage: str, nico_gap: bool, backfill: str | None = None, action_url=None,
-           ndl_review: VerificationNotes | None = None, *, display=read_table_text) -> str:
+           ndl_review: VerificationNotes | None = None, *, display=read_table_text, more_changes: int = 0,
+           left_changes=()) -> str:
     """action_url(ref) -> link for a row's "Mark as complete" button; None leaves the buttons out."""
-    counts = " · ".join(f"{s.short}: {len(s.today)} today, {len(s.highlights)} deals" for s in sections)
+    counts = " · ".join(f"{s.short}: {len(s.today) + s.more_today} today, {len(s.highlights)} deals" for s in sections)
     out = [_stage_css(), f'<div class="bianca-brief" style="max-width:760px;margin:0 auto;padding:8px 4px">',
            f'<p style="font:600 18px {FONT};margin:0 0 2px;color:{INK}">Pipeline brief · {_e(f"{today:%a}, {today:%b} {today.day}")}</p>',
            f'<p style="font:13px {FONT};margin:0;color:{MUTED}">{_e(counts)} · {active_deals} deals in the Sheet</p>']
@@ -1070,12 +1540,14 @@ def render(sections: list[Section], ndl_rows: list[TodayRow], changes: list[Chan
                                + _td(_muted(_e(r.when))) + _td(_src(r.source))
                                + (_td(_done(r.done, action_url)) if action_url else "") + "</tr>" for r in ndl_rows]))
         out.append(verification_html(ndl_review))
-    out.append(_h("What changed since the last brief", MUTED, len(changes)))
+    out.append(_h("What changed since the last brief", MUTED, len(changes) + more_changes))
     out.append(_table(_th("Deal", "20%") + _th("What changed (from the source)") + _th("Source", "12%"),
                       ["<tr>" + _td(f"<b>{_e(c.deal)}</b>")
                        + _td(f"{_e(display(_change_text(c)))} {_muted(_e(change_label(c)))}")
                        + _td(_src(f"{c.source} · {_date(c.event)}" if c.event else c.source)) + "</tr>" for c in changes])
                 if changes else _empty("No notable changes."))
+    if more_changes:
+        out.append(_left_out(more_line(more_changes, "changes on record, not shown", left_changes)))
     if backfill:
         out.append(f'<p style="margin:6px 0 0;font:12px {FONT};color:{MUTED}">{_e(backfill)}</p>')
     out.append(f'<p style="font:11px {FONT};color:#98a2b3;margin-top:28px">{_e(coverage)} <b>We owe</b> = recorded '
@@ -1084,7 +1556,7 @@ def render(sections: list[Section], ndl_rows: list[TodayRow], changes: list[Chan
 
 
 def subject(sections: list[Section], today: date) -> str:
-    bits = [f"{s.short} {len(s.today)} today, {len(s.highlights)} deals" for s in sections]
+    bits = [f"{s.short} {len(s.today) + s.more_today} today, {len(s.highlights)} deals" for s in sections]
     return f"Bianca pipeline · {today:%a}, {today:%b} {today.day} · " + " · ".join(bits)
 
 
@@ -1092,20 +1564,33 @@ def plain_text(sections: list[Section], today: date, ndl_review: VerificationNot
                display=read_table_text) -> str:
     lines = [f"Pipeline brief · {today:%a}, {today:%b} {today.day}"]
     for s in sections:
-        lines.append(f"\n{s.name.upper()}\nNeeds you today ({len(s.today)})")
+        lines.append(f"\n{s.name.upper()}\nNeeds you today ({len(s.today) + s.more_today})")
         lines += [f"• [{r.tag}] {r.deal} — {display(_what_text(r))} ({r.when})" for r in s.today]
         lines.append("Deals to Move")
         lines += [f"• {v.deal} ({stage_short(v.stage)}): [{m.tag}] {display(_move_text(m))} ({m.when})"
                   for v, m, _ in s.highlights]
+        if s.also_active:
+            lines.append(more_line(len(s.also_active), "active in the Sheet", s.also_active))
         if s.waiting:
             lines.append(f"Waiting on their reply ({len(s.waiting) + s.more_waiting})")
             lines += [f"• {w.deal}: {display(_waiting_text(w))} ({w.days}d since {_date(w.sent)})" for w in s.waiting]
+            if s.more_waiting:
+                lines.append(more_line(s.more_waiting, "in the Sheet waiting on a reply", s.left.get("waiting", [])))
         if s.meetings:
             lines.append("Meetings today & tomorrow")
             lines += [f"• {m.at:%a %H:%M} {title} — {prep}" for m, title, prep in meeting_text_rows(s.meetings, display)]
+            if s.more_meetings:
+                lines.append(more_line(s.more_meetings, "on your calendar", s.left.get("meetings", [])))
         if s.followups:
             lines.append(f"Follow-ups that may be needed ({len(s.followups) + s.more_followups})")
             lines += [f"• [{m.tag}] {display(_move_text(m))} ({m.when})" for m in s.followups]
+            if s.more_followups:
+                lines.append(more_line(s.more_followups, "on record", s.left.get("followups", [])))
+        if s.resurfaced:
+            lines.append(f"Quiet In Talks deals to revisit ({len(s.resurfaced)} of {s.quiet_in_talks})")
+            lines += [f"• {v.deal} - {quiet_line(v, today)}" for v in s.resurfaced]
+            lines.append(RESURFACE_NOTE)
+        lines += [f"{label} {text}".strip() for label, text in sheet_footers(s, today)]
         lines.extend(verification_text(s.verification))
     if ndl_review and (ndl_review.waiting or ndl_review.unclear):
         lines += ["\nNICO DE LEÓN", *verification_text(ndl_review)]
@@ -1122,7 +1607,13 @@ def to_payload(sections: list[Section], ndl_rows: list[TodayRow], changes: list[
         return {"tag": m.tag, "text": m.text, "when": m.when, "item_id": m.item_id}
     return {"version": "v2", "sections": [{
         "owner": s.code,
-        "today": [{"deal": r.deal, "tag": r.tag, "text": r.text, "when": r.when, "item_id": r.item_id} for r in s.today],
+        "today": [{"deal": r.deal, "tag": r.tag, "text": r.text, "when": r.when, "item_id": r.item_id,
+                   "source": r.source} for r in s.today],
+        "more_today": s.more_today, "more_meetings": s.more_meetings,
+        "resurfaced": [{"deal": v.deal, "last_contact": v.last_contact} for v in s.resurfaced],
+        "quiet_in_talks": s.quiet_in_talks,
+        "sheet_later": [{"deal": deal, "due": due} for deal, due in s.sheet_later],
+        "sheet_stale": [{"deal": deal, "due": due} for deal, due in s.sheet_stale],
         "highlights": [{"deal": v.deal, "stage": v.stage, "situation": sit.text if sit else None, "move": move(m)}
                        for v, m, sit in s.highlights],
         "selection_audit": [{"deal": r.deal, "stage": r.stage, "selected": r.selected, "position": r.position,

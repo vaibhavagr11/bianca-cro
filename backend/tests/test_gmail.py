@@ -188,3 +188,72 @@ def test_gmail_payload_defaults_to_ramiros_inbox():
     from app.ingest import GmailPayload
     assert GmailPayload(messages=[]).mailbox == "RG"
     assert GmailPayload(messages=[], mailbox="NC").mailbox == "NC"
+
+
+# ---- finding 12 (11/09 evals): a meeting cancelled after the calendar fetch was still listed as scheduled
+
+def test_cancellation_notices_give_the_meeting_title_and_day():
+    from datetime import date
+
+    from app.gmail import cancellation_notices
+
+    sent = "2026-11-11T12:40:00.000Z"
+    batch = [
+        msg(id="n1", subject="Canceled event: Bianca <> Campari @ Wed Nov 11, 2026 3pm - 3:30pm (ART) (ramiro@bianca-ai.com)"),
+        msg(id="n2", subject="Cancelled event with note: Demo: Andina @ Thu Nov 12, 2026 10am - 10:30am (GMT-3) (x@y.com)"),
+        msg(id="n3", subject="Evento cancelado: Reunión Arcor @ jue 12 nov 2026 15:00 - 15:30 (ART) (x@y.com)"),
+        msg(id="n4", subject="Canceled event: Weekly sync @ Weekly on Monday (ramiro@bianca-ai.com)"),   # no single day
+        msg(id="n5", subject="Accepted: Gus <> Ramiro @ Thu Oct 22, 2026 12pm - 1pm (GMT-3)"),
+        msg(id="n6", subject="Re: Canceled event question"),
+    ]
+    for message in batch:
+        message["date"] = sent
+        assert message["id"] == "n6" or skip_reason(message, INTERNAL, PROJECT, set()) == "automated"  # never stored
+    assert cancellation_notices(batch) == [
+        ("Bianca <> Campari", date(2026, 11, 11), sent),
+        ("Demo: Andina", date(2026, 11, 12), sent),
+        ("Reunión Arcor", date(2026, 11, 12), sent),
+    ]
+
+
+def test_gmail_ingest_marks_the_stored_meeting_cancelled_only_for_a_notice_newer_than_the_calendar_sync(monkeypatch):
+    from contextlib import nullcontext
+    from datetime import date
+
+    from fastapi.testclient import TestClient
+
+    from app import ingest
+    from app.main import app
+
+    updates = []
+
+    class Connection:
+        rowcount = 1
+
+        def execute(self, sql, params=()):
+            if sql.startswith("update source_records r set meta"):
+                assert "max(started_at) from sync_runs" in sql and "source = 'calendar'" in sql
+                assert "lower(btrim(r.subject)) = lower(%s)" in sql and sql.count("%s") == len(params)
+                updates.append(params)
+            self.counting = sql.startswith("select count(*) from source_records r")
+            return self
+
+        def fetchone(self):
+            return (1,) if self.counting else (["bianca-ai.com"],)     # one stored meeting has that title and day
+
+        def commit(self):
+            pass
+
+        def transaction(self):
+            return nullcontext()
+
+    monkeypatch.setattr(ingest.db, "connect", lambda: nullcontext(Connection()))
+    monkeypatch.setattr(ingest, "_workspace_id", lambda conn: "workspace")
+    monkeypatch.setattr(ingest, "_start_sync", lambda *args, **kwargs: "run")
+    notice = msg(id="n1", subject="Canceled event: Bianca <> Campari @ Wed Nov 11, 2026 3pm - 3:30pm (ART) (r@bianca-ai.com)")
+    response = TestClient(app).post("/ingest/gmail", json={"messages": [notice, msg(id="m2")], "mailbox": "RG"},
+                                    headers={"X-Ingest-Token": "test-token"})
+    assert response.status_code == 200 and response.json()["meetings_cancelled"] == 1
+    [params] = updates
+    assert params[0].obj == {"status": "cancelled", "cancelled_by": "mail notice", "cancelled_at": notice["date"]}
+    assert params[2:5] == ("Bianca <> Campari", "workspace", date(2026, 11, 11))
