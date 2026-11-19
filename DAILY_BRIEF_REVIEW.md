@@ -126,3 +126,35 @@ Documented limits (accepted, not fixed):
 - The plain-text part has no "What changed" table (it never had one).
 
 Tests: `cd backend && uv run pytest -q` (847 passed, 13 skipped, which need a local test database). The review's tests are in [test_brief_review_1117.py](backend/tests/test_brief_review_1117.py), the decisions' in [test_brief_decisions_1117.py](backend/tests/test_brief_decisions_1117.py). The end-to-end fixture is [test_brief_fixture_1117.py](backend/tests/test_brief_fixture_1117.py); run it with `BRIEF_FIXTURE_HTML=<path>` to save the rendered email.
+
+## Waiting reply descriptions reviewed November 19, 2026
+
+This review uses master `77af7d5368bb098b1e442a3f54f83d9971942af2`. PR #3 merged on November 9 as `548549b64e685de2306cc2f0f518b6632937174c`. The follow-up change renames the visible waiting-table header to **Who / Status** and checks that rendered header in the existing test. The behavioral changes below are proposals for the main developer's review.
+
+### Why the ellipsis still appears
+
+`waiting_text()` in [brief_v2.py](backend/app/brief_v2.py) composes recipient, status, and the requested response. It first calls `first_sentence(w.action)`, which cuts the action at 95 characters and adds an ellipsis. `_waiting_text()` then sends the already-shortened combined description to the 160-character display layer. `read_table_text()` passes through any input at or below 160 characters, including an ellipsis added earlier.
+
+A local synthetic example reproduced the failure with a 117-character action. The resulting cell was only 129 characters and ended mid-sentence. Its original action was still intact in the `Waiting` object. The issue therefore occurs even when the final cell satisfies the 160-character limit. The existing whole-table test uses a waiting row without an action and did not exercise this path.
+
+For longer combined descriptions, the current waiting field requires the exact status string and offers `Waiting for their reply · {status}` as its explicit fallback. That usually fits, but omits both recipient and requested response. The general fallback in [brief_text.py](backend/app/brief_text.py) can also cut text and add an ellipsis if no valid field fallback exists. Verified builds pass `client=None` to display preparation and take deterministic paths. Current merged code deliberately favors delivering a brief, as documented in the November 17 release decisions above.
+
+The published Morning brief n8n workflow inspected during this review calls v2 without a verification parameter, which the repository currently defaults to `off`. Its Gmail node sends the returned HTML directly. No downstream slicing was found in that published workflow. The workflow draft differs from its published version. This inspection establishes the published configuration, not today's exact execution or the deployed backend revision. [Morning brief workflow](https://bianca-cro.app.n8n.cloud/workflow/eO6EAf1mGbcigS7o)
+
+### Suggested implementation
+
+1. Assemble the waiting description from the complete `Waiting.to`, structured status, and complete `Waiting.action`. Remove the display-time call to `first_sentence(w.action)`. Let the combined description pass through the 160-character preparation once. Account for separators in the total.
+2. Rewrite the whole description when it exceeds 160 characters, preserving who is expected to answer, the requested response, lack of a reply, out-of-office state, and any follow-up or Paused recommendation. Protect those status facts structurally, and allow concise equivalent wording instead of requiring the entire verbose status string verbatim. Provide existing recipient identity as context and avoid inventing a shorter identity from a long name or email address.
+3. Decide how the verified path obtains the same concise text. It currently skips the model. If AI shortening is introduced there, generate only after the final rows survive verification and persist or cache the approved display result by build ID and source content digest. Repeated polling should reuse it. Include a changed source or prompt version in invalidation. Keep verified action/evidence separate from display wording.
+4. Define a waiting-specific fallback that remains complete and within 160 characters when the model is unavailable, invalid, over budget, or skipped. Prefer a concise recipient/status plus a complete request when it fits. If all essential facts cannot fit, retain the structured status and an explicit pointer such as `Request details in source`. Give that pointer a usable authorized source link when one exists. Current Source cells are plain labels, so a link requires a deliberate renderer change. This fallback preserves source evidence but carries less inline context. Have the release owner accept that tradeoff while preserving the policy that optional wording work cannot prevent the morning send.
+5. Keep the full source action wording in `payload.sections[].waiting[].action` and preserve `Waiting.evidence` for verification. The current waiting payload does not serialize that evidence set; adding an archived evidence field would be a separate, backward-compatible enhancement. Derive the display value separately and reuse it in HTML and plain text. Completion targets must remain `thread:{thread_id}`. Prefer a separate display composer because `completable()` currently reuses `waiting_text()` for its preview label. Changing that shared helper would also change the preview wording. The separate signing code still limits its preview to 120 characters. Explicitly test that behavior and avoid substituting a model summary for an action ID.
+
+The header-only change deliberately retains the internal `TableText.kind` spelling `Who · status`, since the validator recognizes that kind. If the developer also renames the internal kind, update its validation exception and tests together.
+
+### Regression coverage for the proposed behavior
+
+- Exercise full action lengths of 94, 95, and 96 characters and combined recipient/status/action lengths of 159, 160, and 161. Short complete inputs should retain their wording with no generated ellipsis.
+- Include long recipient names and email addresses, missing actions, multiple action sentences, out-of-office replies, weekly nudges, and Paused suggestions. Check the complete visible description length after decoding HTML entities.
+- Exercise valid model output, invalid/missing output, model failure, batch overflow, and the verified no-client path. Every accepted waiting description should fit and communicate a complete thought.
+- Assert equivalent HTML/plain-text wording, full raw action wording in the payload, unchanged evidence IDs on `Waiting`, stable thread completion targets, and the requested **Who / Status** heading.
+- Preview against the deployed backend revision using approved examples, then inspect a test n8n execution. Confirm the workflow sends the returned HTML and that no stale stored build is substituted. This review did not execute a workflow, read today's production brief archive, or send an email.
