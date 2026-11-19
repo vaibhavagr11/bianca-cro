@@ -9,6 +9,7 @@ import anthropic
 from pydantic import BaseModel
 
 TABLE_TEXT_LIMIT = 160
+WAITING_TEXT_KIND = "Who / Status"
 MAX_BATCH_FIELDS = 32
 MAX_BATCH_CHARS = 24_000
 
@@ -37,6 +38,8 @@ Use a complete sentence for prose and a short, accurate label for titles and ide
 cut off a phrase, or invent facts. Omit an ID if you cannot produce a faithful shorter version.
 For a situation preserve the current state and blocker. For an action preserve who owes what and when.
 For a change or waiting status preserve what happened, who acted or is waiting, and any meaningful timing.
+For Who / Status, keep the complete required status, recipient and requested response. If the full recipient
+cannot fit, use Customer rather than inventing a shortened identity. Never make a waiting request sound completed.
 If only a subject or title is recorded, describe the topic without inferring an outcome or a new action.
 For a meeting preserve the topic and relevant participant or preparation. Keep names, dates, numbers,
 negation, and uncertainty accurate. Do not make a proposal or possibility sound confirmed."""
@@ -49,6 +52,9 @@ _ABBREVIATIONS = frozenset(
 _SENTENCE_END = re.compile(r"[.!?]+[\"'”’)\]]*(?=\s|$)")
 _OPENERS, _CLOSERS = "([{“‘", ")]}”’"
 _TOKEN_LOOKBACK = 40
+_DANGLING_WAITING_END = re.compile(
+    r"\b(?:a|an|the|and|or|but|by|for|to|with|from|of|at|in|on|before|after|until|because|if|"
+    r"without|is|are|was|were|should|would|could|must|will|can|has|have|not)[.!?]+[\"'”’)\]]*$", re.I)
 
 
 def _ends_sentence(text: str, start: int, end: int) -> bool:
@@ -116,8 +122,10 @@ def _valid_shortening(field: TableText, text: str) -> bool:
         return False
     if any(not re.search(rf"(?<!\w){re.escape(fact)}(?!\w)", text, re.IGNORECASE) for fact in field.required):
         return False
-    if field.kind == "Situation" and not _balanced(text):
+    if field.kind in ("Situation", WAITING_TEXT_KIND) and not _balanced(text):
         return False            # a state cut inside a quote, e.g. "is in '2."
+    if field.kind == WAITING_TEXT_KIND and _DANGLING_WAITING_END.search(text):
+        return False            # adding a period to "confirm the plan by" does not complete the request
     original = " ".join(field.text.split()).casefold()
     shorter = text.casefold()
     if original == shorter or not original.startswith(shorter.rstrip(".!?")):
@@ -183,12 +191,16 @@ def cut_table_text(field: TableText) -> str:
 
 
 def read_table_text(field: TableText) -> str:
-    """The field's own text when it fits; else its validated fallback; else a word-boundary cut. Never raises."""
+    """Original text when it fits, else a valid fallback. Waiting never cuts; other fields retain legacy cuts."""
     if len(field.text) <= TABLE_TEXT_LIMIT:
         return field.text
     fallback = (field.fallback or "").strip()
     if _valid_shortening(field, fallback):
         return fallback
+    if field.kind == WAITING_TEXT_KIND:
+        # Waiting descriptions must never reach the generic word-boundary cutter, even if a caller supplies
+        # a malformed fallback. Normal waiting rows provide a more informative, structured fallback.
+        return "Waiting for a reply. See the original email for details."
     return cut_table_text(field)
 
 

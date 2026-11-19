@@ -1,5 +1,7 @@
 # Daily Brief 160-character limit review handoff
 
+This file is a chronological handoff. The PR #3 discussion below describes the original design; later release decisions supersede it. For the current waiting-row fix, see [PR #22 implementation](#waiting-reply-descriptions-fixed-in-pr-22--november-19-2026).
+
 [PR #3](https://github.com/vaibhavagr11/bianca-cro/pull/3) changes how Bianca's Daily Brief displays long table descriptions. This handoff covers the backend change and the checks that require access to the deployed backend, n8n, Supabase, or the Anthropic workspace. The scheduled workflow, production rows, and live model responses were outside the scope of the local verification.
 
 ## What the backend does
@@ -126,3 +128,49 @@ Documented limits (accepted, not fixed):
 - The plain-text part has no "What changed" table (it never had one).
 
 Tests: `cd backend && uv run pytest -q` (847 passed, 13 skipped, which need a local test database). The review's tests are in [test_brief_review_1117.py](backend/tests/test_brief_review_1117.py), the decisions' in [test_brief_decisions_1117.py](backend/tests/test_brief_decisions_1117.py). The end-to-end fixture is [test_brief_fixture_1117.py](backend/tests/test_brief_fixture_1117.py); run it with `BRIEF_FIXTURE_HTML=<path>` to save the rendered email.
+
+## Waiting reply descriptions fixed in PR #22 — November 19, 2026
+
+[PR #22](https://github.com/vaibhavagr11/bianca-cro/pull/22) now includes the actual waiting-description fix, the **Who / Status** heading, tests, and this handoff. It was built from master `77af7d5368bb098b1e442a3f54f83d9971942af2` and PR head `805b8c259b550aa197097d12e26f8e14a09d71d0`. PR #3 merged on November 9 as `548549b64e685de2306cc2f0f518b6632937174c`.
+
+### Root cause and implemented behavior
+
+The old display path called `waiting_text()`, which applied `first_sentence(w.action)` with a 95-character limit. An ellipsis could therefore already exist before the combined recipient/status/request reached the 160-character display layer. A synthetic 117-character request reproduced this; a short final cell could still end mid-sentence.
+
+The new `_waiting_text()` in [brief_v2.py](backend/app/brief_v2.py) composes the complete recipient, original structured status, and full `Waiting.action`. It does not use the completion-preview helper or slice the action. The entire combined description, including separators, spaces, and punctuation, goes through `prepare_table_text()` once. Text at or below 160 characters retains its supplied wording. The limit uses Python Unicode character counts before HTML escaping; markup and the separate Source/Waiting columns are outside that description budget.
+
+Long fields use the existing optional batched Claude request. The input contains the full assembled source wording. A compact status is required verbatim in the rewrite: it preserves the unanswered-email count, the distinction between no reply and silence since an earlier reply, any out-of-office response, and today's follow-up or **consider Paused** recommendation. Elapsed days are already shown in the separate Waiting column. An implausible counter longer than 12 digits is described as `multiple` rather than cutting a number. The prompt preserves recipient identity and the requested response, and permits `Customer` when the full identity cannot fit.
+
+The internal kind is now `Who / Status`, matching the heading. Unlike the legacy `Who · status` kind, generated waiting descriptions require terminal punctuation. Validation also checks the 160-character cap, required status, ellipses, single-line content, balanced quotes/brackets, obvious clipped prefixes, and common dangling final words such as `by.` or `for.`. These are syntactic checks, not a proof of factual or grammatical correctness.
+
+### Complete fallbacks and source access
+
+When AI is absent, times out, returns invalid or missing output, or the field falls outside the existing batch budget, a deterministic fallback:
+
+1. Tries the whole request with the compact status, retaining the full recipient if it fits. It can substitute the whole label `Customer` to fit a complete request; it never invents initials or slices a name/address. The Deal column still identifies the account.
+2. If the full request cannot fit, tries its first complete sentence with the explicit cue `More in email.`. It does not select a later sentence out of context or cut inside a sentence. The cue is included in the same 160-character budget.
+3. Otherwise shows the structured status with `Request details in email.`. A missing/blank request does not get a false omission cue.
+
+Waiting fields never reach `cut_table_text()`. Even an unexpectedly missing or invalid explicit fallback gets a fixed complete source pointer within 160 characters. The normal generated fallback retains the structured status. Existing fallbacks for other table kinds are unchanged.
+
+The waiting Source cell now links to the existing `Waiting.link` when it is a valid HTTPS URL with a hostname, valid port, no credentials, and no whitespace/control characters. The label still says where the row came from and when. HTML escaping is preserved. Plain text uses the identical description and puts the source URL on a separate line. Missing/invalid links remain plain labels; no URL is invented from a completion reference. Email links require the founder to have access to the relevant mailbox.
+
+### Source records and completion references
+
+Display shortening never mutates `Waiting.action`, `Waiting.to`, or `Waiting.evidence`. `payload.sections[].waiting[].action` keeps the full original action string, and the payload contract is unchanged. That action is the existing extracted/expected-response wording; it is not necessarily a verbatim quote from the original email. The evidence IDs remain on `Waiting` for verification and are not newly added to the archived waiting payload.
+
+`completable()` still uses the existing `waiting_text()` preview helper and the exact `thread:{thread_id}` target. Its preview can still use the legacy 95-character action excerpt, and `actions.sign()` still bounds the confirmation preview to 120 characters. Those existing confirmation-label rules are separate from the fixed email table. Tests check the unmodified preview and decode a signed link to confirm the same thread target. No summary becomes an action ID, and this change does not mark anything complete.
+
+### Operational limits and review before merging
+
+- **Verified builds remain deterministic.** `brief_api.py` passes `client=None` when verification is active. They use the complete fallback described above. This PR adds no separate model-call stage, cache, schema migration, setting, or verification/delivery-state change. A full waiting description can now trigger the existing optional batch where the old clipped text fit, so call volume or token use can increase. Non-verified builds retain the existing optional summarizer, model configuration, 10-second SDK timeout, zero retries, 32-field/24,000-input-character batch limits, and 4,096-output-token budget. Full waiting actions can consume more of that existing input budget than the old clipped excerpts.
+- **Bounded text cannot retain every detail of an arbitrary long source.** A fallback may omit the recipient or later request details and explicitly directs the founder to the email. The first-sentence fallback may omit a qualification stated later; the `More in email.` cue is deliberate. Review whether the release owner would prefer only the full-request-or-source-pointer fallback for such rows. Both paths retain the source records and keep optional wording work from preventing the morning send.
+- **Model fidelity still needs review.** Required status is checked, but arbitrary changes to the request, identity, dates, negation, or uncertainty are not semantically verified. Syntactic checks cannot detect every plausible hallucination. Short source inputs pass through as supplied, including any upstream fragments or ellipses; this fix removes display-induced cutting and cannot reconstruct text already missing upstream. Tests use synthetic sources and mocked model responses, not a live-model quality evaluation.
+- **Deployment context is not established by GitHub alone.** The published Morning brief n8n workflow inspected during the review calls v2 without a verification parameter; current repository defaults select `off`. Its Gmail node sends the returned HTML directly, with no downstream slicing found. The draft and published graphs differ. This inspection does not establish today's exact execution, deployed backend revision, environment settings, or production archive contents. No workflow was executed and no email was sent. [Inspected workflow](https://bianca-cro.app.n8n.cloud/workflow/eO6EAf1mGbcigS7o)
+- **Before release**, verify the deployed revision and active n8n graph, render approved long examples with and without the model, inspect both email alternatives, and confirm Source and Done links work in the intended mailbox. Check a staging execution for unchanged HTML handoff and absence of stale stored output. No production Supabase rows or external workflow settings were changed by this work.
+
+### Regression evidence
+
+[Waiting-specific tests](backend/tests/test_waiting_text.py) cover full 117-character requests, the old 94/95/96 cutoff boundary, combined 159/160/161-character descriptions, model output boundaries, incomplete and invalid model output, missing output/provider failure, no-client verified-style preparation, batch overflow and oversized input, long identities, missing requests, reply history/OOO/cadence, complete fallbacks, malformed fallback defense, source URL validation and escaping, HTML/plain-text consistency, unchanged source payload/evidence, and signed completion targets. [V2 table tests](backend/tests/test_brief_v2_text.py) also exercise the new kind and heading in the shared display batch.
+
+Run from `backend`: `python -m pytest -q`. The focused waiting and v2 display files passed **47 tests**. The full backend suite passed **1,011 tests**, with **13 skipped**; `git diff --check` also passed. The first full-suite attempt used an older local environment missing `jwt` and `mcp` and stopped during collection. The successful run used the working Python 3.12 interpreter with the existing sales-connector environment's installed dependencies on `PYTHONPATH`; no dependency or lockfile was changed. A clean environment should install this checkout's declared dependencies before running the command.

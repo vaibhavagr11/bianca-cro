@@ -53,7 +53,7 @@ def test_v2_prepares_every_table_from_full_source_and_renders_the_same_wording()
         note.text: "NDA review is still blocking Bianca from sharing files.",
         move.text: "Send Pablo the revised NDA by Monday.",
         customer.text: "The customer asked Bianca to demonstrate exports.",
-        brief_v2.waiting_text(waiting): "Inés: no reply to our last email, out-of-office received.",
+        brief_v2._waiting_text(waiting).text: "Inés: no reply to our last email; out-of-office received.",
         meeting.title: "Inés’s pilot review",
         prep: "Bring the cost model and confirm the pilot approver.",
         change.text: "The buyer tentatively agreed to review pricing next week.",
@@ -80,11 +80,14 @@ def test_v2_prepares_every_table_from_full_source_and_renders_the_same_wording()
                                     action_url=lambda ref: f"https://example.test/done/{ref}", display=display))
     plain = brief_v2.plain_text(sections, today, display=display)
 
+    assert ">Who / Status</th>" in html
+    assert ">Who · status</th>" not in html
+
     parse.assert_called_once()
     for summary in sources.values():
         assert summary in html
     for text in (short, exact_limit, sources[due.text], sources[move.text], sources[customer.text],
-                 sources[brief_v2.waiting_text(waiting)], sources[meeting.title], sources[prep]):
+                 sources[brief_v2._waiting_text(waiting).text], sources[meeting.title], sources[prep]):
         assert text in plain
     assert short in html and exact_limit in html
     for rendered in (html, plain):

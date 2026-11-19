@@ -10,13 +10,16 @@ import re
 import unicodedata
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
+from urllib.parse import urlsplit
 
 from app.brief import (
     AMBER, BLUE, FONT, INK, MUTED, RED, Meeting, VerificationNotes, _e, _empty, _h, _link, _td, _th,
     meeting_text_fields, meeting_text_rows, meetings_table, stage_short, verification_html, verification_text,
 )
 from app.brief_followups import is_followup_only, is_waiting_only
-from app.brief_text import TableText, first_or_blank, read_table_text, split_sentences
+from app.brief_text import (
+    WAITING_TEXT_KIND, TableText, _valid_shortening, first_or_blank, read_table_text, split_sentences,
+)
 from app.pipeline import is_paused
 
 ACTIVE_DAYS = 14            # last recorded interaction within this = active
@@ -444,7 +447,7 @@ def pick_waiting(waiting: list[Waiting], code: str, limit: int = MAX_TABLE_ROWS)
 
 
 def waiting_text(w: Waiting) -> str:
-    """Who we asked, since when, what came back, and what we asked for (when extraction found it)."""
+    """Legacy completion-preview wording; table display uses the full action in _waiting_text()."""
     action = f" · {first_sentence(w.action)}" if w.action else ""
     return f"To {w.to} · {_waiting_status(w)}{action}"
 
@@ -1353,10 +1356,76 @@ def _move_text(move: Move) -> TableText:
     return TableText(f"Next move ({move.tag})", move.text, required=required)
 
 
-def _waiting_text(waiting: Waiting) -> TableText:
-    status = _waiting_status(waiting)
-    return TableText("Who · status", waiting_text(waiting), required=(status,),
-                     fallback=f"Waiting for their reply · {status}")
+def _compact_waiting_status(w: Waiting) -> str:
+    """Keep the silence, count, OOO and today's recommendation. The Waiting column already carries elapsed days."""
+    count = str(w.nudges)
+    # Corrupt/unbounded counters should not consume the entire cell; never cut a number in half.
+    if len(count) > 12:
+        count = "multiple"
+    if w.replied_before:
+        status = f"{count} emails since their last reply" if w.nudges > 1 else "no reply to our last email"
+    else:
+        status = f"no reply to our {count} emails" if w.nudges > 1 else "no reply yet"
+    bits = [status]
+    if w.auto_reply:
+        bits.append("out-of-office received")
+    if w.nudge:
+        pause = w.pause_after is not None and w.nudges >= w.pause_after
+        bits.append("consider Paused" if pause else "follow up this week")
+    return "; ".join(bits)
+
+
+def _waiting_text(w: Waiting) -> TableText:
+    """Display-only input: no early sentence cut, and a complete fallback for every optional-model outcome.
+
+    Source action, evidence and completion labels are never replaced with the display result. Fallbacks try
+    whole source wording first, then whole leading sentences with an explicit omission cue. If necessary the
+    deal column identifies the customer and the original email carries the full recipient/request details.
+    """
+    text = f"To {w.to} · {_waiting_status(w)}" + (f" · {w.action}" if w.action else "")
+    status = _compact_waiting_status(w)
+    field = TableText(WAITING_TEXT_KIND, text, required=(status,))
+    action = " ".join((w.action or "").split())
+    requests = [action] if action else [""]
+    if action:
+        sentences = split_sentences(action)
+        # Never select a later sentence out of its qualifying context, or build quadratic combinations
+        # from an unexpectedly large source. A first-sentence excerpt always discloses the omission.
+        if len(sentences) > 1 and sentences[0].rstrip("\"'”’)]").endswith((".", "!", "?")):
+            requests.append(f"{sentences[0]} More in email.")
+        requests.append("Request details in email.")
+    for request in requests:
+        for recipient in (f"To {w.to}", "Customer"):
+            candidate = f"{recipient} · {status}" + (f" · {request}" if request else "")
+            if not candidate.rstrip("\"'”’)]").endswith((".", "!", "?")):
+                candidate += "."
+            if _valid_shortening(field, candidate):
+                return replace(field, fallback=candidate)
+    # The structured status is bounded independently of free-form recipient/action text. This last route
+    # also handles an unmatched quote or bracket in a source identity without discarding the waiting facts.
+    fallback = f"{status}." + (" Request details in email." if action else "")
+    return replace(field, fallback=fallback)
+
+
+def _waiting_source_url(w: Waiting) -> str | None:
+    """Only expose an existing, usable HTTPS source link; never invent one from a completion reference."""
+    if not w.link or any(char.isspace() or ord(char) < 32 for char in w.link):
+        return None
+    try:
+        parsed = urlsplit(w.link)
+        host = parsed.hostname or ""
+        if parsed.scheme == "https" and host.strip(".") and not parsed.username and not parsed.password:
+            parsed.port  # validate an explicit port; malformed ports raise ValueError
+            return w.link
+    except ValueError:
+        pass
+    return None
+
+
+def _waiting_source(w: Waiting) -> str:
+    source = _src(w.source or "Email")
+    url = _waiting_source_url(w)
+    return f'<a href="{_e(url)}">{source}</a>' if url else source
 
 
 def _change_text(change: ChangeRow) -> TableText:
@@ -1409,9 +1478,9 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, 
 
     if s.waiting:
         out.append(_h("Waiting on their reply", AMBER, len(s.waiting) + s.more_waiting))
-        out.append(_table(_th("Deal", "20%") + _th("Who · status") + _th("Waiting", "13%") + _th("Source", "12%") + done_th,
+        out.append(_table(_th("Deal", "20%") + _th(WAITING_TEXT_KIND) + _th("Waiting", "13%") + _th("Source", "12%") + done_th,
                           ["<tr>" + _td(_deal_cell(w.deal, w.stage)) + _td(_e(display(_waiting_text(w))))
-                           + _td(_muted(_e(f"{w.days}d since {_date(w.sent)}"))) + _td(_src(w.source))
+                           + _td(_muted(_e(f"{w.days}d since {_date(w.sent)}"))) + _td(_waiting_source(w))
                            + done_td(f"thread:{w.thread_id}" if w.thread_id else None) + "</tr>" for w in s.waiting]))
         if s.more_waiting:
             out.append(_left_out(more_line(s.more_waiting, "in the Sheet waiting on a reply", s.left.get("waiting", []))))
@@ -1573,7 +1642,10 @@ def plain_text(sections: list[Section], today: date, ndl_review: VerificationNot
             lines.append(more_line(len(s.also_active), "active in the Sheet", s.also_active))
         if s.waiting:
             lines.append(f"Waiting on their reply ({len(s.waiting) + s.more_waiting})")
-            lines += [f"• {w.deal}: {display(_waiting_text(w))} ({w.days}d since {_date(w.sent)})" for w in s.waiting]
+            for w in s.waiting:
+                lines.append(f"• {w.deal}: {display(_waiting_text(w))} ({w.days}d since {_date(w.sent)})")
+                if url := _waiting_source_url(w):
+                    lines.append(f"  Source: {w.source or 'Email'} — {url}")
             if s.more_waiting:
                 lines.append(more_line(s.more_waiting, "in the Sheet waiting on a reply", s.left.get("waiting", [])))
         if s.meetings:
