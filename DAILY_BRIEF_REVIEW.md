@@ -1,6 +1,6 @@
 # Daily Brief 160-character limit review handoff
 
-This file is a chronological handoff. The PR #3 discussion below describes the original design; later release decisions supersede it. For the current waiting-row fix, see [PR #22 implementation](#waiting-reply-descriptions-fixed-in-pr-22-november-19-2026).
+This file is a chronological handoff. The PR #3 discussion below describes the original design; later release decisions supersede it. For the current waiting-row fix, see [PR #22 implementation](#waiting-reply-descriptions-fixed-in-pr-22--november-19-2026).
 
 [PR #3](https://github.com/vaibhavagr11/bianca-cro/pull/3) changes how Bianca's Daily Brief displays long table descriptions. This handoff covers the backend change and the checks that require access to the deployed backend, n8n, Supabase, or the Anthropic workspace. The scheduled workflow, production rows, and live model responses were outside the scope of the local verification.
 
