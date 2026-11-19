@@ -80,6 +80,9 @@ def test_v2_prepares_every_table_from_full_source_and_renders_the_same_wording()
                                     action_url=lambda ref: f"https://example.test/done/{ref}", display=display))
     plain = brief_v2.plain_text(sections, today, display=display)
 
+    assert ">Who / Status</th>" in html
+    assert ">Who · status</th>" not in html
+
     parse.assert_called_once()
     for summary in sources.values():
         assert summary in html
