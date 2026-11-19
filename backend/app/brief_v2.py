@@ -1409,7 +1409,7 @@ def render_section(s: Section, today: date, nico_gap: bool, action_url=None, *, 
 
     if s.waiting:
         out.append(_h("Waiting on their reply", AMBER, len(s.waiting) + s.more_waiting))
-        out.append(_table(_th("Deal", "20%") + _th("Who · status") + _th("Waiting", "13%") + _th("Source", "12%") + done_th,
+        out.append(_table(_th("Deal", "20%") + _th("Who / Status") + _th("Waiting", "13%") + _th("Source", "12%") + done_th,
                           ["<tr>" + _td(_deal_cell(w.deal, w.stage)) + _td(_e(display(_waiting_text(w))))
                            + _td(_muted(_e(f"{w.days}d since {_date(w.sent)}"))) + _td(_src(w.source))
                            + done_td(f"thread:{w.thread_id}" if w.thread_id else None) + "</tr>" for w in s.waiting]))
