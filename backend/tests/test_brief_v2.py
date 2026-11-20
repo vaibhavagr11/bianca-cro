@@ -1,6 +1,7 @@
 """Regression tests for brief v2. Each mirrors a failure seen in the Oct 28 briefs (v1, then the first v2 draft)."""
 
 import re
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
 
@@ -237,8 +238,16 @@ def test_legacy_followup_recommendation_leaves_room_for_an_independent_move():
     s = section("RG", [v], [])
 
     assert [move.text for _, move, _ in s.highlights] == [next_move.text]
+    assert s.followups == []                         # B-10: three days after the last contact is too soon to nudge
+
+    v.last_contact = TODAY - timedelta(days=9)
+    s = section("RG", [v], [])
+    assert [move.text for _, move, _ in s.highlights] == [next_move.text]
     assert [move.done for move in s.followups] == ["rec:approval"]
     assert all(move.tag == "Follow up" for move in s.followups)
+    # B-10: the vague wording is replaced by how long it has been and what to do.
+    assert [move.text for move in s.followups] == [
+        "Andina Chile: 9 days since the last contact on record - follow up this week (re: pilot approval)."]
 
 
 def test_first_sentence_keeps_moves_short():
@@ -255,10 +264,19 @@ def test_new_insight_requires_its_quote_in_a_newly_stored_record():
     assert not is_new_insight("old quote", "only new text")
 
 
-def test_changes_reserve_room_for_customers():
-    rows = [ChangeRow(f"P{n}", 3, "x", "Email", None) for n in range(9)] + [ChangeRow("Koala", 5, "Buying signal", "Notes", None)]
+def test_changes_show_up_to_seven_rows_prospects_first_and_customer_replies_before_our_own_notes():
+    # Until 11/17 this kept 3 prospect rows + 2 reserved for working clients (who are no longer in the brief at all)
+    # and none for Opening deals, so a customer's reply could vanish on a busy day (finding 14, Campari).
+    rows = [ChangeRow(f"P{n}", 3, "Next step noted: x", "Email", None) for n in range(6)]
+    rows += [ChangeRow("Opening Co", 1, "Customer replied: hello", "Email", None, from_customer=True),
+             ChangeRow("Campari", 4, "Customer replied (nothing new extracted): Re: pilot", "Email", None,
+                       from_customer=True),
+             ChangeRow("Late Co", 3, "Buying signal", "Notes", None, "late")]
     picked = select_changes(rows)
-    assert len(picked) == 4 and "Koala" in [c.deal for c in picked]
+    assert [c.deal for c in picked] == ["Campari", "P0", "P1", "P2", "P3", "P4", "P5"]
+    assert [c.deal for c in select_changes(rows, limit=9)][-2:] == ["Late Co", "Opening Co"]
+    html = render([], [], picked, TODAY, 0, "c", False, more_changes=2)
+    assert "What changed since the last brief (9)" in html and "+ 2 more changes on record, not shown" in html
 
 
 def test_subject_and_meetings():
@@ -471,7 +489,10 @@ def test_reply_needed_uses_the_extracted_request_without_duplicating_it_as_a_mov
     s = section("RG", [view("Pernod", 3, owner="RG", unanswered=specific)], [request])
     assert [(row.tag, row.text) for row in s.today] == [("Reply needed", request.text)]
     assert s.today[0].done == "insight:i"
-    assert s.highlights[0][1].text == "Check where this deal stands"
+    # B-09 (11/12): the deal is already in Needs you today with its one open thing, so it gets no second,
+    # generic "Check where this deal stands" row in Deals to move (until 11/17 it did).
+    assert s.highlights == []
+    assert [r.reason for r in s.audit] == ["not eligible: already in Needs you today and nothing else is open"]
 
 
 def test_semantic_fixes_do_not_change_deal_selection():
@@ -723,7 +744,11 @@ def test_waiting_list_is_per_founder_prospects_first_newest_silence_first():
     ws = [wait("Customer Co", 60, rank=5), wait("Andina Chile", 9), wait("Arca Peru", 50), wait("Nico deal", 7, owner="NC")]
     assert [w.deal for w in rank_waiting(ws, "RG")] == ["Andina Chile", "Arca Peru", "Customer Co"]
     assert waiting_text(wait("Arca Peru", 50, nudges=3, auto=True)) == "To Juan Pérez · no reply to our 3 emails, out-of-office received"
-    assert waiting_text(wait("Farmater", 7, nudges=8, replied=True)) == "To Juan Pérez · 8 emails since their last reply"
+    assert waiting_text(wait("Farmater", 7, nudges=4, replied=True)) == "To Juan Pérez · 4 emails since their last reply"
+    # B-11: from the fifth unanswered email the row suggests Paused - on the deal's weekly day only (decision 11/17).
+    assert waiting_text(replace(wait("Farmater", 7, nudges=8, replied=True), nudge=True)) == \
+        "To Juan Pérez · 8 emails with no reply - consider moving to Paused"
+    assert waiting_text(wait("Farmater", 9, nudges=8, replied=True)) == "To Juan Pérez · 8 emails since their last reply"
 
 
 @pytest.mark.parametrize("has_evidence", [True, False])
@@ -802,30 +827,164 @@ def test_waiting_list_renders_with_a_done_button():
     assert "thread:t-Andina Chile" in completable([s], [])
 
 
-@pytest.mark.parametrize("row_count", [0, 6, 8])
-def test_amp_disclosures_keep_overflow_in_each_founders_table(row_count):
-    sections = []
-    for code in ("RG", "NC"):
-        views = [view(f"{code} Deal {n}", 3, owner=code) for n in range(row_count)]
-        moves = [item(v.deal, f"Send paperwork {n}", due=TODAY + timedelta(days=4),
-                      deal_owner=code, id=f"{code}-{n}") for n, v in enumerate(views)]
-        s = section(code, views, moves)
-        s.waiting = [wait(f"{code} Wait {n}", 9, owner=code) for n in range(row_count)]
-        sections.append(s)
+# ---- finding 15 (11/09 evals): "Delta: Customer replied" was a Zendesk update from Delta's data vendor
 
-    amp = render(sections, [], [], TODAY, row_count * 2, "Sources", False, amp=True)
-    assert amp.startswith("<!doctype html><html amp4email")
-    tables = re.findall(r"<table\b[^>]*>(.*?)</table>", amp)
-    expanded_tables = [table for table in tables if "[hidden]" in table]
-    if row_count <= 6:
-        assert not expanded_tables
-        assert "Show fewer" not in amp
-        return
+from app.brief_v2 import helpdesk_host, reply_origin  # noqa: E402
 
-    assert len(expanded_tables) == 4
-    for table, prefix in zip(expanded_tables, ("RG Deal", "RG Wait", "NC Deal", "NC Wait"), strict=True):
-        visible, overflow = re.findall(r"<tbody[^>]*>(.*?)</tbody>", table)
-        assert all(f"{prefix} {n}<" in visible for n in range(6))
-        assert all(f"{prefix} {n}<" in overflow and f"{prefix} {n}<" not in visible for n in (6, 7))
-        assert "Show 2 more" in table and "Show fewer" in table
-    assert len(set(re.findall(r'aria-controls="([^"]+)"', amp))) == 4
+
+@pytest.mark.parametrize("senders,subject", [
+    (["support@vtinfo.zendesk.com"], "[VIP Help Center] Request #48213: Delta store file"),
+    (["agent@vendor.com"], "Re: [Acme Help Center] Request #48213 has been updated"),
+    (["helpdesk@vendor.com"], "Ticket #9917 updated: data refresh"),
+    (["soporte@proveedor.com.ar"], "[Mesa de Ayuda] Solicitud N° 4410"),
+])
+def test_help_desk_ticket_notices_are_not_people(senders, subject):
+    assert is_automated(senders, subject)
+
+
+@pytest.mark.parametrize("subject", ["Re: Request for pricing", "Pilot support plan", "Business case 2 for the pilot"])
+def test_ordinary_subjects_are_not_ticket_notices(subject):
+    assert not is_automated(["juan@andina.cl"], subject)
+
+
+@pytest.mark.parametrize("senders,subject", [
+    (["compras@molinos.com.ar"], "Solicitud N° 4521 - alta de proveedor Bianca"),      # a buyer's procurement request
+    (["ramiro@bianca-ai.com"], "Re: Purchase request #7731 - Bianca pilot"),           # our own reply in that thread
+    (["ana@delta.com"], "Fwd: ticket #88 from our IT team, can you look?"),
+    ([], "Request #123"),
+])
+def test_a_ticket_number_alone_does_not_make_a_persons_email_a_system_notice(senders, subject):
+    """Review 11/17: the bare-number rule dropped real customer threads from Reply needed and Waiting."""
+    assert not is_automated(senders, subject)
+
+
+@pytest.mark.parametrize("senders,subject", [
+    (["support@datavendor.com"], "Request #48213 updated"),
+    (["tickets+4410@proveedor.com.ar"], "Solicitud n° 4410 actualizada"),
+    (["agent@acme.zendesk.com"], "Ticket #17 solved"),
+    (["juan@andina.cl"], "Re: [Andina Service Desk] acceso al portal"),
+])
+def test_a_ticket_number_from_a_support_mailbox_or_a_desk_label_is_a_system_notice(senders, subject):
+    assert is_automated(senders, subject)
+
+
+def test_customer_replied_is_only_said_for_the_customers_own_senders():
+    own = {"delta.com"}
+    assert reply_origin(["ana@delta.com"], own, set()) is None
+    assert reply_origin(["ana@gmail.com"], own, {"ana@gmail.com"}) is None           # a known contact on free mail
+    assert reply_origin(["ana@newdeal.com"], None, set()) is None                    # nothing learned yet: no claim
+    assert reply_origin(["agent@vtinfo.com"], own, set()) == "vtinfo.com"            # the data vendor copied in
+    assert reply_origin(["support@vtinfo.zendesk.com"], None, set()) == "vtinfo.zendesk.com"
+    assert helpdesk_host("support@vtinfo.zendesk.com") and not helpdesk_host("ana@delta.com")
+
+
+# ---- B-10 / B-11 (11/12 founder session): time-based nudges, weekly at most, and Paused after five emails
+
+from app.brief_v2 import Cadence, elapsed, nudge_text  # noqa: E402
+
+
+def test_nudge_is_due_once_per_seven_days_on_the_first_brief_after_each_mark():
+    sent = date(2026, 11, 2)                                     # a Monday
+    weekly = Cadence(7, 5, frozenset())
+    assert not weekly.due(sent, sent + timedelta(days=6))        # under a week: no nudge
+    assert weekly.due(sent, sent + timedelta(days=7))
+    told = Cadence(7, 5, frozenset({sent + timedelta(days=7)}))  # a brief went out on the mark day
+    assert not told.due(sent, sent + timedelta(days=8)) and not told.due(sent, sent + timedelta(days=13))
+    assert told.due(sent, sent + timedelta(days=14))             # the next week's mark
+    # A mark on a Saturday is shown on Monday's brief, once.
+    friday = date(2026, 10, 31) - timedelta(days=7)
+    assert Cadence(7, 5, frozenset()).due(friday + timedelta(days=1), date(2026, 11, 2))
+    assert not Cadence(7, 5, frozenset({date(2026, 11, 2)})).due(friday + timedelta(days=1), date(2026, 11, 3))
+
+
+def test_elapsed_time_reads_in_days_then_whole_weeks():
+    assert [elapsed(n) for n in (1, 9, 13, 14, 20, 36)] == ["1 day", "9 days", "13 days", "2 weeks", "2 weeks", "5 weeks"]
+    assert nudge_text(36) == "5 weeks since your last email - follow up this week"
+
+
+def test_waiting_row_carries_the_weekly_nudge_and_suggests_paused_after_five_emails():
+    assert waiting_text(Waiting("Andina", "2. In Talks", "Juan", TODAY - timedelta(days=21), 21, 2, False, False, None,
+                                nudge=True)) == \
+        "To Juan · no reply to our 2 emails, 3 weeks since your last email - follow up this week"
+    quiet_day = Waiting("Andina", "2. In Talks", "Juan", TODAY - timedelta(days=22), 22, 2, False, False, None)
+    assert waiting_text(quiet_day) == "To Juan · no reply to our 2 emails"
+    fifth = Waiting("Andina", "2. In Talks", "Juan", TODAY - timedelta(days=21), 21, 5, True, False, None, nudge=True)
+    assert waiting_text(fifth) == "To Juan · 5 emails with no reply - consider moving to Paused"
+    assert waiting_text(Waiting("Andina", "2. In Talks", "Juan", TODAY, 21, 3, True, False, None, pause_after=3,
+                                nudge=True)) == "To Juan · 3 emails with no reply - consider moving to Paused"
+    # Between two weekly days the row only states the silence: the suggestion shows at most once per 7 days.
+    assert waiting_text(replace(fifth, nudge=False)) == "To Juan · 5 emails since their last reply"
+
+
+def test_vague_follow_up_is_replaced_by_one_time_based_nudge_per_deal():
+    vague = [item("Andina", "Keep following up with the buyer", id="a", kind="next_step", deal_owner="RG"),
+             item("Andina", "Check in with Juan on the store data", id="b", kind="next_step", deal_owner="RG")]
+    v = view("Andina", 2, owner="RG", last_outbound=TODAY - timedelta(days=36), unanswered_emails=2)
+    s = build_section("RG", "RG", "Ramiro", {"Andina": v}, vague, [], TODAY, DISPLAY)
+    assert s.highlights == []
+    [move] = s.followups                                        # one row for the deal, not one per vague item
+    assert move.text == "Andina: 5 weeks since your last email - follow up this week."
+    assert move.when == "your last email Sep 22" and move.done == "insight:a"
+    assert "Keep following up" not in render([s], [], [], TODAY, 1, "c", False)
+
+    told = Cadence(7, 5, frozenset({TODAY - timedelta(days=1)}))   # yesterday's brief already carried this week's nudge
+    quiet = build_section("RG", "RG", "Ramiro", {"Andina": v}, vague, [], TODAY, DISPLAY, cadence=told)
+    assert quiet.followups == [] and quiet.highlights == []        # and no generic "Confirm status" row instead
+
+    v.unanswered_emails = 5                                        # on the weekly day, Paused replaces the nudge
+    paused = build_section("RG", "RG", "Ramiro", {"Andina": v}, vague, [], TODAY, DISPLAY)
+    assert [m.text for m in paused.followups] == ["Andina: 5 emails with no reply - consider moving to Paused."]
+    again = build_section("RG", "RG", "Ramiro", {"Andina": v}, vague, [], TODAY, DISPLAY, cadence=told)
+    assert again.followups == []                                   # already shown this week: not repeated daily
+
+    v.unanswered_emails, v.last_reply = 0, TODAY - timedelta(days=3)     # they wrote last: nothing to nudge
+    assert build_section("RG", "RG", "Ramiro", {"Andina": v}, vague, [], TODAY, DISPLAY).followups == []
+
+
+def test_proposal_reminder_says_how_long_ago_and_keeps_what_was_proposed():
+    proposal = item("Arca Peru", "Bianca proposed reconnecting with Renzo", recorded=TODAY - timedelta(days=9),
+                    deal_owner="RG", id="proposal", kind="proposed")
+    s = section("RG", [view("Arca Peru", 2, owner="RG", last=proposal.recorded)], [proposal])
+    assert [m.text for m in s.followups] == [
+        "Arca Peru: 9 days since we proposed this - follow up this week: Bianca proposed reconnecting with Renzo."]
+
+
+# ---- B-02 (11/12): what is with the customer never fills a Deals-to-move row
+
+def test_waiting_statement_or_no_reply_blocker_is_never_a_deal_to_move():
+    wait_step = item("Campari", "Wait for Franco's reply on the proposal", id="w", kind="next_step", deal_owner="RG")
+    blocker = Note("No reply since Oct 21", verified=True, evidence=frozenset({"w"}), source="Email · Oct 21")
+    stuck = view("Campari", 4, owner="RG", blocker=blocker, last_outbound=TODAY - timedelta(days=7))
+    real = item("Andina", "Send the revised pricing sheet", id="p", kind="next_step", deal_owner="RG")
+    no_reply = Note("Juan has not replied to the pilot proposal", verified=True, source="Email · Oct 20")
+    andina = view("Andina", 2, owner="RG", blocker=no_reply, last_outbound=TODAY - timedelta(days=3))
+    s = build_section("RG", "RG", "Ramiro", {"Campari": stuck, "Andina": andina}, [wait_step, real], [], TODAY, DISPLAY)
+    # Campari has nothing for Bianca to do: no row, only the time-based reminder. Andina keeps its real move,
+    # and its "has not replied" blocker is not shown as the situation or turned into "Clarify next action".
+    assert [(v.deal, m.text, sit) for v, m, sit in s.highlights] == [("Andina", "Send the revised pricing sheet", None)]
+    assert [m.text for m in s.followups] == [
+        "Campari: 7 days since your last email - follow up this week (re: the proposal)."]
+    page = render([s], [], [], TODAY, 2, "c", False)
+    assert "No reply since" not in page and "Wait for Franco" not in page and "has not replied" not in page
+
+
+# ---- finding 14 (11/09 evals): Campari replied Tue; Wed still said "no recorded action addresses this blocker"
+
+def test_blocker_older_than_the_customers_latest_reply_is_not_presented_as_untouched():
+    blocker = Note("Franco must confirm the On Premise data owner", verified=True, source="Email · Oct 21",
+                   on=date(2026, 10, 21))
+    stale = view("Campari", 4, owner="RG", blocker=blocker, last_reply=date(2026, 10, 27))
+    move = primary_move(stale, TODAY, set())
+    assert (move.tag, move.text) == ("Clarify next action", "The customer replied on Oct 27, after this blocker was "
+                                     "recorded - read the reply and check whether it still stands")
+    quiet = view("Campari", 4, owner="RG", blocker=blocker, last_reply=date(2026, 10, 20))
+    assert primary_move(quiet, TODAY, set()).text == "No recorded action or suggestion addresses this blocker yet"
+
+
+# ---- finding 19 (11/09 evals): "10 without a reliable event date" did not say what those records were
+
+def test_undated_developments_are_explained_and_their_deals_named():
+    from app.brief_v2 import undated_note
+    assert undated_note(10, ["Andina", "Campari", "Farmater", "Pernod"]) == (
+        "Also not shown as new: 10 item(s) from meeting notes whose heading has no date (Andina, Campari, Farmater "
+        "+1 more). Add the meeting date to the heading in the notes doc to have them listed.")

@@ -53,3 +53,18 @@ Still generated only by `patch_artifact.py` (same command as above); `BiancaLive
   keep this mode, add a `mode: "append"` field to the approve payload and skip the rotation server side; the page
   can then stop re-sending the current bullets. Kept bullets also arrive as founder edits (no source link).
 - Tests: `verify-live.cjs` 45 / 55 and `verify-demo.cjs` 23 / 36, unchanged from the restyle baseline.
+
+## 11/16/2026 - date field, Status control
+
+`WR_JS` and `CARD_JS` in `patch_artifact.py` carry the day-first Complete by field (`parseDay`), the blocked save on an impossible date, and the Status control (`statusControl`). The matching data calls (`TOOLS.status`, the REST route, `setStatus`, `changeStatus`) live in the page scripts of `sales-pipeline-updates.html` and are not produced by this script; the demo page keeps a status change in the browser only.
+
+## 11/17/2026 - Keep + add is a real append
+
+The backend follow-up from 11/09 is done (`next_step_mode: "append"` on the approve payload, see `docs/gsheet-updates.md`).
+`WR_JS` exports `nextStepUpdate(id, bullets)` (the reviewed steps plus the chosen mode) and `additions(bullets, cell)`
+(preview of what Keep + add will really add) in place of `merged`; `paintDialogMode` also rewrites the
+"What will happen" rows per mode. The page scripts pass `nextStepMode` through `BiancaLive.groups` / `decide`
+(live) and `BiancaCore.approve` (demo, in the browser only).
+
+`shell()` in `WR_JS` also splits the agenda into "Needs your action" and "Waiting on them" from the `waiting` flag
+the service sets per card (the demo seed marks Andina Chile); the row order in the page is the order J / K walk.

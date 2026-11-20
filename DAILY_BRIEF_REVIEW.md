@@ -1,5 +1,7 @@
 # Daily Brief 160-character limit review handoff
 
+This file is a chronological handoff. The PR #3 discussion below describes the original design; later release decisions supersede it. For the current waiting-row fix, see [PR #22 implementation](#waiting-reply-descriptions-fixed-in-pr-22--november-19-2026).
+
 [PR #3](https://github.com/vaibhavagr11/bianca-cro/pull/3) changes how Bianca's Daily Brief displays long table descriptions. This handoff covers the backend change and the checks that require access to the deployed backend, n8n, Supabase, or the Anthropic workspace. The scheduled workflow, production rows, and live model responses were outside the scope of the local verification.
 
 ## What the backend does
@@ -54,3 +56,121 @@ uv run pytest -q
 Before approving, record the deployed revision and n8n path reviewed, the result of one staging render with approved long-field examples, the forced review outcome, and the policy for a blocked build. A successful sign-off includes a complete, faithful description at or below 160 characters, a valid destination and message body on success, and a visible operator outcome on review without a duplicate or stale send.
 
 [Core tests](backend/tests/test_brief_text.py) · [V1 display tests](backend/tests/test_brief_v1_text.py) · [V2 render and API tests](backend/tests/test_brief_v2_text.py)
+
+
+## 11/17/2026 - fixes from the 11/09 evals and the founders' 11/12 session
+
+Branch `brief-fixes-1117`. Everything below is deterministic code in the v2 brief (the version n8n requests); no prompt, migration, n8n workflow or required setting changed. All new settings have defaults in [config.py](backend/app/config.py).
+
+| What a founder sees | Rule | Where |
+| --- | --- | --- |
+| A date set in the Sheet brings the deal back | A Next step bullet ending in `(complete by Nov 16, 2026)` shows in **Needs you today** on that date, tagged **Sheet date**, source "Sheet next step". It stays, marked late, for `BRIEF_SHEET_STEP_OVERDUE_DAYS` (14), then becomes a one-line reminder to update the Sheet. Not for Paused deals or working clients. If the same step also exists as an extracted item, the item is held until the date and the Sheet row replaces it, so a step is never listed twice. Sheet rows have a Done button and are not sent to the pre-send check. | [brief_sheet_steps.py](backend/app/brief_sheet_steps.py), `brief_api._apply_sheet_dates`, `brief_v2.sheet_rows` |
+| No "keep following up" rows | Nudge-only items and suggestions are replaced by one time-based reminder per deal: "3 weeks since your last email - follow up this week", on the first brief on or after each `BRIEF_NUDGE_EVERY_DAYS` (7) mark, on the Waiting row when there is one, else under Follow-ups. After `BRIEF_PAUSE_AFTER_EMAILS` (5) of our emails in a row with no reply, that weekly line reads "5 emails with no reply - consider moving to Paused" instead: same cadence, at most once per 7 days per deal, never together with the nudge. On the days in between the row only states the silence. | `brief_v2.Cadence`, `_split_followups`, `_waiting_status` |
+| Waiting items never in Deals to move | A step or blocker that only says the customer has not answered ("Wait for Franco's reply", "No reply since Oct 21") is the waiting state, never a next move or a Situation. | `brief_followups.is_waiting_only` |
+| Shorter tables | **Needs you today always shows every row** (decision 11/17). Every other table stops at `BRIEF_MAX_TABLE_ROWS` (7) rows, and the line under it names the deals left out: "+ 3 more in the Sheet waiting on a reply: Andina Chile, Arca Peru, Chifles" (8 names, then "and N more"), in HTML and plain text. A deal already in Needs you today gets no second, generic row in Deals to move. | `brief_v2.cap_tables`, `more_line`, `select_changes` |
+| Quiet In Talks deals, a few at a time | "Quiet In Talks deals to revisit (3 of N)": In Talks, no recorded contact in over two weeks or none at all, nothing else open. `BRIEF_RESURFACE_PER_DAY` (3, 0 = off) per founder, longest-untouched first; a deal that was listed waits `BRIEF_RESURFACE_COOLDOWN_DAYS` (14), read from the archived briefs. | `brief_v2.build_section` |
+| Pilots: sales items only | On a Pilot deal, items stored before scopes existed (blank scope) are hidden (`BRIEF_PILOT_STRICT_SCOPE`, default on). | `brief_api._scoped_rows` |
+| Prep on every meeting | Written last, from rows that survived the pre-send check: who is on the invite and whether they accepted, then the most pressing row the brief shows for the deal, else its open issue, Sheet next step, summary or last contact. A meeting the classifier did not link is tied to a deal when a guest's address or domain points to exactly one pipeline company. | `brief_v2.meeting_prep`, `brief_api._deal_for_guests` |
+| Cancelled meetings | Google's "Canceled event" mail, which is never stored, now marks the stored meeting cancelled at Gmail ingest when it is newer than the latest calendar sync. | `gmail.cancellation_notices`, `ingest.apply_cancellation_notices` |
+| Situation text | Sentences no longer end at "2. In Talks", decimals, abbreviations, initials or inside a quote; a long Situation is cut at a clause break, never with an ellipsis. | `brief_text.split_sentences` |
+| "Customer replied" | Help-desk ticket notices are system mail. "Customer replied" is said only for a sender on the deal company's own domain; anyone else is named by domain. Up to 7 changes show, customer-written ones first. | `brief_v2.is_automated`, `reply_origin` |
+| Already-answered rows | Without the pre-send check, a row whose email thread we have written in since is marked "you wrote back Nov 5 - still open?" (not hidden: a later email can be a thank-you). | `brief_api.answered_after` |
+| Stable wording | A regenerated suggestion that cites the same insights and says the same thing keeps its previous wording, so rows and Done clicks stay stable. | `profiler.keep_wording` |
+
+### Check after deploy
+
+- **Sheet dates.** In a dry run (`POST /brief/build?version=v2&dry_run=true`), confirm a row dated today in the live Sheet appears as **Sheet date** and that `payload.sections[].sheet_later` lists the future ones. A slash date such as 03/04/2026 is not read (ambiguous); the Hub writes month names.
+- **Weekly nudge and quiet-deal batch.** Both read the `briefs` archive (`for_date`, `payload.sections[].resurfaced`). Dry runs do not archive, so a preview repeats the same nudge and batch until a real brief is sent.
+- **Cancelled meetings.** Only works if the n8n Gmail search returns "Canceled event" mail; check `meetings_cancelled` in the `/ingest/gmail` response. Re-fetching the calendar right before the build is still the complete fix and is an n8n change.
+- **Friday mail gap (finding 1).** Not fixed here: the Gmail search in n8n needs `newer_than:4d` instead of `newer_than:2d`. The backend already skips mail it has (`store_gmail` matches on Gmail id and Message-ID), so the longer window is safe.
+- **Pilots.** Product-work items that were extracted with a sales scope before PR #17 still show; they need a re-extraction run on Pilot deals.
+
+### Release review (11/17) - what changed after running the branch on a real database
+
+Found by building eight consecutive days of briefs against Postgres from a seeded pipeline (36 deals), first with master's code and then with this branch on the same archive. Fixed here:
+
+- **Nothing optional can stop the send.** Sheet dates, the weekly nudge, the quiet-deal batch, guest matching, meeting prep and the "wrote back" cue are extras: if one fails, the reason is logged (`brief built without ...`, `sheet dates skipped for opportunity ...`, `brief section RG rebuilt without ...`) and the brief is built without it. The archive reads run in a savepoint. At Gmail ingest a cancellation notice the database cannot read is skipped on its own; it used to fail the whole mail sync. A profile is still saved when its earlier wording cannot be carried over.
+- **Blank or huge text.** A blank insight, action or summary no longer raises in the sentence splitter (it did since 11/17; before that it gave blank text). A Next step line with a long run of spaces after "(complete by" no longer stalls the build, and a very long text is read once.
+- **Paused deals get no reminder.** No "follow up this week", no "consider moving to Paused" (the deal is already Paused) and no Follow-ups row. Their Waiting row reads as it did before 11/17.
+- **The hold-back rule never hides what is due.** An extracted item that is due (or due tomorrow) or overdue by its own date stays in the brief even when the same step carries a later date in the Sheet.
+- **Ticket numbers.** "Request #123" in a subject marks a system notice only when the sender is a help-desk host or a support mailbox. A buyer's "Solicitud N° 4521 - alta de proveedor" and our own replies in that thread are people again (they had dropped out of Reply needed and Waiting). A desk label in brackets ("[Acme Help Center]") is still enough on its own.
+- Smaller: a deal with a meeting today or tomorrow is not listed as quiet; a long-past Sheet date from another year shows its year; "Nov 16, 26" is read as 2026.
+
+Off switches (all default to the 11/17 behaviour; set the variable on the backend and the next build uses it):
+
+| Behaviour | Turn off with | With it off |
+| --- | --- | --- |
+| 7-row cap (never applies to Needs you today) | `BRIEF_MAX_TABLE_ROWS=1000` | Meetings list every row; Deals to move (6), Waiting (6) and Follow-ups (3) keep their earlier limits. What changed lists every change (the old 3 + 2 quota is gone for good). |
+| Weekly nudge and "consider Paused" | `BRIEF_FOLLOWUP_NUDGES=false` | Reminders print as written and Waiting rows carry no nudge, as before 11/17. Waiting statements ("Wait for Franco's reply") are ordinary steps again. |
+| Quiet In Talks batch | `BRIEF_RESURFACE_PER_DAY=0` | No batch; the "Confirm status" and "no record in 45+ days" lines count those deals as before. |
+| Pilot strict scope | `BRIEF_PILOT_STRICT_SCOPE=false` | Not-yet-scoped items show on Pilot deals again. |
+| Sheet dates | `BRIEF_SHEET_DATES=false` | "(complete by ...)" notes are not read. |
+| Holding the matching item until the Sheet date | `BRIEF_SHEET_HOLD_MATCHING=false` | Sheet dates still show on their day; the extracted item keeps showing by its own rules before it. |
+
+No switch (by design, they are corrections): prep lines and guest matching, cancelled meetings, "Customer replied" wording, Situation cuts, the "you wrote back" cue, kept wording, and "no second generic row for a deal already in Needs you today".
+
+### Decisions of the release owner (11/17), built on top of the review
+
+Ramiro's biggest fear is missing an email or a deadline, so nothing that needs a founder today may be hidden.
+
+- **Needs you today is never cut.** Every row shows, whatever `BRIEF_MAX_TABLE_ROWS` is. Order: a customer waiting on our reply and what is due today (then tomorrow) first, then what is overdue by its own date, most recent first, then late Sheet-date rows. `more_today` stays in the payload and is always 0.
+- **Capped tables name what they leave out** (Deals to move, Waiting, Meetings, Follow-ups, What changed), in HTML and in the plain-text part.
+- **"Consider moving to Paused" is weekly**, on the deal's nudge day and in place of the nudge.
+- **A cancellation notice that fits more than one stored meeting cancels none.** A notice carries only a title and a day; with two "30 Minute Call" bookings that day we wait for the next calendar fetch and log `cancellation notice for <day> matches N meetings with the same title`.
+- **The plain-text part** now carries the Sheet-date footers ("Sheet dates long past", "N dated Sheet step(s) not due yet") and the quiet-batch note.
+
+Documented limits (accepted, not fixed):
+
+- On an empty archive, or after a day with no brief, a deal can get its catch-up nudge (or Paused suggestion) and the next weekly one less than 7 days apart. With an archive of sent briefs the run showed at most one per 7 days.
+- A regenerated suggestion keeps its earlier wording when it cites the same insights and shares half of its meaningful words.
+- A meeting is tied to a deal by a 5+ letter fragment of the company name in the guest's domain; the prep line says "deal matched by guest domain".
+- The small "Nico de León · urgent only" table still lists at most 3 rows with no count, as it did before 11/17.
+- The plain-text part has no "What changed" table (it never had one).
+
+Tests: `cd backend && uv run pytest -q` (847 passed, 13 skipped, which need a local test database). The review's tests are in [test_brief_review_1117.py](backend/tests/test_brief_review_1117.py), the decisions' in [test_brief_decisions_1117.py](backend/tests/test_brief_decisions_1117.py). The end-to-end fixture is [test_brief_fixture_1117.py](backend/tests/test_brief_fixture_1117.py); run it with `BRIEF_FIXTURE_HTML=<path>` to save the rendered email.
+
+## Waiting reply descriptions fixed in PR #22 — November 19, 2026
+
+[PR #22](https://github.com/vaibhavagr11/bianca-cro/pull/22) now includes the actual waiting-description fix, the **Who / Status** heading, tests, and this handoff. It was built from master `77af7d5368bb098b1e442a3f54f83d9971942af2` and PR head `805b8c259b550aa197097d12e26f8e14a09d71d0`. PR #3 merged on November 9 as `548549b64e685de2306cc2f0f518b6632937174c`.
+
+### Root cause and implemented behavior
+
+The old display path called `waiting_text()`, which applied `first_sentence(w.action)` with a 95-character limit. An ellipsis could therefore already exist before the combined recipient/status/request reached the 160-character display layer. A synthetic 117-character request reproduced this; a short final cell could still end mid-sentence.
+
+The new `_waiting_text()` in [brief_v2.py](backend/app/brief_v2.py) composes the complete recipient, original structured status, and full `Waiting.action`. It does not use the completion-preview helper or slice the action. The entire combined description, including separators, spaces, and punctuation, goes through `prepare_table_text()` once. Text at or below 160 characters retains its supplied wording. The limit uses Python Unicode character counts before HTML escaping; markup and the separate Source/Waiting columns are outside that description budget.
+
+Long fields use the existing optional batched Claude request. The input contains the full assembled source wording. A compact status is required verbatim in the rewrite: it preserves the unanswered-email count, the distinction between no reply and silence since an earlier reply, any out-of-office response, and today's follow-up or **consider Paused** recommendation. Elapsed days are already shown in the separate Waiting column. An implausible counter longer than 12 digits is described as `multiple` rather than cutting a number. The prompt preserves recipient identity and the requested response, and permits `Customer` when the full identity cannot fit.
+
+The internal kind is now `Who / Status`, matching the heading. Unlike the legacy `Who · status` kind, generated waiting descriptions require terminal punctuation. Validation also checks the 160-character cap, required status, ellipses, single-line content, balanced quotes/brackets, obvious clipped prefixes, and common dangling final words such as `by.` or `for.`. These are syntactic checks, not a proof of factual or grammatical correctness.
+
+### Complete fallbacks and source access
+
+When AI is absent, times out, returns invalid or missing output, or the field falls outside the existing batch budget, a deterministic fallback:
+
+1. Tries the whole request with the compact status, retaining the full recipient if it fits. It can substitute the whole label `Customer` to fit a complete request; it never invents initials or slices a name/address. The Deal column still identifies the account.
+2. If the full request cannot fit, tries its first complete sentence with the explicit cue `More in email.`. It does not select a later sentence out of context or cut inside a sentence. The cue is included in the same 160-character budget.
+3. Otherwise shows the structured status with `Request details in email.`. A missing/blank request does not get a false omission cue.
+
+Waiting fields never reach `cut_table_text()`. Even an unexpectedly missing or invalid explicit fallback gets a fixed complete source pointer within 160 characters. The normal generated fallback retains the structured status. Existing fallbacks for other table kinds are unchanged.
+
+The waiting Source cell now links to the existing `Waiting.link` when it is a valid HTTPS URL with a hostname, valid port, no credentials, and no whitespace/control characters. The label still says where the row came from and when. HTML escaping is preserved. Plain text uses the identical description and puts the source URL on a separate line. Missing/invalid links remain plain labels; no URL is invented from a completion reference. Email links require the founder to have access to the relevant mailbox.
+
+### Source records and completion references
+
+Display shortening never mutates `Waiting.action`, `Waiting.to`, or `Waiting.evidence`. `payload.sections[].waiting[].action` keeps the full original action string, and the payload contract is unchanged. That action is the existing extracted/expected-response wording; it is not necessarily a verbatim quote from the original email. The evidence IDs remain on `Waiting` for verification and are not newly added to the archived waiting payload.
+
+`completable()` still uses the existing `waiting_text()` preview helper and the exact `thread:{thread_id}` target. Its preview can still use the legacy 95-character action excerpt, and `actions.sign()` still bounds the confirmation preview to 120 characters. Those existing confirmation-label rules are separate from the fixed email table. Tests check the unmodified preview and decode a signed link to confirm the same thread target. No summary becomes an action ID, and this change does not mark anything complete.
+
+### Operational limits and review before merging
+
+- **Verified builds remain deterministic.** `brief_api.py` passes `client=None` when verification is active. They use the complete fallback described above. This PR adds no separate model-call stage, cache, schema migration, setting, or verification/delivery-state change. A full waiting description can now trigger the existing optional batch where the old clipped text fit, so call volume or token use can increase. Non-verified builds retain the existing optional summarizer, model configuration, 10-second SDK timeout, zero retries, 32-field/24,000-input-character batch limits, and 4,096-output-token budget. Full waiting actions can consume more of that existing input budget than the old clipped excerpts.
+- **Bounded text cannot retain every detail of an arbitrary long source.** A fallback may omit the recipient or later request details and explicitly directs the founder to the email. The first-sentence fallback may omit a qualification stated later; the `More in email.` cue is deliberate. Review whether the release owner would prefer only the full-request-or-source-pointer fallback for such rows. Both paths retain the source records and keep optional wording work from preventing the morning send.
+- **Model fidelity still needs review.** Required status is checked, but arbitrary changes to the request, identity, dates, negation, or uncertainty are not semantically verified. Syntactic checks cannot detect every plausible hallucination. Short source inputs pass through as supplied, including any upstream fragments or ellipses; this fix removes display-induced cutting and cannot reconstruct text already missing upstream. Tests use synthetic sources and mocked model responses, not a live-model quality evaluation.
+- **Deployment context is not established by GitHub alone.** The published Morning brief n8n workflow inspected during the review calls v2 without a verification parameter; current repository defaults select `off`. Its Gmail node sends the returned HTML directly, with no downstream slicing found. The draft and published graphs differ. This inspection does not establish today's exact execution, deployed backend revision, environment settings, or production archive contents. No workflow was executed and no email was sent. [Inspected workflow](https://bianca-cro.app.n8n.cloud/workflow/eO6EAf1mGbcigS7o)
+- **Before release**, verify the deployed revision and active n8n graph, render approved long examples with and without the model, inspect both email alternatives, and confirm Source and Done links work in the intended mailbox. Check a staging execution for unchanged HTML handoff and absence of stale stored output. No production Supabase rows or external workflow settings were changed by this work.
+
+### Regression evidence
+
+[Waiting-specific tests](backend/tests/test_waiting_text.py) cover full 117-character requests, the old 94/95/96 cutoff boundary, combined 159/160/161-character descriptions, model output boundaries, incomplete and invalid model output, missing output/provider failure, no-client verified-style preparation, batch overflow and oversized input, long identities, missing requests, reply history/OOO/cadence, complete fallbacks, malformed fallback defense, source URL validation and escaping, HTML/plain-text consistency, unchanged source payload/evidence, and signed completion targets. [V2 table tests](backend/tests/test_brief_v2_text.py) also exercise the new kind and heading in the shared display batch.
+
+Run from `backend`: `python -m pytest -q`. The focused waiting and v2 display files passed **47 tests**. The full backend suite passed **1,011 tests**, with **13 skipped**; `git diff --check` also passed. The first full-suite attempt used an older local environment missing `jwt` and `mcp` and stopped during collection. The successful run used the working Python 3.12 interpreter with the existing sales-connector environment's installed dependencies on `PYTHONPATH`; no dependency or lockfile was changed. A clean environment should install this checkout's declared dependencies before running the command.

@@ -420,3 +420,62 @@ def test_n8n_path_needs_its_secret_before_any_call(via_n8n, monkeypatch):
     with pytest.raises(SheetError):
         api.read_company("Campari")
     assert proxy.calls == []
+
+
+def test_status_change_writes_only_the_status_cell_and_verifies_it():
+    api, transport = client()
+    row = api.set_status("Campari", "4. Pilot", "0. Paused")
+    assert row.status == "0. Paused" and (row.last_progress, row.next_step) == ("Old progress", "Previous next step")
+    writes = [call for call in transport.calls if call[0] == "POST"]
+    assert len(writes) == 1 and len(writes[0][3]["requests"]) == 1
+    update = writes[0][3]["requests"][0]["updateCells"]
+    assert update["range"] == {"sheetId": 123, "startRowIndex": 1, "endRowIndex": 2,
+                               "startColumnIndex": 4, "endColumnIndex": 5}
+    assert update["rows"] == [{"values": [{"userEnteredValue": {"stringValue": "0. Paused"}}]}]
+    assert update["fields"] == "userEnteredValue"
+
+
+def test_status_change_is_idempotent_and_refuses_a_stale_or_ambiguous_row():
+    api, transport = client()
+    assert api.set_status("Campari", "1. Opening", "4. Pilot").status == "4. Pilot"  # already there
+    with pytest.raises(SheetConflict):
+        api.set_status("Campari", "1. Opening", "0. Paused")  # the founder saw an older status
+    with pytest.raises(SheetConflict):
+        api.set_status("Unknown company", "4. Pilot", "0. Paused")
+    assert not [call for call in transport.calls if call[0] == "POST"]
+    duplicate, transport = client(document(rows=[["Campari", "RG", "", "", "4. Pilot"], ["Campari", "NC", "", "", "4. Pilot"]]))
+    with pytest.raises(SheetConflict):
+        duplicate.set_status("Campari", "4. Pilot", "0. Paused")
+    assert not [call for call in transport.calls if call[0] == "POST"]
+
+
+def test_status_change_never_overwrites_a_formula_and_reports_unverified_writes():
+    formula, transport = client(document(rows=[["Campari", "RG", "", "", {"userEnteredValue": {"formulaValue": "=A1"},
+                                                                         "effectiveValue": {"stringValue": "4. Pilot"}}]]))
+    with pytest.raises(SheetConflict):
+        formula.set_status("Campari", "4. Pilot", "0. Paused")
+    assert not [call for call in transport.calls if call[0] == "POST"]
+    api, transport = client()
+    transport.fail_verify = True
+    with pytest.raises(SheetWriteUncertain):
+        api.set_status("Campari", "4. Pilot", "0. Paused")
+    for bad in ("", "two\nlines", "x" * 101):
+        with pytest.raises(SheetError):
+            client()[0].set_status("Campari", "4. Pilot", bad)
+
+
+def test_keep_and_add_plan_writes_only_the_next_step_cell_and_still_checks_and_verifies():
+    """H-16: an append plan has the same Last progress before and after, so that cell is not in the batch."""
+    api, transport = client()
+    appended = "Previous next step\n- Added step"
+    row = api.apply_update("Campari", "Old progress", "Previous next step", "Old progress", appended,
+                           expected_client_context="", new_client_context="")
+    assert (row.last_progress, row.next_step) == ("Old progress", appended)
+    assert [call[0] for call in transport.calls] == ["GET", "POST", "GET"]
+    requests = transport.calls[1][3]["requests"]
+    assert len(requests) == 1 and requests[0]["updateCells"]["range"]["startColumnIndex"] == 3
+    # The same stale-row guard applies as for a replace.
+    with pytest.raises(SheetConflict):
+        api.apply_update("Campari", "Old progress", "Previous next step", "Old progress", appended + "\n- Again",
+                         expected_client_context="", new_client_context="")
+    assert [call[0] for call in transport.calls].count("POST") == 1

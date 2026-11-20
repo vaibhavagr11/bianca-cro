@@ -228,7 +228,7 @@ test('Demo sources show types and dates and keep escaped excerpts in closed disc
     ['Notes title','Source: Notes, Sep 28','Notes quotation.'],
     ['Email title','Source: Email, Oct 6','Email quotation.'],
     ['Calendar title','Source: Calendar, Oct 7','&lt;img src=x&gt; Calendar quotation.']
-  ])assert.ok(card.includes(`<details><summary><span>${title}</span><span class="src">${label}</span></summary><div class="ctx">${excerpt}</div></details>`),label);
+  ])assert.ok(card.includes(`<details><summary><span>${title}</span><span class="src">${label}</span></summary><div class="ctx"><p>&ldquo;${excerpt}&rdquo;</p></div></details>`),label);
   assert.equal(card.includes('<img src=x>'),false);
 });
 
@@ -240,7 +240,7 @@ test('Demo Current Next steps reads the current row with escaped multiline text'
   const details=card.match(/<details[^>]*class="current-next-steps"[^>]*>([\s\S]*?)<\/details>/);
   assert.ok(details,'Current Next steps uses native details.');
   assert.equal(/\sopen(?:[\s=>])/.test(details[0].slice(0,details[0].indexOf('>'))),false);
-  assert.ok(details[1].includes('<summary>Current Sheet cells</summary>'));
+  assert.ok(details[1].includes('<summary>Current Sheet cells<span class="cells-hint">Next step, Last progress and Client Context as they are now</span></summary>'));
   assert.ok(details[1].includes('<h4>Next step (now)</h4>'));
   assert.ok(details[1].includes('- Current action &amp; details.\n- &lt;img src=x&gt; Follow up.'));
   assert.equal(card.includes('Outdated proposal context'),false);
@@ -307,6 +307,29 @@ test('Context append deduplicates bullets without trimming or rewriting existing
   assert.equal(core.appendContext(existing,['Customer need: Retail reporting.']),existing);
 });
 
+test('Keep + add in the demo adds below the current Next step and leaves Last progress alone',()=>{
+  const before=core.initial(),id='pernod-ricard',old=rowFor(before,id);
+  const after=core.approve(before,id,{nextStepBullets:['received sell-out excel from them, meeting with them on Wed 4th Nov','Send the comparison file.'],clientContextBullets:[],nextStepMode:'append'},at);
+  const updated=rowFor(after,id);
+  assert.equal(updated.lastProgress,old.lastProgress);
+  assert.equal(updated.nextStep,old.nextStep+'\n- Send the comparison file.');
+  assert.equal(after.activity[0].before.lastProgress,after.activity[0].after.lastProgress);
+  assert.equal(core.valid(after),true);
+  // Without the mode the demo behaves as before: the old Next step moves to Last progress.
+  const replaced=rowFor(core.approve(before,id,{nextStepBullets:['Send the comparison file.'],clientContextBullets:[]},at),id);
+  assert.equal(replaced.lastProgress,old.nextStep);
+  assert.equal(replaced.nextStep,'- Send the comparison file.');
+  assert.equal(html.includes('Either way the previous Next Step is copied to Last progress'),false);
+  assert.ok(html.includes('does not change Last progress'));
+});
+
+test('The demo marks one sample card as only waiting so the second agenda group can be seen',()=>{
+  const state=core.initial();
+  assert.deepEqual(json(state.proposals.filter(p=>p.waiting===true).map(p=>p.id)),['andina-chile']);
+  assert.equal(core.valid(state),true);
+  assert.ok(html.includes("group('Needs your action', acting) + group('Waiting on them', waiting)"));
+});
+
 test('Both groups empty or malformed cannot be approved',()=>{
   for(const update of [{nextStepBullets:[],clientContextBullets:[]},{nextStepBullets:['Valid'],clientContextBullets:[null]},{nextStepBullets:[],clientContextBullets:'Wrong'},{nextStepBullets:['x'.repeat(4001)],clientContextBullets:[]}]){
     assert.throws(()=>core.approve(core.initial(),'campari',update,at));
@@ -320,7 +343,7 @@ test('Cards and editor expose separate destination groups and existing Client Co
   assert.ok(cards.includes('Suggested next steps'));
   assert.ok(cards.includes('data-destination="nextStep"'));
   assert.ok(cards.includes('data-destination="clientContext"'));
-  assert.ok(cards.includes('<summary>Current Sheet cells</summary>'));
+  assert.ok(cards.includes('<summary>Current Sheet cells<span class="cells-hint">Next step, Last progress and Client Context as they are now</span></summary>'));
   assert.ok(cards.includes('<h4>Client context (now)</h4>'));
   assert.ok(html.includes('id="edit-client-context"'));
   const article={dataset:{id:p.id}},button={dataset:{action:'edit'},closest:()=>article};

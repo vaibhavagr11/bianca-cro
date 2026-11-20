@@ -57,6 +57,11 @@ def is_pilot(stage: str | None) -> bool:
     return _STAGE_RE.sub("", stage or "", count=1).strip().casefold() == "pilot"
 
 
+def is_paused(stage: str | None) -> bool:
+    """Match the Pipeline's Paused status ("0. Paused"), with or without its number."""
+    return parse_stage(stage) == 0 or _STAGE_RE.sub("", stage or "", count=1).strip().casefold() == "paused"
+
+
 def is_working_client(stage: str | None) -> bool:
     """Match the Pipeline's Working Client status, including its numbered label."""
     label = _STAGE_RE.sub("", stage or "", count=1)

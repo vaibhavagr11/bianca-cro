@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+from dataclasses import replace
 from datetime import datetime, time, timedelta
 from typing import Literal
 from uuid import UUID
@@ -14,14 +15,14 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
-from app import actions, brief, brief_review, brief_v2, db, extractor, timeline
+from app import actions, brief, brief_review, brief_sheet_steps, brief_v2, db, extractor, resolution, timeline
 from app.brief_delivery import DeliveryGate, VerificationPending, create_gate
 from app.brief_review import ActionSource
 from app.brief_text import prepare_table_text
 from app.config import settings
 from app.gmail import domain
 from app.ingest import _workspace_id, require_token
-from app.pipeline import is_working_client
+from app.pipeline import is_paused, is_pilot, is_working_client, normalize_name
 from app.pipeline_freshness import check_fresh_pipeline, require_fresh_pipeline
 from app.process import _claude
 
@@ -38,24 +39,72 @@ AMP_EMAIL_MAX_BYTES = 200_000
 DISPLAY = {"RG": ("Ramiro", "Ramiro Godfrid"), "NC": ("Nico", "Nico Casaux"), "NDL": ("Nico DL", "Nico de León")}
 
 
-def _sales_deals(conn, workspace_id) -> tuple[dict[str, dict], set[str]]:
+def _optional(conn, what: str, read, default):
+    """Run a read the brief can do without. If it fails, log why and build the brief without it.
+
+    The read runs in a savepoint, so a failed statement does not poison the queries that follow it.
+    """
+    try:
+        with conn.transaction():
+            return read()
+    except Exception:
+        log.exception("brief built without %s", what)
+        return default
+
+
+def _safely(what: str, compute, default=None):
+    """An extra the brief can do without, computed from data already read: on failure log why and leave it out."""
+    try:
+        return compute()
+    except Exception:
+        log.exception("brief built without %s", what)
+        return default
+
+
+def _sales_deals(conn, workspace_id) -> tuple[dict[str, dict], dict[str, str]]:
+    """(deals the brief covers by company id, working clients as company id -> name). Working clients stay out."""
     active = {}
-    working_clients = set()
+    working_clients = {}
     for deal in conn.execute(
-            "select o.id, o.company_id, c.name, o.stage, o.stage_rank, o.owner_code, o.removed_at from opportunities o"
+            "select o.id, o.company_id, c.name, o.stage, o.stage_rank, o.owner_code, o.removed_at, o.next_step"
+            " from opportunities o"
             " join companies c on c.id = o.company_id where o.workspace_id = %s order by o.id",
             (workspace_id,)):
         company_id = str(deal["company_id"])
         if is_working_client(deal["stage"]):
-            working_clients.add(company_id)
+            working_clients[company_id] = deal["name"]
         elif deal["removed_at"] is None:
             active[company_id] = deal
     return active, working_clients
 
 
-def _working_client_record(record: dict, working_clients: set[str]) -> bool:
+def _working_client_record(record: dict, working_clients: dict[str, str]) -> bool:
     # A rules link can identify the company even when the primary link is absent or disputed.
     return str(record["company_id"]) in working_clients or str(record.get("rules_company_id")) in working_clients
+
+
+def _company_addresses(conn, workspace_id, names: dict[str, str]) -> tuple[dict[str, set[str]], dict[str, str], dict[str, str]]:
+    """What entity resolution has learned: (company -> its own domains, domain -> company, contact email -> company).
+
+    A company's own domains are those carrying its name plus the one with the most linked records. A second domain
+    seen on its threads may be a vendor or partner copied in, so it is not assumed to be the customer.
+    """
+    rows = conn.execute("select domain, company_id, evidence_count, origin from company_domains"
+                        " where workspace_id = %s", (workspace_id,)).fetchall()
+    by_company: dict[str, list[dict]] = {}
+    for row in rows:
+        if not brief_v2.helpdesk_host(row["domain"]):
+            by_company.setdefault(str(row["company_id"]), []).append(row)
+    own: dict[str, set[str]] = {}
+    for company_id, found in by_company.items():
+        most = max(r["evidence_count"] or 0 for r in found)
+        own[company_id] = {r["domain"].lower() for r in found
+                           if (r["evidence_count"] or 0) == most or r.get("origin") == "manual"
+                           or resolution._name_in_domain(names.get(company_id, ""), r["domain"].lower())}
+    domain_company = {r["domain"].lower(): str(r["company_id"]) for r in rows if not brief_v2.helpdesk_host(r["domain"])}
+    contacts = {r["email"].lower(): str(r["company_id"]) for r in conn.execute(
+        "select email, company_id from contacts where workspace_id = %s and company_id is not null", (workspace_id,))}
+    return own, domain_company, contacts
 
 
 def _insight_rows(conn, workspace_id) -> list[dict]:
@@ -71,10 +120,16 @@ def _insight_rows(conn, workspace_id) -> list[dict]:
 
 
 def _scoped_rows(rows: list[dict], deals: dict[str, dict]) -> list[dict]:
-    """Sales items, plus not-yet-scoped ones; only delivery and out-of-scope work is hidden."""
+    """Sales items, plus not-yet-scoped ones; only delivery and out-of-scope work is hidden.
+
+    Pilots are stricter (founders, 11/12: "only truly sales-related items; a missed feature request is fine"):
+    on a Pilot deal a not-yet-scoped item is hidden too, because most of what a pilot generates is product work.
+    """
+    strict = settings.brief_pilot_strict_scope
     return [r for r in rows if r["action_scope"] in extractor.SALES_SCOPES
             and (deal := deals.get(str(r["company_id"]))) is not None
-            and str(deal["id"]) == str(r["opportunity_id"])]
+            and str(deal["id"]) == str(r["opportunity_id"])
+            and not (strict and r["action_scope"] is None and is_pilot(deal["stage"]))]
 
 
 def _email_asks(rows: list[dict]) -> dict[tuple[str, str, str], list[dict]]:
@@ -128,7 +183,46 @@ def _profile_sales_entry(entry: dict, profile: dict, sales_by_id: dict[str, dict
                                   for r in evidence)
 
 
-def _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, email_to_code, sales) -> list[brief.Meeting]:
+# Words too common in company names to tie a guest's email domain to one deal on their own.
+_GENERIC_NAME_WORDS = frozenset("grupo group foods food wines wine brands brand company companies club coca cola "
+                                "distribuidora distri bebidas drinks snacks snack global international holding "
+                                "holdings corp corporation limited industrias mexico argentina peru chile usa".split())
+
+
+def _deal_for_guests(guests: list[dict], deals: dict[str, dict], working_clients: dict[str, str],
+                     domain_company: dict[str, str], contact_company: dict[str, str]) -> tuple[str | None, str | None]:
+    """(company id, the domain that decided it) for a meeting no other rule linked, from who is invited.
+
+    First what entity resolution already learned (a guest's address or domain tied to one company). Failing that,
+    a guest domain that carries exactly one pipeline company's distinctive name (freestylesnacking.com -> Freestyle
+    Snacks). Two different companies on one invite, or a free-mail guest we do not know, decide nothing.
+    """
+    found: dict[str, str] = {}
+    for guest in guests:
+        address = guest["address"]
+        host = domain(address)
+        company = contact_company.get(address) or (None if host in resolution.FREEMAIL else domain_company.get(host))
+        if company:
+            found.setdefault(company, host)
+    if not found:
+        for guest in guests:
+            host = domain(guest["address"])
+            if host in resolution.FREEMAIL or brief_v2.helpdesk_host(host):
+                continue
+            label = host.split(".")[0].replace("-", "")
+            names = {**working_clients, **{company_id: d["name"] for company_id, d in deals.items()}}
+            for company_id, name in names.items():
+                words = [w.replace("-", "") for w in normalize_name(name).split()]
+                if any(len(w) >= 5 and w not in _GENERIC_NAME_WORDS and w in label for w in words):
+                    found.setdefault(company_id, host)
+    if len(found) != 1:
+        return None, None
+    return next(iter(found.items()))
+
+
+def _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, email_to_code, sales, *,
+                       internal: set[str] = frozenset(), domain_company: dict[str, str] | None = None,
+                       contact_company: dict[str, str] | None = None) -> list[brief.Meeting]:
     # Preserve prep only when a qualifying action is supported by this particular meeting.
     prep: dict[str, str] = {}
     for r in sales:
@@ -136,6 +230,7 @@ def _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, em
                 and r["type"] in ("commitment", "next_step")):
             prep.setdefault(str(r["origin_record_id"]), r["text"])
     start = datetime.combine(today, time.min, tz)
+    ours = set(internal) | {d.lower() for d in settings.project_team_domains}
     meetings = []
     for m in conn.execute(
             "select id, subject, occurred_at, participants, company_id, rules_company_id from source_records"
@@ -144,13 +239,102 @@ def _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, em
             " order by occurred_at", (workspace_id, start, start + timedelta(days=2))):
         if _working_client_record(m, working_clients):
             continue
-        deal = deals.get(str(m["company_id"]))
-        codes = sorted({email_to_code[a["address"]] for a in (m["participants"] or {}).get("attendees") or []
-                        if a.get("address") in email_to_code})
+        attendees = [a for a in (m["participants"] or {}).get("attendees") or [] if a.get("address")]
+        guests = [{"address": a["address"].lower(), "name": (a.get("name") or "").strip(), "response": a.get("response")}
+                  for a in attendees if "@" in a["address"] and domain(a["address"].lower()) not in ours
+                  and domain(a["address"].lower()) not in resolution.IGNORED_DOMAINS]
+        # The classifier's link first, then the people-based link, then the guests' own domains.
+        deal = deals.get(str(m["company_id"])) or deals.get(str(m.get("rules_company_id")))
+        matched_by = None
+        if deal is None and not m["company_id"] and internal:
+            try:
+                company_id, matched_by = _deal_for_guests(guests, deals, working_clients, domain_company or {},
+                                                          contact_company or {})
+            except Exception:           # the meeting is still listed, just not tied to a deal
+                log.exception("guest matching skipped for meeting %s", m["id"])
+                company_id, matched_by = None, None
+            if company_id in working_clients:
+                continue            # a working client's meeting: out of the brief, like the rest of its activity
+            deal = deals.get(company_id)
+        codes = sorted({email_to_code[a["address"]] for a in attendees if a.get("address") in email_to_code})
         meetings.append(brief.Meeting(m["occurred_at"].astimezone(tz), m["subject"] or "(no title)",
                                       deal["name"] if deal else None, deal["stage"] if deal else None, codes,
-                                      context=prep.get(str(m["id"]), "")))
+                                      context=prep.get(str(m["id"]), ""), guests=guests, matched_by=matched_by))
     return meetings
+
+
+def _apply_sheet_dates(deals: dict[str, dict], views: dict[str, brief_v2.DealView], items: list[brief_v2.Item],
+                       insight_rows: list[dict], closed: dict, today) -> list[brief_v2.Item]:
+    """Read "(complete by <date>)" notes from each deal's Sheet Next step and return the items still to show.
+
+    Every dated bullet of a deal that is not Paused becomes a SheetDue on its view. When the same step also exists
+    as an open extracted item, the Sheet date wins: before the date the item is held back (the founder said when to
+    look at it), and from the date on the Sheet row stands in for it, so one step is never listed twice. A bullet
+    whose matching item was already closed, or that a founder marked Done, is not raised again.
+    """
+    for d in deals.values():
+        views[d["name"]].sheet_next = brief_sheet_steps.first_bullet(d.get("next_step"))
+    if not settings.brief_sheet_dates:
+        return items
+    overdue_days, hold = settings.brief_sheet_step_overdue_days, settings.brief_sheet_hold_matching
+    # An item that is due (or due tomorrow) or overdue by its own date is never held for a later Sheet date: the
+    # promise the customer heard stands until someone closes it.
+    due_now = {i.id for i in items if i.due is not None and (i.due - today).days <= 1}
+    actions_by_deal: dict[str, list[dict]] = {}
+    for r in insight_rows:
+        if r["type"] in ("commitment", "next_step"):
+            actions_by_deal.setdefault(str(r["opportunity_id"]), []).append(r)
+    open_ids = {i.id for i in items}
+    taken: set[str] = set()
+    for d in deals.values():
+        view = views[d["name"]]
+        if is_paused(d["stage"]):
+            continue
+        try:
+            taken |= _deal_sheet_dates(d, view, actions_by_deal.get(str(d["id"]), []), open_ids, due_now, closed,
+                                       today, overdue_days, hold)
+        except Exception:               # one unreadable cell must not stop the brief or the other deals' dates
+            log.exception("sheet dates skipped for opportunity %s", d["id"])
+            view.sheet_steps, view.held = [], 0
+    return [i for i in items if i.id not in taken]
+
+
+def _deal_sheet_dates(d: dict, view: brief_v2.DealView, deal_actions: list[dict], open_ids: set[str],
+                      due_now: set[str], closed: dict, today, overdue_days: int, hold: bool) -> set[str]:
+    """One deal's dated Sheet bullets onto its view; returns the ids of the items they hold back or stand in for."""
+    kept_keys, deal_taken = [], set()
+    for step in brief_sheet_steps.parse_cell(d.get("next_step"), today):
+        ref = _recommendation_ref(d["id"], f"sheet step: {step.key} {step.due.isoformat()}")
+        if closed.get(("rec", ref), ("",))[0] == "done":
+            continue
+        same = [r for r in deal_actions
+                if brief_sheet_steps.same_step(step.key, brief_sheet_steps.match_key(r["text"]))]
+        matched = [str(r["id"]) for r in same if str(r["id"]) in open_ids]
+        if same and not matched and any(r["status"] in ("done", "dismissed", "possibly_done") for r in same):
+            continue                # the step itself was closed; the Sheet text is just not updated yet
+        late = (today - step.due).days
+        current = late <= overdue_days
+        if current and late >= 0:   # due now: the Sheet row replaces the item
+            deal_taken.update(matched)
+            kept_keys.append(step.key)
+        elif current and hold:      # not yet due: hold the item until then, unless its own date has come
+            held = [i for i in matched if i not in due_now]
+            deal_taken.update(held)
+            view.held += len(held)
+            if len(held) == len(matched):
+                kept_keys.append(step.key)
+        view.sheet_steps.append(brief_v2.SheetDue(step.text, step.due, ref,
+                                                  matched[0] if matched and 0 <= late and current else None))
+    if kept_keys:
+        def repeats(note: brief_v2.Note) -> bool:
+            return bool(note.evidence and note.evidence <= deal_taken) or any(
+                brief_sheet_steps.same_step(key, brief_sheet_steps.match_key(note.text)) for key in kept_keys)
+        view.recommendations = [n for n in view.recommendations if not repeats(n)]
+        if view.recommendation and repeats(view.recommendation):
+            view.recommendation = next(iter(view.recommendations), None)
+        if view.unanswered and view.unanswered.item_id in deal_taken:
+            view.unanswered = None
+    return deal_taken
 
 
 class BuildSyncReceipts(BaseModel):
@@ -358,7 +542,8 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
                 cands.append(c)
 
         # Meetings today and tomorrow (local time), not cancelled.
-        meetings = _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, email_to_code, sales)
+        meetings = _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, email_to_code, sales,
+                                      internal=internal)
 
         # Changes since the last brief.
         changes: list[brief.Change] = []
@@ -389,7 +574,9 @@ def build_brief_v1(dry_run: bool = False, since: datetime | None = None,
                 continue
             if r["source"] == "gmail":
                 senders = [p["address"] for p in (r["participants"] or {}).get("from") or []]
-                if senders and all(domain(s) not in internal for s in senders):
+                if (senders and all(domain(s) not in internal for s in senders)
+                        and not brief_v2.is_automated(senders, r["subject"])
+                        and not any(brief_v2.helpdesk_host(s) for s in senders)):
                     changes.append(brief.Change(d["name"], f"Customer replied: {r['subject'] or '(no subject)'}",
                                                 d["owner_code"], timeline.GMAIL_THREAD_URL.format(r["thread_id"])))
             elif r["source"] == "notes":
@@ -510,6 +697,9 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         since = since or (last["created_at"] if last else now - timedelta(hours=24))
 
         deals, working_clients = _sales_deals(conn, workspace_id)
+        own_domains, domain_company, contact_company = _optional(
+            conn, "learned company domains (guest matching, reply origin)", lambda: _company_addresses(
+                conn, workspace_id, {company_id: d["name"] for company_id, d in deals.items()}), ({}, {}, {}))
         profiles = {str(r["opportunity_id"]): r for r in conn.execute(
             "select distinct on (opportunity_id) opportunity_id, profile, generated_at, profiler_version"
             " from opportunity_profiles"
@@ -594,6 +784,34 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                 latest = last_reply if from_customer(m) else last_ours
                 if d["name"] not in latest or m["at"] > latest[d["name"]]:
                     latest[d["name"]] = m["at"]
+        # Both read the archive of sent briefs. Briefs archived before 11/17 have no "resurfaced" key: they count
+        # as days a brief was sent and as listing no quiet deal.
+        cadence = None                  # None: time-based nudges are switched off (see _split_followups)
+        if settings.brief_followup_nudges:
+            cadence = brief_v2.Cadence(settings.brief_nudge_every_days, settings.brief_pause_after_emails, _optional(
+                conn, "the days a brief was sent (a weekly nudge may repeat)", lambda: frozenset(
+                    r["for_date"] for r in conn.execute(
+                        "select distinct for_date from briefs where workspace_id = %s and for_date >= %s",
+                        (workspace_id, today - timedelta(days=settings.brief_nudge_every_days))) if r.get("for_date")),
+                frozenset()))
+        # Quiet In Talks deals listed by an earlier day's brief wait out the cooldown (today's own rebuilds do not
+        # count, so a retry shows the same batch).
+        resurface = settings.brief_resurface_per_day
+        resurfaced_recently = _optional(conn, "the quiet-deal batch (earlier batches unreadable)", lambda: frozenset(
+            name for r in conn.execute(
+                "select jsonb_path_query_array(payload, '$.sections[*].resurfaced[*].deal') as deals from briefs"
+                " where workspace_id = %s and for_date >= %s and for_date < %s",
+                (workspace_id, today - timedelta(days=settings.brief_resurface_cooldown_days), today))
+            for name in r.get("deals") or [] if isinstance(name, str)), None) if resurface > 0 else frozenset()
+        if resurfaced_recently is None:     # without the cooldown the same deals would repeat daily: skip the batch
+            resurface, resurfaced_recently = 0, frozenset()
+        def answered_after(thread_id: str | None, at: datetime | None) -> datetime | None:
+            """When we last sent a real email to someone outside Bianca in this thread after the given moment."""
+            if at is None:
+                return None
+            return max((m["at"] for m in threads.get(thread_id or "", [])
+                        if not m["automated"] and not from_customer(m) and outside(m) and m["at"] > at), default=None)
+
         waiting_candidates: list[brief_v2.Waiting] = []
         waiting: dict[str, brief_v2.Waiting] = {}
         for thread_id, msgs in threads.items():
@@ -618,12 +836,15 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                 replied = last_reply.get(d["name"])
                 nudges = sum(1 for at in ours_sent.get(d["name"], []) if not replied or at > replied)  # every thread
                 action, evidence = _waiting_action(email_asks, w)
+                timed = cadence is not None and not is_paused(d["stage"])   # a Paused deal is never nudged
                 candidate = brief_v2.Waiting(
                     d["name"], d["stage"], w["to"], sent.date(), w["days"], max(nudges, w["nudges"]), replied is not None,
                     w["auto_reply"] or last_auto.get(d["name"], t["occurred_at"]) > t["occurred_at"],
                     timeline.GMAIL_THREAD_URL.format(thread_id), f"Email · {sent:%b} {sent.day}",
                     thread_id, sender if sender in FOUNDER_ORDER else d["owner_code"], d["stage_rank"],
-                    action=action, evidence=evidence)
+                    action=action, evidence=evidence,
+                    nudge=bool(timed and _safely("a weekly nudge", lambda: cadence.due(sent.date(), today), False)),
+                    pause_after=cadence.pause_after if timed else None)
                 waiting_candidates.append(candidate)
                 if d["name"] not in waiting or sent.date() > waiting[d["name"]].sent:
                     waiting[d["name"]] = candidate
@@ -646,7 +867,9 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                     if gate:
                         sources[f"thread:{thread_id}"] = ActionSource("reply", str(t["id"]), t["occurred_at"])
 
-        meetings = _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, email_to_code, sales)
+        meetings = _upcoming_meetings(conn, workspace_id, today, tz, deals, working_clients, email_to_code, sales,
+                                      internal=internal, domain_company=domain_company,
+                                      contact_company=contact_company)
 
         # What changed: only records stored since the last brief can hold a development; each is then dated by
         # its source event time (email sent, meeting date), never by when we stored it.
@@ -686,7 +909,21 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             sources[f"rec:{ref}"] = brief_review.profile_source(prof, entry, ins_by_id)
         return brief_v2.Note(text, entry.get("why") if with_why else None, verified, entry.get("basis"),
                              link if verified else None, frozenset(str(x["id"]) for x in resolved), source, ref,
-                             followup_only=with_why and entry.get("followup_only") is True)
+                             followup_only=with_why and entry.get("followup_only") is True,
+                             on=when.date() if when else None)
+
+    def replied_since(evidence: frozenset):
+        """Already-done cue for builds without the pre-send check (11/09 evals, FEMSA): the day we last wrote in
+        the email threads a suggestion rests on, if in every one of them we wrote after the newest thing it cites.
+
+        A later email is not proof the suggestion was carried out (it may be a thank-you), so the row is kept and
+        only marked "you wrote back <day> - still open?". A verified build asks the pre-send check instead.
+        """
+        cited = [ins_by_id[i] for i in evidence if i in ins_by_id]
+        times = [r["origin_occurred_at"] or r["occurred_at"] for r in cited if r["origin_occurred_at"] or r["occurred_at"]]
+        mail = {r["unit_id"] for r in cited if r["source"] == "gmail"}
+        replies = [answered_after(thread_id, max(times)) for thread_id in mail] if times else []
+        return max(replies).astimezone(tz).date() if replies and all(replies) else None
 
     views: dict[str, brief_v2.DealView] = {}
     for company_id, d in deals.items():
@@ -698,12 +935,19 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                  and _profile_sales_entry(a, prow, sales_by_id, d)
                  and (n := note(d, a, prow, True)) and n.verified
                  and closed.get(("rec", n.ref), ("",))[0] != "done"]
+        if not gate:                    # a verified build asks the pre-send check instead
+            for n in recs_:
+                n.replied = _safely("the wrote-back cue on a suggestion", lambda: replied_since(n.evidence))
         views[d["name"]] = brief_v2.DealView(
             d["name"], d["stage"], d["stage_rank"], d["owner_code"], last_contact.get(company_id),
             blocker=blockers[0] if blockers else None,
             recommendation=recs_[0] if recs_ else None,
             recommendations=recs_,
-            summary=note(d, prof.get("summary"), prow, False), unanswered=unanswered.get(d["name"]))
+            summary=note(d, prof.get("summary"), prow, False), unanswered=unanswered.get(d["name"]),
+            last_outbound=max(sent).astimezone(tz).date() if (sent := ours_sent.get(d["name"])) else None,
+            last_reply=replied.astimezone(tz).date() if (replied := last_reply.get(d["name"])) else None,
+            unanswered_emails=sum(1 for at in ours_sent.get(d["name"], [])
+                                  if not last_reply.get(d["name"]) or at > last_reply[d["name"]]))
 
     bianca_names = {brief_v2.norm(t["full_name"]) for t in team} | {"bianca"}
 
@@ -757,11 +1001,19 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         kind = brief_v2.item_kind(r["type"], r["due_date"], speaker(r), r["quote"], side_for(r))
         if gate:
             sources[f"insight:{r['id']}"] = ActionSource.insight("recommendation" if kind == "proposed" else "commitment", r)
+        replied = None
+        if not gate and kind == "customer_request" and r["source"] == "gmail":
+            # The customer asked by email and we have written back in that thread since: flag it, do not hide it.
+            replied = _safely("the wrote-back cue on a request", lambda: answered_after(r["unit_id"], timestamp))
         items.append(brief_v2.Item(
             str(r["id"]), d["name"], r["text"], r["due_date"], recorded, r["owner_name"], route, basis, delegated,
             f"{SOURCE_LABEL.get(r['source'], r['source'])} · {when:%b} {when.day}" if when else r["source"],
             _link_for(r["source"], r["unit_id"], r["meta"]),
-            brief_v2.bucket(r["due_date"], recorded, today, t1, t2), kind))
+            brief_v2.bucket(r["due_date"], recorded, today, t1, t2), kind,
+            replied=replied.astimezone(tz).date() if replied else None))
+
+    items_before_sheet = items
+    items = _apply_sheet_dates(deals, views, items, ins_rows, closed, today)
 
     # ---- classify every newly extracted insight by the event time of the record its quote comes from
     lookback = settings.brief_late_lookback_days
@@ -783,24 +1035,50 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
 
     names = {t["owner_code"]: t["full_name"] for t in team}
     waits = list(waiting.values())
+    max_rows = settings.brief_max_table_rows
+    picked_waits = {code: brief_v2.pick_waiting(waits, code, max_rows) for code in FOUNDER_ORDER}
     sections = []
     for code in FOUNDER_ORDER:
         short, full = DISPLAY.get(code, (code, names.get(code, code)))
-        sections.append(brief_v2.build_section(
-            code, full, short, views, items, [(m, m.context) for m in meetings if code in m.attendees], today, display,
-            0 if gate else hidden.get(code, 0), settings.brief_critical_ahead_days, settings.brief_in_talks_target,
-            waiting=brief_v2.rank_waiting(waits, code), waiting_candidates=waiting_candidates))
+        shown, more = picked_waits[code]
+
+        def section(views, items, cadence, resurface):
+            return brief_v2.build_section(
+                code, full, short, views, items, [(m, m.context) for m in meetings if code in m.attendees], today,
+                display, 0 if gate else hidden.get(code, 0), settings.brief_critical_ahead_days,
+                settings.brief_in_talks_target, waiting=shown, more_waiting=more,
+                left_waiting=brief_v2.waiting_left_out(waits, code, shown), waiting_candidates=waiting_candidates,
+                sheet_overdue_days=settings.brief_sheet_step_overdue_days, cadence=cadence, max_rows=max_rows,
+                resurface=resurface, resurfaced_recently=resurfaced_recently)
+        try:
+            sections.append(section(views, items, cadence, resurface))
+        except Exception:
+            # The 11/17 additions are extras. If one of them breaks on today's data, send the brief without them
+            # rather than no brief: no Sheet dates, no time-based nudges, no quiet-deal batch for this founder.
+            log.exception("brief section %s rebuilt without Sheet dates, nudges and the quiet-deal batch", code)
+            plain = {name: replace(v, sheet_steps=[], held=0) for name, v in views.items()}
+            sections.append(section(plain, items_before_sheet, None, 0))
 
     ndl = [brief_v2.TodayRow(i.deal, views[i.deal].stage, "Due now", i.text, f"due {i.due:%b} {i.due.day}", "Nico DL",
-                             i.link, i.id, i.source, f"insight:{i.id}")
+                             i.link, i.id, i.source, f"insight:{i.id}", late=(today - i.due).days)
            for i in items if i.route == "NDL" and i.kind == "owed" and i.bucket in ("today", "overdue")]
     ndl += [brief_v2.TodayRow(v.deal, v.stage, "Reply needed", brief_v2.reply_text(v.unanswered),
                               f"received {v.unanswered.days}d ago", "Nico DL", v.unanswered.link, v.unanswered.item_id,
                               v.unanswered.source, v.unanswered.completion_ref)
             for v in views.values() if v.owner == "NDL" and v.unanswered and brief_v2.reply_label(v.unanswered) == "reply_needed"]
-    ndl = ndl[:brief.MAX_NDL]
+    for v in views.values():
+        if v.owner == "NDL":
+            ndl += _safely("a Sheet date for Nico DL", lambda: brief_v2.sheet_rows(
+                v, today, settings.brief_sheet_step_overdue_days, "Nico DL (Sheet)")[0], [])
+    ndl = brief_v2.sort_today(ndl)[:brief.MAX_NDL]
     ndl_review = brief_review.verify_v2(sections, ndl, {d["name"]: key for key, d in deals.items()}, sources, gate) \
         if gate else None
+    # Prep is written last, from the rows that survived the check above, so it never revives a closed action.
+    for s in sections:
+        s.meetings = [(m, prep or _safely("a meeting's prep line", lambda: brief_v2.meeting_prep(
+            m, s, views.get(m.deal), today, checked=gate is not None), ""))
+                      for m, prep in s.meetings]
+        brief_v2.cap_tables(s, max_rows)    # after the check, so rows that passed it fill the tables
 
     changes: list[brief_v2.ChangeRow] = []
     for ch in stage_changes:
@@ -839,7 +1117,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         changes.append(brief_v2.ChangeRow(d["name"], d["stage_rank"], text,
                                           f"{SOURCE_LABEL.get(r['source'], r['source'])} · {event:%b} {event.day}",
                                           _link_for(r["source"], r["unit_id"], r["meta"]), kind, event,
-                                          title_only=title_only))
+                                          title_only=title_only, from_customer=spk == "customer"))
     seen: set[tuple[str, str]] = set()
     for rec in reversed(new_records):  # plain facts only where nothing was extracted, dated the same way
         key, d = (rec["source"], rec["thread_id"]), deals.get(str(rec["company_id"]))
@@ -854,14 +1132,24 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             senders = [x["address"] for x in (rec["participants"] or {}).get("from") or []]
             if not senders or any(domain(a) in internal for a in senders) or brief_v2.is_automated(senders, rec["subject"]):
                 continue  # ours, or an out-of-office/notification: nobody replied
-            text = f"Customer replied (nothing new extracted): {rec['subject'] or '(no subject)'}"
+            company_id = str(rec["company_id"])
+            other = brief_v2.reply_origin(senders, own_domains.get(company_id),
+                                          {a for a, c in contact_company.items() if c == company_id})
+            who = f"Email from {other} on this deal" if other else "Customer replied"
+            text = f"{who} (nothing new extracted): {rec['subject'] or '(no subject)'}"
         else:
+            other = None
             text = f"Meeting notes added (nothing new extracted): {rec['subject'] or '(no subject)'}"
         changes.append(brief_v2.ChangeRow(d["name"], d["stage_rank"], text, SOURCE_LABEL[rec["source"]],
                                           _link_for(rec["source"], rec["thread_id"], rec["meta"]), kind,
-                                          _event_day(rec, tz), title_only=True))
-    changes = brief_v2.select_changes(changes)
+                                          _event_day(rec, tz), title_only=True,
+                                          from_customer=rec["source"] == "gmail" and not other))
+    every_change = changes
+    changes = brief_v2.select_changes(changes, max_rows)
+    more_changes = len(every_change) - len(changes)
+    left_changes = [c.deal for c in every_change if all(c is not shown for shown in changes)]
     backfill_events = [(r, rec) for r, rec, kind in events if kind == "backfill"]
+    undated = sorted({deals[str(r["company_id"])]["name"] for r, _, kind in events if kind == "undated"})
     undated_events = sum(1 for _, _, kind in events if kind == "undated")
     backfill = None
     if backfill_events:
@@ -870,7 +1158,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                     f"(events from {dates[0]:%b} {dates[0].day} to {dates[-1]:%b} {dates[-1].day}, "
                     f"more than {lookback} days before the last brief).")
     if undated_events:
-        backfill = (backfill + " " if backfill else "") + f"{undated_events} without a reliable event date."
+        from_notes = all(rec["source"] == "notes" for _, rec, kind in events if kind == "undated")
+        backfill = (backfill + " " if backfill else "") + brief_v2.undated_note(undated_events, undated, from_notes)
 
     coverage = ("Sources: pipeline Sheet, Ramiro's and Nico's Gmail and Calendar, meeting notes. Not connected: "
                 "WhatsApp, so missing activity is not proof nothing happened." if NICO_INBOX_CONNECTED else
@@ -881,7 +1170,8 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
     client = None if gate else _claude()   # verified builds keep wording stable: deterministic cut only
     display = prepare_table_text(brief_v2.table_text_fields(sections, ndl, changes), client, settings.anthropic_model)
     html_body = brief_v2.render(sections, ndl, changes, today, len(deals), coverage, not NICO_INBOX_CONNECTED,
-                                backfill, action_url, ndl_review, display=display)
+                                backfill, action_url, ndl_review, display=display, more_changes=more_changes,
+                                left_changes=left_changes)
     text_body = brief_v2.plain_text(sections, today, ndl_review, display=display)
     subj = brief_v2.subject(sections, today)
     to = settings.brief_to or [t["email"] for t in team if t["receives_brief"]]
@@ -893,6 +1183,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                                 "event": _event_day(rec, tz).isoformat(),
                                 "stored": rec["created_at"].astimezone(tz).isoformat(), "class": kind}
                                for r, rec, kind in events]
+    payload["more_changes"] = more_changes
     payload["change_cutoff"] = since.astimezone(tz).isoformat()
     log.info("brief v2 built for %s: items=%s changes=%s dry_run=%s", today, len(items), len(changes), dry_run)
     response = {"subject": subj, "html": html_body, "text": text_body, "to": ",".join(to), "for_date": today.isoformat(),

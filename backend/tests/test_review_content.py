@@ -5,8 +5,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from app.review_content import (approved_lineage, bullet_id, merge_content, proposal_content,
-                                source_id, source_version, validate_lineage)
+from app.review_content import (approved_lineage, bullet_id, merge_content, proposal_content, reviewed_content,
+                                review_next_step_bullets, source_id, source_version, validate_lineage)
 
 
 NOW = datetime(2026, 11, 4, 15, tzinfo=timezone.utc)
@@ -246,6 +246,43 @@ def test_reordering_approved_bullets_uses_text_identity_not_the_old_array_positi
                for node in lineage["nextStep"])
 
 
+def test_matching_formatted_deadlines_keep_both_sources_when_approved_once():
+    first_text = "Send the checklist by Nov 21."
+    second_text = "Send the Checklist on November 21."
+    first = record(body=first_text)
+    second = record(2, body=second_text)
+    content = proposal_content([first, second], [
+        insight(text=first_text, quote=first_text, source_record_ids=[first["id"]]),
+        insight(text=second_text, quote=second_text, source_record_ids=[second["id"]]),
+    ])
+    proposal = stored(content)
+
+    formatted = review_next_step_bullets(proposal)
+
+    assert len(content[0]) == 2
+    assert formatted == [formatted[0], formatted[0]]
+    assert formatted[0].endswith("(complete by Nov 21, 2026)")
+    lineage = approved_lineage(proposal, formatted[:1], [], review_next_steps=formatted)
+    assert lineage["nextStep"][0]["sourceIds"] == sorted([source_id(first), source_id(second)])
+
+
+def test_relative_deadlines_require_supporting_source_dates_that_agree():
+    action = "Send the checklist next Friday."
+    first = record(body=action)
+    second = record(2, body=action, occurred_at=NOW.replace(day=7))
+    content = proposal_content([first, second], [
+        insight(text=action, quote=action, source_record_ids=[first["id"]]),
+        insight(text=action, quote=action, source_record_ids=[second["id"]]),
+    ])
+    proposal = stored(content, created_at=NOW.replace(day=15))
+
+    assert review_next_step_bullets(proposal) == content[0]
+    assert review_next_step_bullets(proposal, frozenset((source_id(first), source_id(second)))) == content[0]
+    assert review_next_step_bullets(proposal, frozenset((source_id(first),))) == [
+        "Next step: Send the checklist. (complete by Nov 6, 2026)"
+    ]
+
+
 def test_manual_edits_and_destination_moves_do_not_inherit_source_attribution():
     content = proposal_content([record()], [insight()])
     lineage = approved_lineage(stored(content), ["Send a different offer."], [content[0][0]])
@@ -260,3 +297,297 @@ def test_empty_content_has_a_valid_empty_graph():
     content = proposal_content([], [])
     assert content == ([], [], [], {"nextStep": [], "clientContext": []})
     assert validate_lineage(*content)
+
+
+def _step(number, day, **overrides):
+    subjects = ("", "Send Ana the price list", "Book the Lima workshop", "Share the forecast sample",
+                "Confirm store codes", "Draft the pilot scope", "", "Ana needs faster reporting")
+    text = overrides.pop("text", f"Step {number}: {subjects[number]}.")
+    return (record(number, body=text, occurred_at=datetime(2026, 11, day, 15, tzinfo=timezone.utc)),
+            insight(id=f"extract-{number}", text=text, quote=text, source_record_ids=[f"record-{number}"],
+                    origin_record_id=f"record-{number}",
+                    occurred_at=datetime(2026, 11, day, 15, tzinfo=timezone.utc), **overrides))
+
+
+def test_next_steps_lead_with_bianca_actions_newest_first_then_customer_items_and_blockers():
+    pairs = [_step(1, 2, owner_side="customer"), _step(2, 3, type="blocker"), _step(3, 4), _step(4, 9),
+             _step(5, 10, owner_side=None)]
+    actions, context, sources, lineage = proposal_content([r for r, _ in pairs], [i for _, i in pairs])
+    assert [text.split(":")[0] for text in actions] == [
+        "Next step", "Next step", "Next step (owner to confirm)", "Customer next step", "Blocker"]
+    assert actions[0].startswith("Next step: Step 4") and actions[1].startswith("Next step: Step 3")
+    assert validate_lineage(actions, context, sources, lineage)
+
+
+def test_card_limit_keeps_the_newest_bullets_and_names_the_sources_it_retires():
+    pairs = [_step(number, day) for number, day in ((1, 1), (2, 5), (3, 9), (4, 12))]
+    need = _step(7, 2, type="need")
+    records, insights = [r for r, _ in pairs] + [need[0]], [i for _, i in pairs] + [need[1]]
+    (actions, context, sources, lineage), retired = reviewed_content(records, insights, max_next_steps=2, max_context=4)
+    assert [text[:17] for text in actions] == ["Next step: Step 4", "Next step: Step 3"]
+    assert len(context) == 1 and len(sources) == 3
+    assert validate_lineage(actions, context, sources, lineage)
+    assert retired == sorted((source_version(pairs[0][0]), source_version(pairs[1][0])),
+                             key=lambda item: (item["source"], item["external_id"], item["version"]))
+    # No limit, or a limit that is not exceeded, retires nothing.
+    assert reviewed_content(records, insights)[1] == []
+    assert reviewed_content(records, insights, max_next_steps=4, max_context=1)[1] == []
+
+
+def test_a_source_that_still_supports_a_kept_bullet_is_not_retired():
+    shared = record(1, body="Send the price list to Ana today. Confirm the store codes with the regional team.",
+                    occurred_at=datetime(2026, 11, 1, 15, tzinfo=timezone.utc))
+    old = insight(id="a", text="Confirm the store codes with the regional team.",
+                  quote="Confirm the store codes with the regional team.", origin_record_id="record-1",
+                  occurred_at=datetime(2026, 11, 1, 15, tzinfo=timezone.utc))
+    need = insight(id="b", type="need", text="Ana needs the price list.", quote="Send the price list to Ana today.",
+                   origin_record_id="record-1")
+    newer = _step(2, 9)
+    (actions, context, sources, lineage), retired = reviewed_content(
+        [shared, newer[0]], [old, need, newer[1]], max_next_steps=1)
+    assert actions == ["Next step: Step 2: Book the Lima workshop."] and context == ["Customer need: Ana needs the price list."]
+    assert retired == [] and len(sources) == 2
+    assert validate_lineage(actions, context, sources, lineage)
+
+
+def test_two_wordings_of_one_step_become_one_bullet_with_both_sources():
+    ours = _step(1, 9, text="Send Franco the sales analysis deck and schedule the pilot scoping meeting.")
+    theirs = _step(2, 10, owner_side="customer",
+                   text="Franco to review the sales analysis deck before the pilot scoping meeting.")
+    other = _step(3, 10, text="Ask Ana for the KeHE portal credentials.")
+    actions, context, sources, lineage = proposal_content(
+        [ours[0], theirs[0], other[0]], [ours[1], theirs[1], other[1]])
+    assert actions == ["Next step: Ask Ana for the KeHE portal credentials.",
+                       "Next step: Send Franco the sales analysis deck and schedule the pilot scoping meeting."]
+    assert lineage["nextStep"][1]["sourceIds"] == sorted([source_id(ours[0]), source_id(theirs[0])])
+    assert validate_lineage(actions, context, sources, lineage)
+
+
+def test_short_or_different_steps_are_never_merged():
+    first = _step(1, 9, text="Follow up with Ana.")
+    second = _step(2, 9, text="Follow up with Paul.")
+    third = _step(3, 9, text="Send the proposal to the commercial team in Mexico.")
+    fourth = _step(4, 9, text="Send the contract to the legal team in Chile.")
+    pairs = [first, second, third, fourth]
+    assert len(proposal_content([r for r, _ in pairs], [i for _, i in pairs])[0]) == 4
+
+
+# ---- H-06: an emailed ask that Bianca already answered in the same thread is not suggested again
+
+from datetime import timedelta
+
+from app.review_content import answered_email_asks, is_email_ask
+
+INTERNAL = frozenset({"bianca-ai.com", "kellogg.northwestern.edu"})
+
+
+def mail(number, sender, to, *, hours=0, thread="thread-1", subject="Meeting next week", **overrides):
+    return {"id": f"record-{number}", "thread_id": thread, "occurred_at": NOW + timedelta(hours=hours),
+            "subject": subject, "participants": {"from": [{"address": sender}], "to": [{"address": a} for a in to]},
+            **overrides}
+
+
+def ask(**overrides):
+    return insight(**{"id": "ask-1", "source": "gmail", "origin_record_id": "record-1",
+                      "text": "Confirm a time on Wednesday morning.", "quote": "Does Wednesday morning work?", **overrides})
+
+
+CUSTOMER_EMAIL = mail(1, "ana@redbull.com", ["nico@bianca-ai.com"])
+OUR_REPLY = mail(2, "nico@bianca-ai.com", ["ana@redbull.com"], hours=3)
+
+
+def test_an_emailed_ask_is_answered_once_bianca_writes_back_in_the_same_thread():
+    assert is_email_ask(ask())
+    assert answered_email_asks([ask()], [CUSTOMER_EMAIL, OUR_REPLY], INTERNAL) == {"ask-1"}
+    # The Kellogg project team writes on Bianca's behalf, as in the brief.
+    team = mail(2, "gibb@kellogg.northwestern.edu", ["ana@redbull.com"], hours=3)
+    assert answered_email_asks([ask()], [CUSTOMER_EMAIL, team], INTERNAL) == {"ask-1"}
+    # Stored timestamps may arrive as text.
+    as_text = [{**m, "occurred_at": m["occurred_at"].isoformat()} for m in (CUSTOMER_EMAIL, OUR_REPLY)]
+    assert answered_email_asks([ask()], as_text, INTERNAL) == {"ask-1"}
+
+
+@pytest.mark.parametrize("later", [
+    [],                                                                               # nothing after the ask
+    [mail(2, "nico@bianca-ai.com", ["ana@redbull.com"], hours=-2)],                   # our email came before the ask
+    [mail(2, "nico@bianca-ai.com", ["ana@redbull.com"], hours=0)],                    # same instant proves nothing
+    [mail(2, "nico@bianca-ai.com", ["ana@redbull.com"], hours=3, thread="thread-2")],  # another conversation
+    [mail(2, "nico@bianca-ai.com", ["ramiro@bianca-ai.com"], hours=3)],               # an internal forward
+    [mail(2, "ana@redbull.com", ["nico@bianca-ai.com"], hours=3)],                    # the customer wrote again
+    [mail(2, "mailer-daemon@bianca-ai.com", ["ana@redbull.com"], hours=3)],           # a bounce
+    [mail(2, "nico@bianca-ai.com", ["ana@redbull.com"], hours=3, subject="Automatic reply: Meeting next week")],
+    [mail(2, "nico@bianca-ai.com", ["ana@redbull.com"], hours=3, occurred_at=None)],  # undated
+    [{**mail(2, "nico@bianca-ai.com", ["ana@redbull.com"], hours=3), "participants": None}],
+])
+def test_anything_short_of_a_later_reply_from_bianca_to_the_outside_keeps_the_ask(later):
+    assert answered_email_asks([ask()], [CUSTOMER_EMAIL, *later], INTERNAL) == frozenset()
+
+
+@pytest.mark.parametrize("change", [
+    {"type": "commitment"},                 # a promise is a deliverable, not a reply
+    {"owner_side": "customer"},             # something the customer owes
+    {"owner_side": None},
+    {"source": "notes"},                    # said in a meeting: an email does not prove it was done
+    {"origin_record_id": None},             # older items not tied to one message
+    {"origin_record_id": "record-9"},       # origin not among the thread's messages
+    {"type": "blocker"},
+])
+def test_only_next_steps_for_bianca_taken_from_one_customer_email_are_checked(change):
+    assert answered_email_asks([ask(**change)], [CUSTOMER_EMAIL, OUR_REPLY], INTERNAL) == frozenset()
+
+
+def test_an_ask_in_our_own_email_or_an_automatic_message_is_never_treated_as_answered():
+    ours = mail(1, "nico@bianca-ai.com", ["ana@redbull.com"])
+    assert answered_email_asks([ask()], [ours, OUR_REPLY], INTERNAL) == frozenset()
+    auto = mail(1, "noreply@redbull.com", ["nico@bianca-ai.com"])
+    assert answered_email_asks([ask()], [auto, OUR_REPLY], INTERNAL) == frozenset()
+    undated = {**CUSTOMER_EMAIL, "occurred_at": None}
+    assert answered_email_asks([ask()], [undated, OUR_REPLY], INTERNAL) == frozenset()
+
+
+def test_a_reply_that_is_only_about_delivery_work_does_not_answer_a_sales_ask():
+    assert answered_email_asks([ask()], [CUSTOMER_EMAIL, OUR_REPLY], INTERNAL, not_sales=frozenset({"record-2"})) == frozenset()
+    second = mail(3, "nico@bianca-ai.com", ["ana@redbull.com"], hours=5)
+    assert answered_email_asks([ask()], [CUSTOMER_EMAIL, OUR_REPLY, second], INTERNAL,
+                               not_sales=frozenset({"record-2"})) == {"ask-1"}
+
+
+def test_a_thread_marked_done_in_the_brief_answers_asks_up_to_that_click_only():
+    clicked = NOW + timedelta(hours=1)
+    assert answered_email_asks([ask()], [CUSTOMER_EMAIL], INTERNAL, thread_done={"thread-1": clicked}) == {"ask-1"}
+    assert answered_email_asks([ask()], [CUSTOMER_EMAIL], INTERNAL, thread_done={"thread-2": clicked}) == frozenset()
+    # A newer customer email after the click is a new ask.
+    newer = mail(3, "ana@redbull.com", ["nico@bianca-ai.com"], hours=4)
+    later_ask = ask(id="ask-2", origin_record_id="record-3")
+    assert answered_email_asks([ask(), later_ask], [CUSTOMER_EMAIL, newer], INTERNAL,
+                               thread_done={"thread-1": clicked}) == {"ask-1"}
+
+
+def test_an_answered_ask_leaves_the_card_and_everything_else_stays():
+    email = record(body="Does Wednesday morning work? We also need the store list.")
+    asks = [insight(id="ask-1", text="Confirm a time on Wednesday morning.", quote="Does Wednesday morning work?"),
+            insight(id="ask-2", text="Send the store list.", quote="We also need the store list."),
+            insight(id="need-1", type="need", text="Store-level reporting.", quote="We also need the store list.")]
+    (steps, context, sources, lineage), retired = reviewed_content([email], asks, answered=frozenset({"ask-1"}))
+    assert steps == ["Next step: Send the store list."]
+    assert context == ["Customer need: Store-level reporting."]
+    assert len(sources) == 1 and retired == []
+    assert validate_lineage(steps, context, sources, lineage)
+    # With no rule input the card is exactly what it was before this rule existed.
+    assert reviewed_content([email], asks)[0][0] == [
+        "Next step: Confirm a time on Wednesday morning.", "Next step: Send the store list."]
+
+
+# ---- B-10: a step that only says "keep following up" is not suggested; H-10: cards that are only waiting
+
+from app.brief_followups import is_followup_only
+from app.review_content import is_vague_followup, is_waiting_on_them
+
+VAGUE = [
+    "Keep following up.", "keep following up", "Continue to follow up", "Continue following up with the customer.",
+    "Keep following up with Andina", "Keep following up with Andina until they reply.",
+    "Bianca should keep following up with Chifles.", "The team should continue to follow up",
+    "Ramiro to keep following up with Arca Peru", "We need to keep following up with them",
+    "Follow up.", "Follow-up", "Follow up with the customer", "Follow up with them again",
+    "Follow up again with Renzo", "Send a follow-up", "Send a follow-up email.", "Send another follow-up to Juan",
+    "Send a reminder to the team", "Check in again", "Keep checking in with the client periodically",
+    "Stay in touch", "Keep in touch with them for now", "- Keep following up",
+    "Seguir haciendo seguimiento", "Continuar con el seguimiento con el cliente", "Dar seguimiento",
+]
+SPECIFIC = [
+    "Follow up with Renzo",                                         # names who to write to
+    "Follow up with Renzo about the FEMSA walkthrough",
+    "Follow up on the pricing proposal", "Follow up next week", "Follow up this week",
+    "Keep following up on the NDA", "Follow up by Nov 13", "Follow up with Juan on Monday",
+    "Follow up in two weeks if there is no reply", "Keep following up with the pricing proposal",
+    "Send a follow-up with the revised quote", "Send a follow-up email with three time slots",
+    "Send another follow-up to Juan about the store data", "Send the follow-up deck",
+    "Send Patricio a few bullet points on the idea", "Reconnect", "Email her Monday",
+    "Check on tax docs and onboarding", "Check in with Zach about the store data",
+    "Re-push Renzo for the 15-minute FEMSA walkthrough", "Chase Zach for the store data",
+    "Follow up to confirm the Wednesday 2 pm call", "Schedule a follow-up meeting",
+    "Follow up with the buyer to get the signed NDA", "Hold the follow-up call on Nov 6",
+    "Waiting for reply from their team in terms of when do we meet", "",
+]
+
+
+@pytest.mark.parametrize("text", VAGUE)
+def test_content_free_follow_ups_are_recognised(text):
+    assert is_vague_followup(text) is True
+
+
+@pytest.mark.parametrize("text", SPECIFIC)
+def test_a_step_with_a_topic_a_date_or_a_named_person_is_never_treated_as_vague(text):
+    assert is_vague_followup(text) is False
+
+
+def test_the_vague_filter_is_narrower_than_the_brief_nudge_check():
+    # The brief treats any nudge-only suggestion as a follow-up; the hub drops only the ones with no content.
+    for text in ("Follow up with Renzo about the FEMSA walkthrough", "Follow up on the pricing proposal"):
+        assert is_followup_only(text) and not is_vague_followup(text)
+    for text in ("Follow up.", "Follow up with the customer", "Send a follow-up", "Check in again"):
+        assert is_followup_only(text) and is_vague_followup(text)
+
+
+def test_vague_follow_ups_leave_the_card_but_dated_customer_owed_and_context_items_stay():
+    body = ("Keep following up. They will keep following up with us. Follow up on the pricing proposal. "
+            "Send a follow-up. We keep following up but they are slow.")
+    email = record(body=body)
+    def item(n, text, quote, **changes):
+        return insight(id=f"i-{n}", text=text, quote=quote, **changes)
+    insights = [
+        item(1, "Keep following up.", "Keep following up."),                                   # dropped
+        item(2, "Keep following up", "Keep following up.", type="commitment"),                 # dropped
+        item(3, "Keep following up", "They will keep following up with us.", owner_side="customer"),
+        item(4, "Follow up on the pricing proposal", "Follow up on the pricing proposal."),
+        item(5, "Send a follow-up", "Send a follow-up.", due_date="2026-11-20"),               # a date is content
+        item(6, "Keep following up", "We keep following up but they are slow.", type="objection"),
+        item(7, "Keep following up", "We keep following up but they are slow.", type="blocker"),
+    ]
+    (steps, context, sources, lineage), _ = reviewed_content([email], insights)
+    assert steps == ["Next step: Follow up on the pricing proposal", "Next step: Send a follow-up — requested by 2026-11-20",
+                     "Customer next step: Keep following up", "Blocker: Keep following up"]
+    assert context == ["Objection: Keep following up"]
+    assert validate_lineage(steps, context, sources, lineage)
+
+
+def test_a_card_with_only_a_vague_follow_up_has_no_content():
+    (steps, context, sources, _), retired = reviewed_content(
+        [record(body="Keep following up with Andina.")],
+        [insight(text="Keep following up with Andina", quote="Keep following up with Andina.")])
+    assert steps == context == sources == retired == []
+
+
+def test_each_next_step_bullet_records_who_it_is_with_and_the_card_knows_when_it_is_only_waiting():
+    email = record(body="We will send the deck. Ana will share the store list. Budget is frozen. Someone books the room. "
+                        "They want store-level reporting.")
+    def item(n, quote, **changes):
+        return insight(id=f"i-{n}", text=quote.rstrip("."), quote=quote, **changes)
+    ours = item(1, "We will send the deck.", type="commitment")
+    theirs = item(2, "Ana will share the store list.", type="commitment", owner_side="customer")
+    blocker = item(3, "Budget is frozen.", type="blocker")
+    unowned = item(4, "Someone books the room.", owner_side=None)
+    need = item(5, "They want store-level reporting.", type="need")
+    lineage = proposal_content([email], [ours, theirs, blocker, unowned, need])[3]
+    assert [node["side"] for node in lineage["nextStep"]] == ["bianca", "unassigned", "customer", "blocker"]
+    assert all("side" not in node for node in lineage["clientContext"])
+    assert is_waiting_on_them(lineage) is False
+    assert is_waiting_on_them(proposal_content([email], [theirs, blocker, need])[3]) is True
+    assert is_waiting_on_them(proposal_content([email], [theirs])[3]) is True
+    assert is_waiting_on_them(proposal_content([email], [blocker, unowned])[3]) is False   # an unowned step may be ours
+    # No Next Step bullets, or a card built before sides were recorded: the card cannot say.
+    assert is_waiting_on_them(proposal_content([email], [need])[3]) is None
+    old = proposal_content([email], [theirs])[3]
+    del old["nextStep"][0]["side"]
+    assert is_waiting_on_them(old) is None
+    for broken in (None, {}, {"nextStep": "x"}, {"nextStep": [None]}, {"nextStep": [{"side": "martian"}]}):
+        assert is_waiting_on_them(broken) is None
+
+
+def test_an_unedited_step_keeps_its_side_in_the_decision_lineage():
+    email = record(body="Ana will share the store list.")
+    theirs = insight(text="Share the store list", quote="Ana will share the store list.", type="commitment", owner_side="customer")
+    content = proposal_content([email], [theirs])
+    approved = approved_lineage(stored(content), [content[0][0], "A founder's own step"], [])
+    assert approved["nextStep"][0]["side"] == "customer" and approved["nextStep"][0]["origin"] == "source"
+    assert "side" not in approved["nextStep"][1] and approved["nextStep"][1]["origin"] == "founder_edit"

@@ -11,7 +11,7 @@ import re, sys, os, base64, json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from seed_data import to_js
 
-SHEET_URL = "https://docs.google.com/spreadsheets/d/11HXJsfGHIqnr_mekiV6l277v61C2qz_ELNxA0RyaNcA/edit?gid=1869050409#gid=1869050409"
+SHEET_URL = "https://docs.google.com/spreadsheets/d/1iPYYPFiFRokytN8xYOpByoQY-UYjdtoLeerWsuRGyHs/edit?gid=1869050409#gid=1869050409"
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOGO_BLUE = base64.b64encode(open(os.path.join(HERE, "bianca-blue-360.png"), "rb").read()).decode()
 LOGO_WHITE = base64.b64encode(open(os.path.join(HERE, "bianca-white-360.png"), "rb").read()).decode()
@@ -49,6 +49,8 @@ button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,t
 .wr{display:grid;grid-template-columns:320px 1fr;gap:18px;align-items:start}
 .wr-side{background:#fff;border:1px solid var(--line);border-radius:12px;overflow:hidden;position:sticky;top:12px;max-height:calc(100vh - 24px);overflow-y:auto}
 .wr-side .lh{padding:12px 14px 8px;font-size:11px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;color:#8792A8;display:flex;justify-content:space-between}
+.wr-side .gh{padding:9px 14px 6px;font-size:10.5px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:#5E6B86;display:flex;justify-content:space-between;border-top:1px solid var(--line);background:#FAFBFE}
+.wr-row.wait .co{color:#55617C}
 .wr-grp{padding:8px 14px 4px;font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:#8792A8;display:flex;align-items:center;gap:8px;border-top:1px solid var(--line)}.wr-grp:first-of-type{border-top:0}.wr-grp .avatar{margin:0;width:20px;height:20px;font-size:8px;border-width:1px}
 .wr-row{display:block;width:100%;text-align:left;background:#fff;border:0;border-left:3px solid transparent;padding:10px 14px 10px 12px;cursor:pointer}.wr-row:hover{background:#F6F8FD}.wr-row.on{background:var(--soft);border-left-color:var(--blue)}.wr-row .r1{display:flex;justify-content:space-between;gap:8px;align-items:center}.wr-row .co{font-family:Poppins,Inter,sans-serif;font-weight:600;font-size:13.5px;color:var(--ink)}.wr-row .age{font-size:11px;color:#94A0B2;white-space:nowrap}.wr-row .r2{font-size:12px;color:#5E6B86;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.wr-row .r3{margin-top:6px;display:flex;gap:6px;align-items:center;font-size:11px;color:#55617C;font-weight:600}.wr-row .r3 .own{margin-left:-2px}.wr-row .r3 .avatar{margin:0;width:18px;height:18px;font-size:7.5px;border-width:1px}
 .wr-main{min-width:0}.wr-nav{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}.wr-nav .pos{font-size:12px;color:var(--muted)}.wr-nav .btns{display:flex;gap:6px}.pill{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 12px;border-radius:999px;border:1px solid var(--line);background:#fff;font-size:12px;font-weight:600;color:var(--ink)}.pill.primary{background:var(--navy);color:#fff;border-color:var(--navy)}.pill:disabled{opacity:.4}
@@ -64,11 +66,18 @@ button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,t
 .bullet-list[data-destination=clientContext] li{font-size:13px;line-height:1.55;color:#5E6B86;font-weight:400}
 .source-highlight{background:#FFF4D6;border-radius:4px}
 .empty-group{font-size:12.5px;color:#94A0B2;margin-top:6px;font-style:italic}
-.whats-new{list-style:none;padding:0;margin:8px 0 0}.whats-new li{margin:3px 0}.whats-new details{font-size:13px;color:#5E6B86;line-height:1.5}.whats-new summary{list-style:none;cursor:pointer;display:flex;gap:8px;align-items:flex-start;padding-left:16px;position:relative}.whats-new summary::-webkit-details-marker{display:none}.whats-new summary:before{content:"-";position:absolute;left:2px;top:0;color:currentColor;font-weight:500}.whats-new .src{display:inline-block;font-size:10.5px;color:#5874AD;background:#F3F6FF;border:1px solid #E5EBF7;border-radius:4px;padding:0 6px;line-height:17px;white-space:nowrap;flex:none;margin-top:2px}.whats-new .ctx{margin:6px 0 4px 16px;padding:8px 10px;background:#F7F9FD;border-left:2px solid #C9D4EA;font-size:12.5px;color:#44506B;border-radius:0 6px 6px 0}
+.whats-new{list-style:none;padding:0;margin:8px 0 0}.whats-new li{margin:3px 0}.whats-new details{font-size:13px;color:#5E6B86;line-height:1.5}.whats-new summary{list-style:none;cursor:pointer;display:flex;gap:8px;align-items:flex-start;padding-left:16px;position:relative}.whats-new summary::-webkit-details-marker{display:none}.whats-new summary:before{content:"+";position:absolute;left:1px;top:0;color:#5874AD;font-weight:600}
+.whats-new details[open]>summary:before{content:"-"}
+.whats-new li.plain{display:flex;gap:8px;align-items:flex-start;padding-left:16px;position:relative;font-size:13px;color:#5E6B86;line-height:1.5}
+.whats-new li.plain:before{content:"\00B7";position:absolute;left:4px;top:0;color:#8C9CB7;font-weight:700}
+.whats-new li.more{color:#8792A8;font-size:12px}.whats-new li.more:before{content:""}
+.whats-new .ctx p{margin:0}.whats-new .ctx p+p{margin-top:6px;padding-top:6px;border-top:1px dashed #D9E0EE}.whats-new .src{display:inline-block;font-size:10.5px;color:#5874AD;background:#F3F6FF;border:1px solid #E5EBF7;border-radius:4px;padding:0 6px;line-height:17px;white-space:nowrap;flex:none;margin-top:2px}.whats-new .ctx{margin:6px 0 4px 16px;padding:8px 10px;background:#F7F9FD;border-left:2px solid #C9D4EA;font-size:12.5px;color:#44506B;border-radius:0 6px 6px 0}
 .source-list{display:flex;flex-wrap:wrap;gap:6px 8px;list-style:none;padding:0;margin:12px 0 0}.source-label{font-size:11px;color:#5874AD;background:#F3F6FF;border:1px solid #E5EBF7;border-radius:4px;padding:2px 8px;line-height:1.6;cursor:pointer}.source-label[aria-pressed=true]{background:var(--blue);color:#fff;border-color:var(--blue)}.source-label:disabled{opacity:.55;cursor:default}
 .source-trace-status{font-size:11px;color:#94A0B2;margin-top:6px}.source-trace-unavailable{color:var(--amber)}
 .approval-note{margin-top:10px;font-size:12px;color:var(--amber);background:#FFF8E8;border:1px solid #F0D9A4;border-radius:6px;padding:8px 10px}.legacy-note{color:var(--red);background:#FDF0F2;border-color:#F3C9D0}
-details.current-next-steps{margin-top:10px;border-top:1px solid #EFF2F8;padding-top:9px;font-size:12.5px}details.current-next-steps summary{cursor:pointer;color:#62769A;font-weight:600;list-style:none;display:flex;gap:8px;align-items:center}details.current-next-steps summary::-webkit-details-marker{display:none}details.current-next-steps summary:before{content:"+";width:12px;color:#8C9CB7;font-size:15px}details.current-next-steps[open] summary:before{content:"-"}
+details.current-next-steps{margin-top:10px;border-top:1px solid #EFF2F8;padding-top:9px;font-size:12.5px}details.current-next-steps summary{cursor:pointer;color:var(--ink);font-weight:600;font-size:13px;list-style:none;display:flex;gap:8px;align-items:center;border:1px solid #CBD3E3;border-radius:8px;background:#F7F9FD;padding:9px 12px}
+.current-next-steps summary:hover{background:#EEF3FC;border-color:#AFBBD3}.current-next-steps[open] summary{margin-bottom:10px}details.current-next-steps summary::-webkit-details-marker{display:none}details.current-next-steps summary:before{content:"+";width:12px;color:#3B5BDB;font-size:16px;font-weight:700}details.current-next-steps[open] summary:before{content:"-"}
+.cells-hint{font-weight:400;font-size:12px;color:#8792A8;margin-left:4px}
 .current-next-steps-content{font-size:12.5px;line-height:1.7;color:#5E6F8B;background:#F7F9FD;border-radius:6px;padding:10px 12px;margin-top:8px;white-space:pre-wrap;overflow-wrap:anywhere}
 .cells-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:8px}.cells-grid h4{margin:0 0 4px;font-size:10.5px;color:#8792A8;font-weight:700;text-transform:uppercase;letter-spacing:.6px}.cells-grid .current-next-steps-content{margin-top:0;min-height:46px}
 .card-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;flex-wrap:wrap}.actions{display:flex;gap:8px;align-items:center;position:relative;flex-wrap:wrap}
@@ -104,10 +113,27 @@ dialog{border:1px solid #D8E0EF;border-radius:14px;box-shadow:0 22px 90px #182D5
 .ns-add{margin-top:8px}
 .ns-preview{margin-top:10px;padding:8px 10px;border:1px dashed var(--line);border-radius:8px;font-size:12px;line-height:1.6;color:#55617C;white-space:pre-wrap}
 .ns-preview b{display:block;font-size:11px;letter-spacing:.4px;text-transform:uppercase;color:#6B7690;margin-bottom:2px}
+.ns-row input[aria-invalid=true]{border-color:var(--red);background:#FFF7F8}.ns-date-err{grid-column:1/-1;margin:-2px 0 2px;font-size:12px;line-height:1.5;color:var(--red)}
+.status-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px;font-size:12px;color:var(--muted)}.status-row .k{font-weight:600;color:#8792A8}.status-pick{height:32px;border:1px solid #CBD3E3;border-radius:7px;padding:0 8px;font-size:12.5px;color:var(--ink);background:#fff;max-width:220px}.status-row .status-save{min-height:32px;padding:0 11px;font-size:12px}
 @media (max-width:560px){.ns-row,.ns-head{grid-template-columns:minmax(0,1fr) 132px 32px}}
 .due{display:flex;gap:10px;align-items:center;margin-top:12px;font-size:12.5px;flex-wrap:wrap}.due input{height:32px;border:1px solid var(--line);border-radius:7px;padding:0 10px;font-size:12.5px;width:150px}
 .rotation-preview{margin-top:16px;border:1px solid #E2E8F4;border-radius:8px;overflow:hidden}.rotation-preview h3{font-size:11px;font-weight:650;padding:9px 12px;background:#F4F7FC;color:#526786;border-bottom:1px solid #E2E8F4}.rotation-row{padding:9px 12px;display:grid;grid-template-columns:110px 1fr;gap:10px;font-size:12px;line-height:1.6}.rotation-row+.rotation-row{border-top:1px solid #EDF1F8}.rotation-name{font-weight:650;color:#697B9A}.rotation-content{color:#7A879E;white-space:pre-line;overflow-wrap:anywhere}.rotation-explain{font-size:10.5px;color:#98A3B6;margin-top:8px;line-height:1.7}
-.dialog-actions{padding:12px 24px;border-top:1px solid #E9EEF7;display:flex;justify-content:flex-end;gap:8px;background:#FCFDFF}
+.dialog-actions{padding:12px 24px;border-top:1px solid #E9EEF7;display:flex;justify-content:flex-end;gap:8px;background:#FCFDFF;position:sticky;bottom:0;z-index:2;box-shadow:0 -6px 14px #1B22380F}
+#save-approve{min-width:164px;min-height:40px;font-size:14px}
+.btn-label{display:inline-flex;align-items:center;gap:6px}
+.btn-saving{display:none;align-items:center;gap:8px}
+.btn-saving::before,#save-approve.is-saving::before{content:"";width:12px;height:12px;flex:none;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:wr-spin .7s linear infinite}
+.review-card.is-saving .btn-label{display:none}
+.review-card.is-saving .btn-saving{display:inline-flex}
+.review-card.is-busy{overflow:hidden}
+.review-card.is-busy>*:not(.card-footer){opacity:.5}
+.review-card.is-busy::after{content:"";position:absolute;top:0;left:-40%;width:40%;height:3px;background:var(--green);animation:wr-saving 1.1s ease-in-out infinite}
+.review-card.is-busy button:disabled,#save-approve.is-saving:disabled{opacity:1;cursor:progress}
+.review-card.is-busy .secondary:disabled,.review-card.is-busy .quiet:disabled,.review-card.is-busy .status-save:disabled,.review-card.is-busy .mode button:disabled{opacity:.45}
+#edit-form[aria-busy=true] .dialog-body{opacity:.55;pointer-events:none}
+@keyframes wr-spin{to{transform:rotate(360deg)}}
+@keyframes wr-saving{to{left:100%}}
+@media(prefers-reduced-motion:reduce){.btn-saving::before,#save-approve.is-saving::before,.review-card.is-busy::after{animation:none}.review-card.is-busy::after{left:0;width:100%}}
 .toast-region{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);z-index:20;max-width:calc(100vw - 30px);pointer-events:none}.toast{background:#17274B;border:1px solid #33456B;border-radius:8px;box-shadow:0 7px 30px #14234A26;color:#fff;padding:12px 16px;display:flex;align-items:center;gap:12px;font-size:12.5px;line-height:1.6;pointer-events:auto}.toast button{background:transparent;border:0;color:#B9CCFF;text-decoration:underline;text-underline-offset:3px;padding:4px;font-size:12px;white-space:nowrap}.toast-close{font-size:17px!important;text-decoration:none!important;color:#A5B2CF!important}
 .pending-write{opacity:.65;pointer-events:none}
 /* focus theme */
@@ -129,9 +155,9 @@ HEADER = '''<header class="site-header"><div class="header-inner"><a class="bran
 TOOLBAR = '''<div class="toolbar"><div class="seg" id="owner-seg" role="group" aria-label="Filter by owner"><button type="button" class="on" data-owner="all">All <span class="cnt" data-cnt="all">0</span></button><button type="button" class="rg" data-owner="RG"><span class="avatar">RG</span>Ramiro <span class="cnt" data-cnt="RG">0</span></button><button type="button" class="nc" data-owner="NC"><span class="avatar nc">NC</span>Nico <span class="cnt" data-cnt="NC">0</span></button><button type="button" class="ndl" data-owner="NDL"><span class="avatar ndl">NDL</span>Nicolás de León <span class="cnt" data-cnt="NDL">0</span></button></div><div class="tb-right">__LAYOUT_TOGGLE__</div><div class="search-wrap"><label class="sr-only" for="company-search">Search companies</label><input class="search" id="company-search" type="search" value="" autocomplete="off" tabindex="-1" aria-hidden="true"></div><label class="sr-only" for="owner-filter">Filter by owner</label><select class="owner-filter" id="owner-filter" tabindex="-1" aria-hidden="true"><option value="all">All founders</option><option value="RG">Ramiro · RG</option><option value="NC">Nico · NC</option><option value="NDL">Nicolás de León · NDL</option></select></div>'''
 LAYOUT_TOGGLE = '<div class="layout-toggle" role="group" aria-label="Layout"><button type="button" class="on" data-theme-pick="war-room">War room</button><button type="button" data-theme-pick="focus">Focus</button></div>'
 
-DIALOG_EXTRA = '''<div class="mode-row"><div class="mode" id="edit-mode" role="group" aria-label="Next Step write mode"><button type="button" class="on" data-mode-pick="replace" aria-pressed="true">Replace Next Step</button><button type="button" data-mode-pick="append" aria-pressed="false">Keep current bullets + add these</button></div></div><p class="field-help">Replace writes only these steps to Next Step. Keep + add leaves the bullets already in the Sheet and adds these below them. Either way the previous Next Step is copied to Last progress. The same switch is on the card.</p>'''
-ROWS_EDITOR = '''<div class="ns-head" aria-hidden="true"><span>Next step</span><span>Complete by</span><span></span></div><div class="ns-rows" id="ns-rows"></div><button type="button" class="pill ns-add" data-action="ns-add">+ Add next step</button><div class="ns-preview" id="ns-preview" aria-live="polite"></div>'''
-ROWS_HELP = 'One row per next step, with an optional date. The date is written into the Next Step cell after the step as "(complete by Nov 4, 2026)" - no new Sheet column. Leave every row empty to keep Next Step and Last progress unchanged.'
+DIALOG_EXTRA = '''<div class="mode-row"><div class="mode" id="edit-mode" role="group" aria-label="Next Step write mode"><button type="button" class="on" data-mode-pick="replace" aria-pressed="true">Replace Next Step</button><button type="button" data-mode-pick="append" aria-pressed="false">Keep current bullets + add these</button></div></div><p class="field-help">Replace writes only these steps to Next Step and moves the previous Next Step to Last progress. Keep + add leaves the Next Step text already in the Sheet as it is, adds these steps below it and does not change Last progress. The same switch is on the card.</p>'''
+ROWS_EDITOR = '''<div class="ns-head" aria-hidden="true"><span>Next step</span><span>Complete by (d/m/y)</span><span></span></div><div class="ns-rows" id="ns-rows"></div><button type="button" class="pill ns-add" data-action="ns-add">+ Add next step</button><div class="ns-preview" id="ns-preview" aria-live="polite"></div>'''
+ROWS_HELP = 'One row per next step, with an optional date typed day first (16/11/2026 or 16 Nov). The date is written into the Next Step cell after the step as "(complete by Nov 4, 2026)" - no new Sheet column. Leave every row empty to keep Next Step and Last progress unchanged.'
 
 # ------------------------------------------------------------------------------------------------ presentation module (shared)
 WR_JS = r"""
@@ -157,11 +183,17 @@ const BiancaWarRoom = (() => {
     if(!filtered.some(p => p.id === selected)) selected = null;
     if(theme() === 'focus') return `<div class="grid">${filtered.map(card).join('')}</div>`;
     const ageDays = p => { const d = latestDate(p); return d ? Math.max(0, Math.round((Date.now() - d.getTime())/86400000)) : 9999; };
-    const ordered = [...filtered].sort((a, b) => ageDays(a) - ageDays(b) || a.company.localeCompare(b.company));
+    const byAge = (a, b) => ageDays(a) - ageDays(b) || a.company.localeCompare(b.company);
+    // Cards that only wait on the customer (the service marks them `waiting`) sit in a second group below the cards needing action (11/17/2026).
+    const acting = filtered.filter(p => p.waiting !== true).sort(byAge), waiting = filtered.filter(p => p.waiting === true).sort(byAge);
+    const ordered = [...acting, ...waiting];
     if(selected === null) selected = ordered[0].id;
     const idx = ordered.findIndex(p => p.id === selected), cur = ordered[idx];
-    const rows = ordered.map(p => `<button type="button" class="wr-row${p.id===selected?' on':''}" data-action="wr-select" data-select="${esc(p.id)}" aria-current="${p.id===selected?'true':'false'}"><div class="r1"><span class="co">${esc(p.company)}</span><span class="age">${esc(age(p))}</span></div><div class="r3"><span class="${stageClass(p.stage)}">${esc(p.stage||'')}</span>${avatar(p.owner)}<span class="own">${esc(p.owner||'')}</span></div></button>`).join('');
-    return `<div class="wr"><aside class="wr-side" aria-label="Companies to review"><div class="lh"><span>War room agenda</span><span>${filtered.length} to review</span></div>${rows}</aside><section class="wr-main"><div class="wr-nav"><span class="pos">Card ${idx+1} of ${filtered.length} · <span class="kbd">J</span> next <span class="kbd">K</span> prev <span class="kbd">A</span> approve <span class="kbd">E</span> edit <span class="kbd">I</span> ignore</span><div class="btns"><button type="button" class="pill" data-action="wr-prev" ${idx===0?'disabled':''}>&#8592; Prev</button><button type="button" class="pill primary" data-action="wr-next" ${idx>=filtered.length-1?'disabled':''}>Next card &#8594;</button></div></div>${card(cur)}</section></div>`;
+    const row = p => `<button type="button" class="wr-row${p.id===selected?' on':''}${p.waiting===true?' wait':''}" data-action="wr-select" data-select="${esc(p.id)}" aria-current="${p.id===selected?'true':'false'}"><div class="r1"><span class="co">${esc(p.company)}</span><span class="age">${esc(age(p))}</span></div><div class="r3"><span class="${stageClass(p.stage)}">${esc(p.stage||'')}</span>${avatar(p.owner)}<span class="own">${esc(p.owner||'')}</span></div></button>`;
+    const group = (label, list) => list.length ? `<div class="gh" role="presentation"><span>${label}</span><span>${list.length}</span></div>${list.map(row).join('')}` : '';
+    // The row order in the page is the order J / K and Prev / Next walk through.
+    const rows = waiting.length ? group('Needs your action', acting) + group('Waiting on them', waiting) : acting.map(row).join('');
+    return `<div class="wr"><aside class="wr-side" aria-label="Companies to review"><div class="lh"><span>War room agenda</span><span>${filtered.length} to review</span></div>${rows}</aside><section class="wr-main"><div class="wr-nav"><span class="pos">Card ${idx+1} of ${filtered.length}${cur.waiting===true?' · waiting on them':''} · <span class="kbd">J</span> next <span class="kbd">K</span> prev <span class="kbd">A</span> approve <span class="kbd">E</span> edit <span class="kbd">I</span> ignore</span><div class="btns"><button type="button" class="pill" data-action="wr-prev" ${idx===0?'disabled':''}>&#8592; Prev</button><button type="button" class="pill primary" data-action="wr-next" ${idx>=filtered.length-1?'disabled':''}>Next card &#8594;</button></div></div>${card(cur)}</section></div>`;
   }
   function syncControls(state, filtered){
     const pending = (state.proposals||[]).filter(p => ['pending','applying'].includes(p.status));
@@ -190,7 +222,7 @@ const BiancaWarRoom = (() => {
     else if(a !== 'ignore') closeMenus();
   }, true);
   document.addEventListener('keydown', e => {
-    if(e.metaKey || e.ctrlKey || e.altKey) return; const t = e.target; if(t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return; if(document.querySelector('dialog[open]')) return;
+    if(e.metaKey || e.ctrlKey || e.altKey) return; const t = e.target; if(t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return; if(document.querySelector('dialog[open]')) return;
     if(theme() !== 'war-room') return;
     const card = document.querySelector('.wr-main .review-card'); const k = e.key.toLowerCase();
     if(k === 'j') move(1); else if(k === 'k') move(-1);
@@ -204,33 +236,101 @@ const BiancaWarRoom = (() => {
   // Still presentation only: the page's own approve / decide path sends the bullets; nothing here calls the connector.
   const modes = new Map();
   const mode = id => modes.get(id) === 'append' ? 'append' : 'replace';
+  function suggestedNextSteps(proposal){
+    const original = proposal.nextStepBullets || [];
+    const formatted = proposal.reviewNextStepBullets;
+    // Formatted bullets keep the original order so source links stay attached to the right rows.
+    if(proposal.status === 'pending' && Array.isArray(formatted) && formatted.length === original.length &&
+       formatted.every(bullet => typeof bullet === 'string' && bullet.trim())) return formatted;
+    return original;
+  }
   const cellBullets = v => String(v || '').split(/\r?\n/).map(l => l.trim().replace(/^(?:[-*•]\s*)/, '').trim()).filter(Boolean);
-  // Keep + add: the bullets already in the Sheet cell, then the new ones (identical lines not repeated).
-  function merged(id, bullets, currentCell){ if(mode(id) !== 'append' || !bullets || !bullets.length) return bullets; const cur = cellBullets(currentCell), seen = new Set(cur); return [...cur, ...bullets.filter(x => !seen.has(x))]; }
-  function modeControl(id){ const m = mode(id); return `<div class="mode-row"><div class="mode" role="group" aria-label="Next Step write mode"><button type="button" class="${m==='replace'?'on':''}" data-mode-pick="replace" data-mode-for="${esc(id)}" aria-pressed="${m==='replace'}">Replace Next Step</button><button type="button" class="${m==='append'?'on':''}" data-mode-pick="append" data-mode-for="${esc(id)}" aria-pressed="${m==='append'}">Keep current bullets + add these</button></div><span class="mode-hint">${m==='append'?'Bullets already in the Sheet stay; these are added below.':'These replace what is in Next Step now.'}</span></div>`; }
-  function paintDialogMode(id){ const m = mode(id); document.querySelectorAll('#edit-mode [data-mode-pick]').forEach(x => { const on = x.dataset.modePick === m; x.classList.toggle('on', on); x.setAttribute('aria-pressed', String(on)); }); }
-  const fmtDate = iso => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || ''); return m ? new Date(Date.UTC(+m[1], +m[2]-1, +m[3])).toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric', timeZone:'UTC'}) : ''; };
-  const toISO = text => { if(!/\b\d{4}\b/.test(text)) return ''; const t = Date.parse(text + ' UTC'); return Number.isFinite(t) ? new Date(t).toISOString().slice(0, 10) : ''; };
+  // What a card or the editor sends (11/17/2026): the reviewed steps and how to write them. In Keep + add the server
+  // adds them below the Next Step text already in the Sheet and leaves Last progress alone, so the page sends only the new steps.
+  function nextStepUpdate(id, bullets){ const proposed = [...new Set(bullets)]; return {nextStepBullets: proposed, nextStepMode: proposed.length ? mode(id) : 'replace'}; }
+  // Preview only: the steps Keep + add would really add, compared the way the server compares them (bullet mark, case and spacing ignored).
+  const cellKey = line => String(line || '').trim().replace(/^(?:[-*•]\s+|\d+[.)]\s+)/, '').trim().replace(/\s+/g, ' ').toLowerCase();
+  function additions(bullets, currentCell){ const seen = new Set(String(currentCell || '').split(/\r?\n/).map(cellKey).filter(Boolean)); return bullets.filter(b => { const k = cellKey(b); if(!k || seen.has(k)) return false; seen.add(k); return true; }); }
+  function modeControl(id){ const m = mode(id); return `<div class="mode-row"><div class="mode" role="group" aria-label="Next Step write mode"><button type="button" class="${m==='replace'?'on':''}" data-mode-pick="replace" data-mode-for="${esc(id)}" aria-pressed="${m==='replace'}">Replace Next Step</button><button type="button" class="${m==='append'?'on':''}" data-mode-pick="append" data-mode-for="${esc(id)}" aria-pressed="${m==='append'}">Keep current bullets + add these</button></div><span class="mode-hint">${m==='append'?'Next Step keeps what is in the Sheet and these are added below. Last progress does not change.':'These replace what is in Next Step now. The old Next Step moves to Last progress.'}</span></div>`; }
+  function paintDialogMode(id){ const m = mode(id); document.querySelectorAll('#edit-mode [data-mode-pick]').forEach(x => { const on = x.dataset.modePick === m; x.classList.toggle('on', on); x.setAttribute('aria-pressed', String(on)); }); const add = m === 'append', set = (sel, text) => { const el = $(sel); if(el) el.textContent = text; }; set('#rotation-last-name', add ? 'Last progress' : 'Last progress \u2190'); set('#rotation-last-progress', add ? 'stays as it is - Keep + add does not move anything into it' : 'the current Next Step (when Next Step bullets are approved)'); set('#rotation-next-name', add ? 'Next Step (kept, new steps added below)' : 'Next Step (now, replaced)'); set('#rotation-explain', add ? 'Keep + add leaves the Next Step text in the Sheet exactly as it is and adds the approved steps below it. A step that is already in the cell is not repeated. Last progress does not change.' : 'When Next Step bullets are approved, the previous Next Step replaces Last progress. Context-only approval leaves both of those cells unchanged.'); }
+  function fmtDate(iso){
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(iso || '')) return '';
+    const day = new Date(iso + 'T00:00:00Z');
+    if(!Number.isFinite(day.getTime()) || day.toISOString().slice(0, 10) !== iso) return '';
+    return day.toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric', timeZone:'UTC'});
+  }
+  function toISO(text){
+    const clean = text.trim();
+    if(fmtDate(clean)) return clean;
+    const date = /^([a-z]+)\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})$/i.exec(clean);
+    if(!date) return '';
+    const day = new Date(date[1] + ' ' + date[2] + ', ' + date[3] + ' UTC');
+    if(!Number.isFinite(day.getTime())) return '';
+    const iso = day.toISOString().slice(0, 10);
+    const expected = date[1].slice(0, 3) + ' ' + Number(date[2]) + ', ' + Number(date[3]);
+    return fmtDate(iso).toLowerCase() === expected.toLowerCase() ? iso : '';
+  }
   function splitBullet(bullet){
     let m = /\s*\(complete by ([^)]+)\)\s*$/i.exec(bullet);
     if(m){ const iso = toISO(m[1]); if(iso) return {text: bullet.slice(0, m.index).trim(), date: iso}; }
     m = /\s*[—–-]\s*due (\d{4}-\d{2}-\d{2})\s*$/i.exec(bullet);
-    if(m) return {text: bullet.slice(0, m.index).trim(), date: m[1]};
+    if(m && fmtDate(m[1])) return {text: bullet.slice(0, m.index).trim(), date: m[1]};
     return {text: bullet, date: ''};
   }
+  // ---- Complete-by field (11/16/2026, Kellogg team): always day / month / year, whatever the browser's language,
+  // and an impossible date (31/11) says why instead of silently refusing to save.
+  const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const MONTH_KEYS = {jan:1,ene:1,feb:2,mar:3,apr:4,abr:4,may:5,jun:6,jul:7,aug:8,ago:8,sep:9,set:9,oct:10,nov:11,dec:12,dic:12};
+  const monthNumber = name => MONTH_KEYS[String(name || '').toLowerCase().slice(0, 3)] || 0;
+  const DATE_HINT = 'Use day/month/year, for example 16/11/2026.';
+  const dmy = iso => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || ''); return m && fmtDate(iso) ? `${m[3]}/${m[2]}/${m[1]}` : ''; };
+  function parseDay(text, today){
+    const raw = String(text || '').trim();
+    if(!raw) return {iso:''};
+    let d, mo, y, m;
+    if((m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(raw))){ y = m[1]; mo = +m[2]; d = +m[3]; }
+    else if((m = /^(\d{1,2})\s*[\/.-]\s*(\d{1,2})(?:\s*[\/.-]\s*(\d{4}|\d{2}))?$/.exec(raw))){ d = +m[1]; mo = +m[2]; y = m[3]; }
+    else if((m = /^(\d{1,2})(?:st|nd|rd|th)?\s+(?:de\s+)?([a-z]{3,})\.?,?(?:\s+(?:de\s+)?(\d{4}))?$/i.exec(raw))){ d = +m[1]; mo = monthNumber(m[2]); y = m[3]; if(!mo) return {iso:'', error:`"${m[2]}" is not a month. ${DATE_HINT}`}; }
+    else if((m = /^([a-z]{3,})\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{4}))?$/i.exec(raw))){ mo = monthNumber(m[1]); d = +m[2]; y = m[3]; if(!mo) return {iso:'', error:`"${m[1]}" is not a month. ${DATE_HINT}`}; }
+    else return {iso:'', error:DATE_HINT};
+    if(mo < 1 || mo > 12) return {iso:'', error:`There is no month ${mo}. Dates here are day/month/year, for example 16/11/2026.`};
+    const now = today instanceof Date ? today : new Date();
+    let year = y === undefined ? now.getFullYear() : +y;
+    if(y !== undefined && String(y).length === 2) year += 2000;
+    // No year typed: the next time that day comes around.
+    if(y === undefined && Date.UTC(year, mo - 1, d) < Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) - 7 * 864e5) year += 1;
+    const days = new Date(Date.UTC(year, mo, 0)).getUTCDate();
+    if(d < 1 || d > days) return {iso:'', error:`${MONTH_NAMES[mo - 1]} ${year} has ${days} days, so ${d}/${mo} is not a date.`};
+    if(year < 2000 || year > 2100) return {iso:'', error:`Check the year. ${DATE_HINT}`};
+    return {iso:`${year}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`};
+  }
+  // ---- Status change on the card (11/16/2026, Kellogg team). Presentation only: the page's own handler sends it.
+  const DEMO_STATUSES = ['0. Paused','1. Opening','2. In Talks','3. Proposal','4. Pilot','5. Working client'];
+  function statusControl(p, options, current){
+    const list = Array.isArray(options) && options.length ? options : (typeof BiancaCore !== 'undefined' ? DEMO_STATUSES : []);
+    const now = String(current || '').trim();
+    if(!list.length || !now || p.status !== 'pending') return '';
+    const all = list.includes(now) ? list : [now, ...list];
+    return `<div class="status-row"><label class="k" for="status-${esc(p.id)}">Status in the Sheet</label><select class="status-pick" id="status-${esc(p.id)}" data-status-current="${esc(now)}">${all.map(o => `<option value="${esc(o)}"${o === now ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select><button type="button" class="secondary status-save" data-action="set-status" disabled>Update status<span class="sr-only"> of ${esc(p.company)}</span></button></div>`;
+  }
+  document.addEventListener('change', e => { const pick = e.target.closest?.('.status-pick'); if(!pick) return; const save = pick.parentElement?.querySelector('.status-save'); if(save) save.disabled = pick.value === pick.dataset.statusCurrent; });
   const joinBullet = (text, date) => { const t = String(text || '').replace(/[\r\n]+/g, ' ').trim(); if(!t) return ''; const d = fmtDate(date); return d ? `${t} (complete by ${d})` : t; };
-  let rows = [], editingRows = null;
+  let rows = [], editingRows = null, editingCell = '';
   const blankRow = () => ({text:'', date:'', t0:null, d0:null});
   // An untouched row goes back exactly as suggested, so its source link survives.
   const rowBullet = r => (r.orig !== undefined && r.text === r.t0 && r.date === r.d0) ? r.orig : joinBullet(r.text, r.date);
-  function drawRows(focusIndex){ const box = $('#ns-rows'); if(!box) return; box.innerHTML = rows.map((r, i) => `<div class="ns-row" data-row="${i}"><textarea class="ns-text" rows="2" maxlength="3900" placeholder="Next step" aria-label="Next step ${i+1}">${esc(r.text)}</textarea><input type="date" class="ns-date" value="${esc(r.date)}" aria-label="Complete by date for next step ${i+1}"><button type="button" class="ns-del" data-action="ns-del" aria-label="Remove next step ${i+1}">&times;</button></div>`).join(''); if(focusIndex !== undefined) box.querySelectorAll('.ns-text')[focusIndex]?.focus(); drawPreview(); }
-  function drawPreview(){ const out = $('#ns-preview'); if(!out) return; const lines = rows.map(rowBullet).filter(Boolean); out.innerHTML = lines.length ? `<b>${mode(editingRows)==='append'?'Added to Next Step, below the current bullets':'Written to Next Step'}</b>${lines.map(l => esc('- ' + l)).join('\n')}` : '<b>Next Step</b>No rows - Next Step and Last progress stay as they are.'; }
+  function drawRows(focusIndex){ const box = $('#ns-rows'); if(!box) return; box.innerHTML = rows.map((r, i) => `<div class="ns-row" data-row="${i}"><textarea class="ns-text" rows="2" maxlength="3900" placeholder="Next step" aria-label="Next step ${i+1}">${esc(r.text)}</textarea><input type="text" class="ns-date" autocomplete="off" spellcheck="false" placeholder="dd/mm/yyyy" value="${esc(r.dateText ?? dmy(r.date))}" aria-label="Complete by date, day/month/year, for next step ${i+1}"${r.dateError ? ' aria-invalid="true"' : ''}><button type="button" class="ns-del" data-action="ns-del" aria-label="Remove next step ${i+1}">&times;</button><p class="ns-date-err" role="alert"${r.dateError ? '' : ' hidden'}>${esc(r.dateError || '')}</p></div>`).join(''); if(focusIndex !== undefined) box.querySelectorAll('.ns-text')[focusIndex]?.focus(); drawPreview(); }
+  function drawPreview(){ const out = $('#ns-preview'); if(!out) return; const all = rows.map(rowBullet).filter(Boolean), add = mode(editingRows) === 'append'; const lines = add ? additions(all, editingCell) : all, skipped = all.length - lines.length; out.innerHTML = all.length ? `<b>${add?'Added to Next Step, below what is already in the Sheet':'Written to Next Step'}</b>${lines.map(l => esc('- ' + l)).join('\n')}${add && skipped ? `${lines.length ? '\n' : ''}<i>${skipped === 1 ? '1 step is' : skipped + ' steps are'} already in the cell and will not be repeated.</i>` : ''}` : '<b>Next Step</b>No rows - Next Step and Last progress stay as they are.'; }
   function syncRows(){ const ta = $('#edit-content'); if(!ta) return; ta.value = rows.map(rowBullet).filter(Boolean).map(x => '- ' + x).join('\n'); ta.dispatchEvent(new Event('input', {bubbles:true})); drawPreview(); }
   // Called by the page right after it fills the hidden #edit-content textarea and opens the dialog.
-  function openRows(id){ try{ const ta = $('#edit-content'), box = $('#ns-rows'); if(!ta || !box) return; editingRows = id; rows = cellBullets(ta.value).map(x => { const p = splitBullet(x); return {orig:x, text:p.text, date:p.date, t0:p.text, d0:p.date}; }); if(!rows.length) rows = [blankRow()]; paintDialogMode(id); drawRows(0); }catch(_){ } }
-  document.addEventListener('input', e => { const row = e.target.closest?.('.ns-row'); if(!row) return; const r = rows[Number(row.dataset.row)]; if(!r) return; if(e.target.classList.contains('ns-text')) r.text = e.target.value; else if(e.target.classList.contains('ns-date')) r.date = e.target.value; syncRows(); });
+  function openRows(id, currentCell){ try{ const ta = $('#edit-content'), box = $('#ns-rows'); if(!ta || !box) return; editingRows = id; editingCell = String(currentCell || ''); rows = cellBullets(ta.value).map(x => { const p = splitBullet(x); return {orig:x, text:p.text, date:p.date, t0:p.text, d0:p.date}; }); if(!rows.length) rows = [blankRow()]; paintDialogMode(id); drawRows(0); }catch(_){ } }
+  document.addEventListener('input', e => { const row = e.target.closest?.('.ns-row'); if(!row) return; const r = rows[Number(row.dataset.row)]; if(!r) return; if(e.target.classList.contains('ns-text')) r.text = e.target.value; else if(e.target.classList.contains('ns-date')){ const day = parseDay(e.target.value); r.dateText = e.target.value; r.dateError = day.error || ''; r.date = day.iso; const note = row.querySelector?.('.ns-date-err'); if(note){ note.textContent = r.dateError; note.hidden = !r.dateError; } if(r.dateError) e.target.setAttribute?.('aria-invalid', 'true'); else e.target.removeAttribute?.('aria-invalid'); } syncRows(); });
+  // Leaving a valid date shows it back day-first, so 16 nov and 16/11 both read 16/11/2026.
+  document.addEventListener('change', e => { if(!e.target.classList?.contains('ns-date')) return; const r = rows[Number(e.target.closest?.('.ns-row')?.dataset.row)]; if(r && !r.dateError && r.date){ r.dateText = dmy(r.date); e.target.value = r.dateText; } });
+  // A row with an impossible date never reaches the page's own save handler.
+  document.addEventListener('submit', e => { if(e.target?.id !== 'edit-form') return; const bad = rows.findIndex(r => r.dateError); if(bad < 0) return; e.preventDefault(); e.stopImmediatePropagation(); const note = $('#edit-error'); if(note){ note.textContent = `Next step ${bad + 1}: ${rows[bad].dateError}`; note.hidden = false; } document.querySelectorAll('#ns-rows .ns-date')[bad]?.focus(); }, true);
   document.addEventListener('keydown', e => { if(e.key === 'Enter' && !e.shiftKey && e.target.closest?.('.ns-row') && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')){ e.preventDefault(); rows.push(blankRow()); drawRows(rows.length - 1); } });
-  return {shell, avatar, ownerName, stageClass, shortDate, esc, mode, merged, modeControl, openRows, get selected(){ return selected; }};
+  return {shell, avatar, ownerName, stageClass, shortDate, esc, mode, nextStepUpdate, additions, modeControl, openRows, suggestedNextSteps, statusControl, parseDay, get selected(){ return selected; }};
 })();
 """
 
@@ -239,19 +339,21 @@ CARD_JS = r"""function card(p){
     const WR=BiancaWarRoom;
     const cellOf=(field)=>{const row=state.rows.find(r=>r.id===p.id)||state.rows.find(r=>r.company===p.company);return row?row[field]:p[field];};
     const applying=p.status==='applying',legacy=p.routingVersion!==undefined&&p.routingVersion!==1,data=displayTrace(p),lineageBlocked=!applying&&!legacy&&!data.available;
-    const nextBullets=applying&&p.retry?p.retry.next_step_bullets:(p.nextStepBullets||[]),contextBullets=applying&&p.retry?p.retry.client_context_bullets:(p.clientContextBullets||[]);
-    const srcs=(p.sources||[]).slice(0,3);
+    const nextBullets=applying&&p.retry?p.retry.next_step_bullets:WR.suggestedNextSteps(p),contextBullets=applying&&p.retry?p.retry.client_context_bullets:(p.clientContextBullets||[]);
+    const srcs=p.sources||[];
     const traceNote=(!data.available||![...data.lineage.nextStep,...data.lineage.clientContext].some(edge=>edge.sourceIds.length))?traceMessage(p,data):'';
-    const whatsNew=srcs.length?`<ul class="whats-new">${srcs.map(s=>{const line=s.summary||s.subject||'';const ctx=s.quote||s.subject||'';return `<li><details><summary><span>${esc(line)}</span><span class="src">Source: ${esc(sourceType(s.type))}, ${esc(WR.shortDate(s.date))}</span></summary><div class="ctx">${esc(ctx)}</div></details></li>`;}).join('')}</ul>`:'<p class="empty-group">No new information recorded.</p>';
-    const open=expandedNextSteps.has(p.id);
+    const excerpt=t=>{const words=String(t||'').replace(/\s+/g,' ').trim().split(' ').filter(Boolean);return words.length>15?words.slice(0,15).join(' ')+' ...':words.join(' ');};
+    const news=[];for(const s of srcs){const line=s.summary||s.subject||'(no subject)',key=[line,s.type,s.date].join('|');let item=news.find(n=>n.key===key);if(!item){item={key,line,s,said:[]};news.push(item);}for(const passage of Array.isArray(s.quotes)&&s.quotes.length?s.quotes:[s.quote]){const said=excerpt(passage);if(said&&said!==line&&!item.said.includes(said)&&item.said.length<3)item.said.push(said);}}
+    const whatsNew=news.length?`<ul class="whats-new">${news.slice(0,4).map(n=>{const head=`<span>${esc(n.line)}</span><span class="src">Source: ${esc(sourceType(n.s.type))}, ${esc(WR.shortDate(n.s.date))}</span>`;return n.said.length?`<li><details><summary>${head}</summary><div class="ctx">${n.said.map(t=>`<p>&ldquo;${esc(t)}&rdquo;</p>`).join('')}</div></details></li>`:`<li class="plain">${head}</li>`;}).join('')}${news.length>4?`<li class="plain more"><span>+ ${news.length-4} more source${news.length-4===1?'':'s'} behind this card</span></li>`:''}</ul>`:'<p class="empty-group">No new information recorded.</p>';
+    const open=expandedNextSteps.has(p.id),stageNow=cellOf('stage')||p.stage;
     return `<article class="review-card" data-id="${esc(p.id)}" aria-labelledby="title-${esc(p.id)}">
-<div class="card-top"><div><h2 class="company-title" id="title-${esc(p.id)}">${esc(p.company)}</h2><div class="meta-bar"><span><span class="k">Stage:</span><span class="${WR.stageClass(p.stage)}">${esc(p.stage||'-')}</span></span><span><span class="k">Owner:</span>${WR.avatar(p.owner)}${esc(WR.ownerName(p.owner))}</span><span><span class="k">Country:</span>${esc(p.country||'-')}</span></div></div></div>
+<div class="card-top"><div><h2 class="company-title" id="title-${esc(p.id)}">${esc(p.company)}</h2><div class="meta-bar"><span><span class="k">Stage:</span><span class="${WR.stageClass(stageNow)}">${esc(stageNow||'-')}</span></span><span><span class="k">Owner:</span>${WR.avatar(p.owner)}${esc(WR.ownerName(p.owner))}</span><span><span class="k">Country:</span>${esc(p.country||'-')}</span></div>${!applying&&!legacy?WR.statusControl(p,state.statusOptions,stageNow):''}</div></div>
 <div class="ns-box"><div class="sec-label ns-label">Suggested next steps</div>${bulletList(p,nextBullets,'nextStep',data)}${!applying&&!legacy&&!lineageBlocked&&nextBullets.length?WR.modeControl(p.id):''}</div>
 <div class="sec-label">What's new</div>${whatsNew}
 <div class="sec-label">Client context <span class="proposed">Column proposed</span></div>${bulletList(p,contextBullets,'clientContext',data)}
 ${traceNote?`<p class="approval-note trace-note" role="status">${esc(traceNote)}</p>`:''}${legacy?`<p class="approval-note legacy-note" role="status">${esc(p.error)}</p>`:''}${applying&&!legacy?`<p class="approval-note" role="status">${esc(p.error||'This approval has a saved write request. Retry checks that same request; it will not move the cells twice.')}</p>`:''}
-<details class="current-next-steps" data-current-next-steps${open?' open':''}><summary>Current Sheet cells</summary><div class="cells-grid"><div><h4>Next step (now)</h4><div class="current-next-steps-content">${esc(cellOf('nextStep'))||'<i>No Next steps are currently noted.</i>'}</div></div><div><h4>Last progress (now)</h4><div class="current-next-steps-content">${esc(cellOf('lastProgress'))||'<i>No Last progress is currently noted.</i>'}</div></div><div><h4>Client context (now)</h4><div class="current-next-steps-content">${esc(cellOf('clientContext'))||'<i>No Client Context is currently noted.</i>'}</div></div></div></details>
-<div class="card-footer"><div class="actions">${legacy?'<button type="button" class="primary" data-review-blocked="true" disabled>Rebuild required</button>':lineageBlocked?'<button type="button" class="primary" data-review-blocked="true" disabled>Rebuild required</button><button type="button" class="quiet" data-action="ignore">Ignore</button>':applying?`<button type="button" class="primary" data-action="retry" ${p.retry?'':'disabled'}>Retry approval<span class="sr-only"> ${esc(p.company)}</span></button>`:`<button type="button" class="primary" data-action="approve"><span class="approve-check" aria-hidden="true">&#10003;</span>Approve<span class="sr-only"> ${esc(p.company)}</span></button><button type="button" class="secondary" data-action="edit">Edit<span class="sr-only"> ${esc(p.company)}</span></button><button type="button" class="quiet" data-action="ignore-menu" aria-haspopup="menu">Ignore &#9662;<span class="sr-only"> options for ${esc(p.company)}</span></button><div class="ign-menu" role="menu"><div class="mh">Ignore options <span class="proposed">Proposed - all dismiss today</span></div><button type="button" class="mi" role="menuitem" data-action="ignore"><b>Not now</b><span>Comes back tomorrow with any new info</span></button><button type="button" class="mi" role="menuitem" data-action="ignore"><b>Ignore this suggestion</b><span>Dismissed for everyone; new info makes a new card</span></button><button type="button" class="mi" role="menuitem" data-action="ignore"><b>Never suggest for this deal</b><span>Mute the company until the stage changes</span></button></div>`}</div><div class="rowlink"><a href="__SHEET_URL__" target="_blank" rel="noopener">Open in Sheet copy &#8599;</a></div></div>
+<details class="current-next-steps" data-current-next-steps${open?' open':''}><summary>Current Sheet cells<span class="cells-hint">Next step, Last progress and Client Context as they are now</span></summary><div class="cells-grid"><div><h4>Next step (now)</h4><div class="current-next-steps-content">${esc(cellOf('nextStep'))||'<i>No Next steps are currently noted.</i>'}</div></div><div><h4>Last progress (now)</h4><div class="current-next-steps-content">${esc(cellOf('lastProgress'))||'<i>No Last progress is currently noted.</i>'}</div></div><div><h4>Client context (now)</h4><div class="current-next-steps-content">${esc(cellOf('clientContext'))||'<i>No Client Context is currently noted.</i>'}</div></div></div></details>
+<div class="card-footer"><div class="actions">${legacy?'<button type="button" class="primary" data-review-blocked="true" disabled>Rebuild required</button>':lineageBlocked?'<button type="button" class="primary" data-review-blocked="true" disabled>Rebuild required</button><button type="button" class="quiet" data-action="ignore">Ignore</button>':applying?`<button type="button" class="primary" data-action="retry" ${p.retry?'':'disabled'}><span class="btn-label">Retry approval<span class="sr-only"> ${esc(p.company)}</span></span><span class="btn-saving">Saving to Sheet...</span></button>`:`<button type="button" class="primary" data-action="approve"><span class="btn-label"><span class="approve-check" aria-hidden="true">&#10003;</span>Approve<span class="sr-only"> ${esc(p.company)}</span></span><span class="btn-saving">Saving to Sheet...</span></button><button type="button" class="secondary" data-action="edit">Edit<span class="sr-only"> ${esc(p.company)}</span></button><button type="button" class="quiet" data-action="ignore-menu" aria-haspopup="menu">Ignore &#9662;<span class="sr-only"> options for ${esc(p.company)}</span></button><div class="ign-menu" role="menu"><div class="mh">Ignore options <span class="proposed">Proposed - all dismiss today</span></div><button type="button" class="mi" role="menuitem" data-action="ignore"><b>Not now</b><span>Comes back tomorrow with any new info</span></button><button type="button" class="mi" role="menuitem" data-action="ignore"><b>Ignore this suggestion</b><span>Dismissed for everyone; new info makes a new card</span></button><button type="button" class="mi" role="menuitem" data-action="ignore"><b>Never suggest for this deal</b><span>Mute the company until the stage changes</span></button></div>`}</div><div class="rowlink"><a href="__SHEET_URL__" target="_blank" rel="noopener">Open in Sheet copy &#8599;</a></div></div>
 <p class="validation card-error" role="alert" hidden></p></article>`;
   }
 """
@@ -275,8 +377,9 @@ def patch(src_html: str, demo: bool) -> str:
     s = s.replace('<p class="validation" id="edit-error" role="alert" hidden></p><div class="rotation-preview">',
                   DIALOG_EXTRA + '<p class="validation" id="edit-error" role="alert" hidden></p><div class="rotation-preview">', 1)
     s = s.replace('<h3>Current sheet context</h3><div class="rotation-row"><span class="rotation-name">Next Step</span>',
-                  '<h3>What will happen in the Sheet copy</h3><div class="rotation-row"><span class="rotation-name">Last progress &#8592;</span><span class="rotation-content">the current Next Step (when Next Step bullets are approved)</span></div><div class="rotation-row"><span class="rotation-name">Next Step (now)</span>', 1)
+                  '<h3>What will happen in the Sheet copy</h3><div class="rotation-row"><span class="rotation-name" id="rotation-last-name">Last progress &#8592;</span><span class="rotation-content" id="rotation-last-progress">the current Next Step (when Next Step bullets are approved)</span></div><div class="rotation-row"><span class="rotation-name" id="rotation-next-name">Next Step (now, replaced)</span>', 1)
     s = s.replace('<span>Approve sends actions and blockers to “Next Step,” and needs, signals, and objections to “Client Context.”</span>', '<span>Approve or edit to update Pipeline Next Steps.</span>')
+    s = s.replace('<p class="rotation-explain">', '<p class="rotation-explain" id="rotation-explain">', 1)  # rewritten per write mode
     # 5b. Next Step editor: one row per step (text + date); the original textarea stays as the hidden value the page submits
     assert s.count('<textarea class="editor" id="edit-content"') == 1
     s = s.replace('<textarea class="editor" id="edit-content"', '<textarea class="editor" id="edit-content" hidden', 1)
@@ -284,19 +387,22 @@ def patch(src_html: str, demo: bool) -> str:
                   'aria-describedby="edit-help edit-error"></textarea>' + ROWS_EDITOR + '<p id="edit-help" class="field-help">' + ROWS_HELP + '</p>', 1)
     assert 'id="ns-rows"' in s, "edit-help anchor not found"
     assert s.count("$('#edit-dialog').showModal();$('#edit-content').focus();}") == 1
-    s = s.replace("$('#edit-dialog').showModal();$('#edit-content').focus();}", "$('#edit-dialog').showModal();$('#edit-content').focus();BiancaWarRoom.openRows(id);}", 1)
+    s = s.replace("$('#edit-dialog').showModal();$('#edit-content').focus();}", "$('#edit-dialog').showModal();$('#edit-content').focus();BiancaWarRoom.openRows(id," + ("r.nextStep" if demo else "currentNextStep(p)") + ");}", 1)
+    assert s.count("$('#edit-content').value=p.nextStepBullets.map") == 1
+    s = s.replace("$('#edit-content').value=p.nextStepBullets.map",
+                  "$('#edit-content').value=BiancaWarRoom.suggestedNextSteps(p).map", 1)
     # 5c. Replace / Keep + add: applied where the page builds the bullets it approves (card Approve and the editor submit)
     if demo:
         cur = "state.rows.find(r=>r.id===ID)?.nextStep"
         a_old = "if(action==='approve')approve(id,state.proposals.find(p=>p.id===id));"
-        a_new = "if(action==='approve'){const p=state.proposals.find(p=>p.id===id);if(BiancaWarRoom.mode(id)==='append'&&p.nextStepBullets.length)approve(id,{nextStepBullets:BiancaWarRoom.merged(id,p.nextStepBullets," + cur.replace('ID','id') + "),clientContextBullets:p.clientContextBullets},true);else approve(id,p);}"
+        a_new = "if(action==='approve'){const p=state.proposals.find(p=>p.id===id);if(p?.status==='pending')approve(id,{...BiancaWarRoom.nextStepUpdate(id,BiancaWarRoom.suggestedNextSteps(p)),clientContextBullets:p.clientContextBullets});}"
         s_old = "nextStepBullets:BiancaCore.parseBullets($('#edit-content').value)"
-        s_new = "nextStepBullets:BiancaWarRoom.merged(editingId,BiancaCore.parseBullets($('#edit-content').value)," + cur.replace('ID','editingId') + ")"
+        s_new = "...BiancaWarRoom.nextStepUpdate(editingId,BiancaCore.parseBullets($('#edit-content').value))"
     else:
         a_old = "if(action==='approve')decide(id,'approve',state.proposals.find(p=>p.id===id));"
-        a_new = "if(action==='approve'){const p=state.proposals.find(p=>p.id===id);if(p&&BiancaWarRoom.mode(id)==='append'&&p.nextStepBullets?.length)decide(id,'approve',{nextStepBullets:BiancaWarRoom.merged(id,p.nextStepBullets,currentNextStep(p)),clientContextBullets:p.clientContextBullets},true);else decide(id,'approve',p);}"
+        a_new = "if(action==='approve'){const p=state.proposals.find(p=>p.id===id);if(p?.status==='pending')decide(id,'approve',{...BiancaWarRoom.nextStepUpdate(id,BiancaWarRoom.suggestedNextSteps(p)),clientContextBullets:p.clientContextBullets});}"
         s_old = "nextStepBullets:BiancaLive.parseBullets($('#edit-content').value)"
-        s_new = "nextStepBullets:BiancaWarRoom.merged(editingId,BiancaLive.parseBullets($('#edit-content').value),currentNextStep(state.proposals.find(p=>p.id===editingId)||{}))"
+        s_new = "...BiancaWarRoom.nextStepUpdate(editingId,BiancaLive.parseBullets($('#edit-content').value))"
     assert s.count(a_old) == 1 and s.count(s_old) == 1, "approve / submit anchors not found"
     s = s.replace(a_old, a_new, 1).replace(s_old, s_new, 1)
     # 6. footer copy

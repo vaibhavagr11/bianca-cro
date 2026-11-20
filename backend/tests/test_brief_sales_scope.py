@@ -57,21 +57,38 @@ class Result(list):
 
 
 class BriefData:
-    def __init__(self, deals, messages, insights, profiles, *, meetings=(), changes=()):
+    def __init__(self, deals, messages, insights, profiles, *, meetings=(), changes=(), domains=(), contacts=()):
         self.deals = deals
         self.messages = messages
         self.insights = insights
         self.profiles = profiles
         self.meetings = meetings
         self.changes = changes
+        self.domains = domains
+        self.contacts = contacts
+        self.last_contact_days = 2
+        self.briefed = []           # days a brief was already sent, for the weekly nudge
+        self.resurfaced = []        # per earlier brief, the quiet In Talks deals it listed
+        self.last_contact = {}      # company id -> days since the last record (None: no record at all)
+
+    def transaction(self):
+        return nullcontext()
 
     def execute(self, query, params=()):
+        if "from company_domains" in query:
+            return Result(self.domains)
+        if "from contacts" in query:
+            return Result(self.contacts)
         if "from workspaces" in query:
             return Result([{"timezone": "UTC", "internal_domains": ["bianca.example"]}])
         if "from team_members" in query:
             return Result([{"owner_code": "RG", "full_name": "Ramiro Godfrid", "email": "ramiro@bianca.example",
                             "receives_brief": True}])
         if "from briefs" in query:
+            if "resurfaced" in query:
+                return Result([{"deals": names} for names in self.resurfaced])
+            if "for_date" in query:
+                return Result([{"for_date": day} for day in self.briefed])
             return Result([{"created_at": NOW - timedelta(hours=6)}])
         if "from opportunity_profiles" in query:
             return Result(self.profiles)
@@ -87,7 +104,9 @@ class BriefData:
         if "from sync_runs" in query:
             return Result()
         if "max(occurred_at) as last" in query:
-            return Result([{"company_id": d["company_id"], "last": NOW - timedelta(days=2)} for d in self.deals])
+            days = {d["company_id"]: self.last_contact.get(d["company_id"], self.last_contact_days) for d in self.deals}
+            return Result([{"company_id": company, "last": NOW - timedelta(days=n)} for company, n in days.items()
+                           if n is not None])
         if "created_at >" in query or "occurred_at > %s" in query:
             return Result(m for m in self.messages if m["occurred_at"] > params[1])
         if "from source_records" in query and "source = 'gmail'" in query:
@@ -384,7 +403,9 @@ def test_profile_followup_stays_out_of_deals_to_move(brief_client, with_next_mov
     profiles = [{"opportunity_id": company["id"], "generated_at": NOW, "profile": {
         "refs": refs, "recommended_actions": recommendations,
     }}]
-    client = brief_client(BriefData([company], [], insights, profiles))
+    data = BriefData([company], [], insights, profiles)
+    data.last_contact_days = 9
+    client = brief_client(data)
     response = client.post("/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"})
     assert response.status_code == 200
     result = response.json()
@@ -392,9 +413,355 @@ def test_profile_followup_stays_out_of_deals_to_move(brief_client, with_next_mov
     assert [h["move"]["text"] for h in founder["highlights"]] == ([next_move] if with_next_move else [])
     assert len(founder["followups"]) == 1
     assert founder["followups"][0]["tag"] == "Follow up"
-    assert followup in founder["followups"][0]["text"]
+    # B-10 (11/12): the check-in is not printed as written; the row says how long it has been and what to do.
+    topic = "last week's proposal" if tagged else "the proposal we sent last week"
+    nudge = f"Prospect Co: 9 days since the last contact on record - follow up this week (re: {topic})."
+    assert founder["followups"][0]["text"] == nudge
     assert not founder["waiting"]
-    for body, wording in ((result["html"], html.escape(followup)), (result["text"], followup)):
+    for body, wording in ((result["html"], html.escape(nudge)), (result["text"], nudge)):
         assert body.count(wording) == 1
         assert body.index("Follow-ups that may be needed") < body.index(wording)
         assert (next_move in body) == with_next_move
+        assert followup not in body and html.escape(followup) not in body
+
+
+# ---- finding 15 (11/09 evals): a vendor's support ticket was reported as "Delta: Customer replied"
+
+def test_vendor_ticket_or_help_desk_mail_is_never_reported_as_a_customer_reply(brief_client):
+    delta = deal("delta")
+    reply = email("Re: store list", "delta", "Thanks, received.", days=0)
+    ticket = email("[VIP Help Center] Request #48213: store file", "delta", "Your request was updated.", days=0)
+    ticket["participants"]["from"] = [{"address": "support@vtinfo.zendesk.com", "name": "VIP Support"}]
+    agent = email("Re: VIP data access", "delta", "We reset the access.", days=0)
+    agent["participants"]["from"] = [{"address": "support@vtinfo.zendesk.com", "name": "VIP Support"}]
+    vendor = email("Data feed timing", "delta", "The feed runs on Mondays.", days=0)
+    vendor["participants"]["from"] = [{"address": "ops@vtinfo.com", "name": "Vendor Ops"}]
+    domains = [{"domain": "delta.example", "company_id": "delta", "evidence_count": 9, "origin": "learned"},
+               {"domain": "vtinfo.com", "company_id": "delta", "evidence_count": 2, "origin": "learned"}]
+    for message in (ticket, agent, vendor):          # one record per thread, so each can produce a change row
+        client = brief_client(BriefData([delta], [message], [], [], domains=domains))
+        result = client.post("/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"}).json()
+        assert "Customer replied" not in result["html"]
+        changes = [c["text"] for c in result["payload"]["changes"]]
+        if message is ticket:
+            assert changes == []                     # a ticket notice is not a development at all
+        else:
+            sender = message["participants"]["from"][0]["address"].split("@")[1]
+            assert changes == [f"Email from {sender} on this deal (nothing new extracted): {message['subject']}"]
+    client = brief_client(BriefData([delta], [reply], [], [], domains=domains))
+    result = client.post("/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"}).json()
+    assert [c["text"] for c in result["payload"]["changes"]] == ["Customer replied (nothing new extracted): Re: store list"]
+    v1 = brief_client(BriefData([delta], [ticket], [], [])).post(
+        "/brief/build?dry_run=true&version=v1", headers={"X-Ingest-Token": "test-token"}).json()
+    assert "Customer replied" not in v1["html"]
+
+
+# ---- findings 11 and 5 (11/09 evals): prep was blank on every meeting; prep ignored the invite's guest
+
+def _meeting(title, company, guests=(), *, hours=3):
+    people = [{"address": "ramiro@bianca.example", "name": "Ramiro", "response": "accepted"}, *guests]
+    return {"id": title, "subject": title, "company_id": company, "rules_company_id": None,
+            "occurred_at": NOW + timedelta(hours=hours), "participants": {"attendees": people},
+            "meta": {"status": "confirmed"}}
+
+
+class PassingGate:
+    """A pre-send check that keeps every row, so the test exercises the verified path without a model."""
+    as_of = NOW
+    audit = {}
+
+    def __call__(self, actions):
+        return {a.key: Verdict("waiting" if a.kind == "waiting" else "still_owed", "fixture") for a in actions}
+
+    def ready_fields(self):
+        return {}
+
+    def finalize(self, conn, response):
+        pass
+
+
+@pytest.mark.parametrize("verification", ["off", "shadow"])
+def test_every_meeting_tied_to_a_deal_gets_a_prep_line(monkeypatch, brief_client, verification):
+    monkeypatch.setattr(brief_api, "create_gate", lambda *_: PassingGate())
+    ana = {"address": "ana@owing.example", "name": "Ana Ruiz", "response": "accepted"}
+    ally = {"address": "ally@freestylesnacking.com", "name": "", "response": "accepted"}
+    stranger = {"address": "sam@unknown-firm.com", "name": "Sam", "response": "needsAction"}
+    deals = [deal("owing"), deal("quiet"), {**deal("Freestyle Snacks"), "company_id": "freestyle"}]
+    insights = [insight("promise", "owing", "Send the pilot pricing", SALES)]
+    meetings = [
+        _meeting("Pricing review", "owing", [ana]),
+        _meeting("Catch-up", "quiet", [{"address": "leo@quiet.example", "name": "Leo", "response": "declined"}]),
+        _meeting("30 Minute Call (Ramiro Godfrid)", None, [ally]),
+        _meeting("Intro call", None, [stranger]),
+    ]
+    client = brief_client(BriefData(deals, [], insights, [], meetings=meetings))
+    response = client.post(f"/brief/build?dry_run=true&version=v2&verification={verification}",
+                           headers={"X-Ingest-Token": "test-token"})
+    assert response.status_code == 200
+    result = response.json()
+    prep = {m["title"]: (m["deal"], m["prep"]) for m in result["payload"]["sections"][0]["meetings"]}
+    assert prep["Pricing review"] == ("owing", "With Ana Ruiz (accepted). Due now: Send the pilot pricing.")
+    assert prep["Catch-up"] == ("quiet", "Leo declined the invite - confirm it is still on. "
+                                         "No open item on record - last contact Nov 3.")
+    # Finding 5: the accepted guest's domain names a pipeline company, so the meeting is tied to that deal.
+    assert prep["30 Minute Call (Ramiro Godfrid)"] == (
+        "Freestyle Snacks", "With ally@freestylesnacking.com (accepted). No open item on record - last contact Nov 3. "
+                            "(deal matched by guest domain freestylesnacking.com)")
+    assert prep["Intro call"] == (None, "With Sam (not yet answered). No pipeline deal matched - check who this is with.")
+    for title, (linked, line) in prep.items():
+        assert line and line in html.unescape(result["html"]) and line in result["text"]
+    assert all(line for linked, line in prep.values() if linked)
+
+
+def test_guest_domain_matching_needs_one_distinctive_company_and_respects_working_clients(brief_client):
+    grupo = {"address": "ana@grupobimbo.com", "name": "Ana", "response": "accepted"}
+    koala = {"address": "kim@koalaeco.com", "name": "Kim", "response": "accepted"}
+    known = {"address": "pat@kof.example", "name": "Pat", "response": "accepted"}
+    deals = [{**deal("Grupo Pelon"), "company_id": "pelon"}, {**deal("FEMSA MX"), "company_id": "femsa"},
+             {**deal("Koala Eco"), "company_id": "koala", "stage": "5. Working client", "stage_rank": 5}]
+    meetings = [_meeting("Bimbo intro", None, [grupo]), _meeting("Koala sync", None, [koala]),
+                _meeting("Whitespace review", None, [known])]
+    domains = [{"domain": "kof.example", "company_id": "femsa", "evidence_count": 4, "origin": "learned"}]
+    client = brief_client(BriefData(deals, [], [], [], meetings=meetings, domains=domains))
+    result = client.post("/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"}).json()
+    found = {m["title"]: m["deal"] for m in result["payload"]["sections"][0]["meetings"]}
+    # "Grupo" alone is too common to pick a deal; a working client's meeting stays out; a learned domain links.
+    assert found == {"Bimbo intro": None, "Whitespace review": "FEMSA MX"}
+
+
+# ---- B-10 / B-11 (11/12): weekly "follow up this week" nudge; Paused suggested after five unanswered emails
+
+def test_waiting_rows_nudge_weekly_and_suggest_paused_after_five_unanswered_emails(brief_client):
+    silent = [email(f"silent-{n}", "silent", "Can you confirm the pilot dates?", days=days, outgoing=True,
+                    thread="silent-thread") for n, days in enumerate((42, 35, 28, 21, 14))]
+    midweek = [email(f"mid-{n}", "midweek", "Can you confirm the pilot dates?", days=days, outgoing=True,
+                     thread="mid-thread") for n, days in enumerate((40, 33, 26, 19, 12))]
+    weekly = email("weekly-ask", "weekly", "Can you approve the proposal?", days=14, outgoing=True)
+    told = email("told-ask", "told", "Can you share the store list?", days=15, outgoing=True)
+    data = BriefData([deal("silent"), deal("midweek"), deal("weekly"), deal("told")],
+                     [*silent, *midweek, weekly, told], [], [])
+    data.briefed = [NOW.date() - timedelta(days=1)]          # yesterday's brief carried "told"'s day-14 nudge
+    result = brief_client(data).post("/brief/build?dry_run=true&version=v2",
+                                     headers={"X-Ingest-Token": "test-token"}).json()
+    rows = {w["deal"]: w for w in result["payload"]["sections"][0]["waiting"]}
+    assert rows["silent"]["nudges"] == 5
+    text = result["text"]
+    # Decision 11/17: the Paused suggestion keeps the weekly cadence and takes the nudge's place on that day.
+    assert "• silent: To Buyer · 5 emails with no reply - consider moving to Paused (14d since Oct 22)" in text
+    assert "• midweek: To Buyer · no reply to our 5 emails (12d since Oct 24)" in text    # its day-7 mark has passed
+    assert text.count("consider moving to Paused") == 1 and text.count("follow up this week") == 1
+    assert "• weekly: To Buyer · no reply yet, 2 weeks since your last email - follow up this week (14d since Oct 22)" in text
+    assert "• told: To Buyer · no reply yet (15d since Oct 21)" in text      # at most one nudge per 7 days
+
+
+def test_nudge_thresholds_are_settings(monkeypatch, brief_client):
+    monkeypatch.setattr(brief_api.settings, "brief_pause_after_emails", 2)
+    monkeypatch.setattr(brief_api.settings, "brief_nudge_every_days", 10)
+    two = [email(f"two-{n}", "two", "Can you confirm?", days=days, outgoing=True, thread="two-thread")
+           for n, days in enumerate((20, 10))]
+    ten = email("ten-ask", "ten", "Can you approve the proposal?", days=10, outgoing=True)
+    result = brief_client(BriefData([deal("two"), deal("ten")], [*two, ten], [], [])).post(
+        "/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"}).json()
+    assert "2 emails with no reply - consider moving to Paused" in result["text"]
+    assert "10 days since your last email - follow up this week" in result["text"]
+
+
+# ---- B-02 (11/12): an item in "Waiting on their reply" never also appears in "Deals to move"
+
+@pytest.mark.parametrize("verification", ["off", "shadow"])
+def test_waiting_deal_with_only_waiting_statements_has_no_deals_to_move_row(monkeypatch, brief_client, verification):
+    monkeypatch.setattr(brief_api, "create_gate", lambda *_: PassingGate())
+    ask = email("proposal-ask", "farmater", "Can you approve the proposal?", days=9, outgoing=True)
+    ask["reply_expectation"].update(evidence_quote=ask["body"], response="Customer to approve the proposal")
+    insights = [
+        insight("approval", "farmater", "Customer to approve the proposal", SALES, type_="next_step", origin=ask,
+                quote=ask["body"], owner_side="customer", dated=False),
+        insight("waiting-note", "farmater", "Wait for the buyer's reply on the proposal", SALES, type_="next_step",
+                dated=False),
+        insight("silence", "farmater", "No reply since Oct 27", SALES, type_="blocker", owner_side=None, dated=False),
+    ]
+    profiles = [{"opportunity_id": "farmater-opportunity", "generated_at": NOW, "profile": {
+        "refs": {"I1": "silence", "I2": "waiting-note"},
+        "blockers": [{"text": "No reply since Oct 27", "evidence": ["I1"]}],
+        "recommended_actions": [{"action": "Keep following up with the buyer", "evidence": ["I2"],
+                                 "action_scope": SALES}]}}]
+    client = brief_client(BriefData([deal("farmater")], [ask], insights, profiles))
+    result = client.post(f"/brief/build?dry_run=true&version=v2&verification={verification}",
+                         headers={"X-Ingest-Token": "test-token"}).json()
+    founder = result["payload"]["sections"][0]
+    assert [w["deal"] for w in founder["waiting"]] == ["farmater"]
+    assert founder["highlights"] == [] and founder["followups"] == [] and founder["today"] == []
+    for body in (result["html"], result["text"]):
+        assert body.count("farmater") == 1               # one row: the Waiting row
+        for leak in ("No reply since", "Wait for the buyer", "Keep following up", "Check where this deal stands"):
+            assert leak not in body
+
+
+# ---- B-09 (11/12): no table longer than 7 rows, and nothing left out silently
+
+@pytest.mark.parametrize("verification", ["off", "shadow"])
+def test_no_table_lists_more_than_seven_rows_and_says_how_many_were_left_out(monkeypatch, brief_client, verification):
+    monkeypatch.setattr(brief_api, "create_gate", lambda *_: PassingGate())
+    names = [f"Deal {n:02d}" for n in range(1, 10)]
+    deals = [deal(name) for name in names]
+    insights = [insight(f"promise-{name}", name, f"Send the proposal to {name}", SALES) for name in names]
+    waits = []
+    for name in names:
+        ask = email(f"ask-{name}", name, "Can you approve the proposal?", days=8, outgoing=True)
+        waits.append(ask)
+    meetings = [_meeting(f"Call {n}", name, hours=n) for n, name in enumerate(names, start=1)]
+    client = brief_client(BriefData(deals, waits, insights, [], meetings=meetings))
+    result = client.post(f"/brief/build?dry_run=true&version=v2&verification={verification}",
+                         headers={"X-Ingest-Token": "test-token"}).json()
+    founder = result["payload"]["sections"][0]
+    assert len(founder["today"]) == 9 and founder["more_today"] == 0     # decision 11/17: this table is never cut
+    assert len(founder["highlights"]) <= 7 and len(founder["followups"]) <= 7
+    assert len(founder["meetings"]) == 7 and founder["more_meetings"] == 2
+    assert len(founder["waiting"]) <= 7
+    assert len(founder["waiting"]) + founder["more_waiting"] == (9 if verification == "off" else len(founder["waiting"]))
+    assert "Ramiro 9 today" in result["subject"]
+    page = html.unescape(result["html"])
+    assert "Needs you today (9)" in page and "more need you today" not in page + result["text"]
+    for body in (page, result["text"]):                                 # a capped table names what it left out
+        assert "+ 2 more on your calendar: Deal 08, Deal 09" in body
+        if verification == "off":
+            assert "+ 3 more in the Sheet waiting on a reply: Deal 07, Deal 08, Deal 09" in body
+    for table in page.split("<table")[1:]:
+        rows = table.split("</table>")[0]
+        assert rows.count("<tr>") - 1 <= (9 if ">Due now<" in rows else 7)        # header row aside
+
+
+def test_table_limit_is_a_setting(monkeypatch, brief_client):
+    monkeypatch.setattr(brief_api.settings, "brief_max_table_rows", 4)
+    names = [f"Deal {n}" for n in range(1, 7)]
+    insights = [insight(f"promise-{name}", name, f"Send the proposal to {name}", SALES) for name in names]
+    result = brief_client(BriefData([deal(name) for name in names], [], insights, [])).post(
+        "/brief/build?dry_run=true&version=v2", headers={"X-Ingest-Token": "test-token"}).json()
+    founder = result["payload"]["sections"][0]
+    assert len(founder["today"]) == 6 and founder["more_today"] == 0 and len(founder["highlights"]) <= 4
+
+
+# ---- B-12 (11/12): frozen In Talks deals come back in small batches, never all at once
+
+def test_quiet_in_talks_deals_come_back_three_a_day_longest_untouched_first(monkeypatch, brief_client):
+    quiet = {f"Quiet {n}": days for n, days in enumerate((70, 50, 40, 30, 20), start=1)}
+    deals = [{**deal(name), "next_step": "- Reconnect after their reorg"} for name in quiet]
+    deals += [deal("Never Seen"), deal("Active"), {**deal("Proposal"), "stage": "3. Proposal", "stage_rank": 3},
+              {**deal("On Hold"), "stage": "0. Paused", "stage_rank": 0},
+              {**deal("Dated"), "next_step": "- Call in January (complete by Jan 15, 2027)"}, deal("Waiting")]
+    ask = email("waiting-ask", "Waiting", "Can you approve the proposal?", days=20, outgoing=True)
+    data = BriefData(deals, [ask], [], [])
+    data.last_contact = {**quiet, "Never Seen": None, "Active": 3, "Proposal": 60, "On Hold": 60, "Dated": 60,
+                         "Waiting": 20}
+
+    def build():
+        result = brief_client(data).post("/brief/build?dry_run=true&version=v2",
+                                         headers={"X-Ingest-Token": "test-token"}).json()
+        return result, result["payload"]["sections"][0]
+
+    result, founder = build()
+    # In Talks only, nothing else open, not dated in the Sheet, not waiting: 6 qualify, 3 are shown.
+    assert [r["deal"] for r in founder["resurfaced"]] == ["Never Seen", "Quiet 1", "Quiet 2"]
+    assert founder["quiet_in_talks"] == 6
+    page = html.unescape(result["html"])
+    assert "Quiet In Talks deals to revisit (3 of 6)" in page
+    assert "last contact Aug 27 (10 weeks ago) · Sheet next step: Reconnect after their reorg" in page
+    assert "no email, meeting or note on record" in page
+    assert "A few each day, longest-untouched first." in page
+    assert "• Quiet 1 - last contact Aug 27 (10 weeks ago) · Sheet next step: Reconnect after their reorg" in result["text"]
+    for name in ("Quiet 3", "Quiet 4", "Quiet 5"):
+        assert f"<b>{name}</b>" not in page
+
+    data.resurfaced = [["Never Seen", "Quiet 1", "Quiet 2"]]         # yesterday's brief listed those
+    _, founder = build()
+    assert [r["deal"] for r in founder["resurfaced"]] == ["Quiet 3", "Quiet 4", "Quiet 5"]
+    data.resurfaced.append(["Quiet 3", "Quiet 4", "Quiet 5"])        # all six listed inside the cooldown
+    _, founder = build()
+    assert founder["resurfaced"] == []
+
+    data.resurfaced = []
+    monkeypatch.setattr(brief_api.settings, "brief_resurface_per_day", 1)
+    assert [r["deal"] for r in build()[1]["resurfaced"]] == ["Never Seen"]
+    monkeypatch.setattr(brief_api.settings, "brief_resurface_per_day", 0)
+    result, founder = build()
+    assert founder["resurfaced"] == [] and "Quiet In Talks deals" not in result["html"]
+
+
+# ---- B-07 (11/12): pilots stay in the funnel under a stricter sales-only filter (the Smearcase card)
+
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_pilot_deal_shows_only_items_classified_as_deal_progression(monkeypatch, brief_client, version):
+    product_work = ["Add the store-level export to the dashboard", "Fix the SKU mapping for the pilot stores",
+                    "Build the weekly out-of-stock report"]
+    pricing = "Send pricing for the paid rollout"
+    pilot = {**deal("Smearcase"), "stage": "4. Pilot", "stage_rank": 4}
+    talks = deal("Prospect")
+    insights = [insight(f"legacy-{n}", "Smearcase", text, None) for n, text in enumerate(product_work)]
+    insights += [insight("pricing", "Smearcase", pricing, SALES),
+                 insight("delivery", "Smearcase", "Reset the pilot users' passwords", DELIVERY),
+                 insight("legacy-prospect", "Prospect", "Share the onboarding checklist", None)]
+    profiles = [{"opportunity_id": pilot["id"], "generated_at": NOW, "profile": {
+        "refs": {"I1": "legacy-0"}, "recommended_actions": [
+            {"action": "Ship the export before the pilot review", "evidence": ["I1"], "action_scope": SALES}]}}]
+    client = brief_client(BriefData([pilot, talks], [], insights, profiles))
+    result = client.post(f"/brief/build?dry_run=true&version={version}", headers={"X-Ingest-Token": "test-token"}).json()
+    assert pricing in result["html"] and "Smearcase" in result["html"]          # the pilot is still in the funnel
+    for text in (*product_work, "Reset the pilot users", "Ship the export before the pilot review"):
+        assert text not in result["html"] and text not in result["text"]
+    assert "Share the onboarding checklist" in result["html"]                   # other stages keep legacy items
+
+    monkeypatch.setattr(brief_api.settings, "brief_pilot_strict_scope", False)
+    relaxed = client.post(f"/brief/build?dry_run=true&version={version}", headers={"X-Ingest-Token": "test-token"}).json()
+    assert product_work[0] in relaxed["html"]
+
+
+# ---- findings 4 and 16 (11/09 evals): "Send Patricio the overview" although Ramiro had already replied to him
+
+@pytest.mark.parametrize("verification", ["off", "shadow"])
+def test_suggestion_whose_thread_we_already_answered_is_flagged_or_left_to_the_pre_send_check(
+        monkeypatch, brief_client, verification):
+    checked = []
+
+    class Gate(PassingGate):
+        def __call__(self, actions):
+            checked.extend(actions)
+            return super().__call__(actions)
+
+    monkeypatch.setattr(brief_api, "create_gate", lambda *_: Gate())
+    ask = email("patricio-ask", "FEMSA MX", "Could you walk us through the whitespace analysis?", days=6,
+                thread="femsa-thread")
+    reply = email("ramiro-reply", "FEMSA MX", "Hi Patricio, here is the overview.", days=4, outgoing=True,
+                  thread="femsa-thread")
+    reply["reply_expectation"] = None
+    other = email("other-ask", "Other Co", "Could you share a case study?", days=6, thread="other-thread")
+    elsewhere = email("elsewhere", "Other Co", "Intro to our partner.", days=4, outgoing=True, thread="second-thread")
+    elsewhere["reply_expectation"] = None
+    suggestion = "Send Patricio the whitespace-analysis overview"
+    control = "Send the case study to Other Co"
+    insights = [
+        insight("femsa-need", "FEMSA MX", "Patricio wants a walkthrough of the whitespace analysis", SALES,
+                type_="need", origin=ask, quote=ask["body"], owner_side=None, dated=False),
+        insight("other-need", "Other Co", "The buyer wants a case study", SALES, type_="need", origin=other,
+                quote=other["body"], owner_side=None, dated=False),
+    ]
+    profiles = [
+        {"opportunity_id": "FEMSA MX-opportunity", "generated_at": NOW, "profile": {"refs": {"I1": "femsa-need"},
+         "recommended_actions": [{"action": suggestion, "evidence": ["I1"], "action_scope": SALES}]}},
+        {"opportunity_id": "Other Co-opportunity", "generated_at": NOW, "profile": {"refs": {"I1": "other-need"},
+         "recommended_actions": [{"action": control, "evidence": ["I1"], "action_scope": SALES}]}},
+    ]
+    client = brief_client(BriefData([deal("FEMSA MX"), deal("Other Co")], [ask, reply, other, elsewhere],
+                                    insights, profiles))
+    result = client.post(f"/brief/build?dry_run=true&version=v2&verification={verification}",
+                         headers={"X-Ingest-Token": "test-token"}).json()
+    moves = {h["deal"]: h["move"] for h in result["payload"]["sections"][0]["highlights"]}
+    assert moves["FEMSA MX"]["text"] == suggestion and moves["Other Co"]["text"] == control
+    if verification == "off":
+        # No pre-send check ran: the row is kept but says we already wrote back in that thread.
+        assert moves["FEMSA MX"]["when"].endswith("· you wrote back Nov 1 - still open?")
+        assert "still open?" not in moves["Other Co"]["when"]          # an email in another thread proves nothing
+    else:
+        # The pre-send check receives the suggestion anchored to Patricio's email, so it can read the reply.
+        anchored = {a.text: a for a in checked}
+        assert anchored[suggestion].origin_record_id == "patricio-ask" and anchored[suggestion].kind == "recommendation"
+        assert "still open?" not in moves["FEMSA MX"]["when"]
