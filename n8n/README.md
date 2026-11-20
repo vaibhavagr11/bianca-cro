@@ -15,14 +15,6 @@ An authorized operator can call `POST /review/build?force=true` for an intention
 
 See [workflow import](https://docs.n8n.io/workflows/export-import/) and [HTTP Request credentials](https://docs.n8n.io/integrations/builtin/credentials/httprequest/).
 
-## Send an expandable Daily Brief
-
-The v2 build can return `amp_html` for Gmail's **Show N more** controls. Import [daily-brief-send.json](daily-brief-send.json) and select the sender's Gmail OAuth2 credential on **Send via Gmail**. The credential must allow `users.messages.send`. [Gmail send scopes](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/send#authorization-scopes)
-
-Replace the scheduled workflow's mail node with **Execute Sub-workflow** and select **Bianca - Send Daily Brief**. Map `brief` to the successful v2 response object and `from` to the plain email address authorized by the selected Gmail credential. Wait for the sub-workflow to finish so the caller receives the Gmail message ID. Keep the caller's existing verification gate and delivery deduplication before this step. The sub-workflow rejects dry runs and builds with an unready verification status.
-
-The sender puts `amp_html` between the plain-text and HTML versions in a single message. Gmail requires [sender registration](https://developers.google.com/workspace/gmail/ampemail/register) for production dynamic email. Use a test recipient with the sender allowlisted in [Gmail developer settings](https://developers.google.com/workspace/gmail/ampemail/testing-dynamic-email) to check both expanders before switching the scheduled workflow. Preview builds still use `dry_run=true` with the send step disconnected. Clients that display the standard HTML or plain-text version receive all eligible rows.
-
 # Sheets proxy: the backend's only route to Google Sheets
 
 n8n is the Google connector, so the backend never holds a Google credential. Import `sheets-proxy.json`; the backend
