@@ -15,7 +15,7 @@ from app import brief_verification, db, timeline
 from app.config import settings
 from app.ingest import _workspace_id
 
-CHECKER = "brief-send-v2"
+CHECKER = "brief-send-v3-hub"
 
 
 class VerificationPending(Exception):

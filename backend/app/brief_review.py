@@ -126,14 +126,18 @@ def verify_v1(sections: list[dict], ndl: list[brief.Row], companies: dict[str, s
 
 
 def verify_v2(sections: list[brief_v2.Section], ndl: list[brief_v2.TodayRow], companies: dict[str, str],
-              sources: dict[str, ActionSource], gate: Gate) -> brief.VerificationNotes:
+              sources: dict[str, ActionSource], gate: Gate, *,
+              full_sections: list[brief_v2.Section] | None = None,
+              full_ndl: list[brief_v2.TodayRow] | None = None,
+              full_ndl_notes: brief.VerificationNotes | None = None) -> brief.VerificationNotes:
     inventory = _Inventory(companies, sources)
 
     def describe(row: brief_v2.TodayRow) -> tuple[str, str, str | None]:
         return row.deal, row.text, row.done
 
+    all_sections = sections + (full_sections or [])
     sheet_dates = []
-    for section in sections:
+    for section in all_sections:
         notes = section.verification = brief.VerificationNotes()
         # A founder's own dated note in the Sheet has no email to check it against: it is shown as written.
         sheet_dates.append([row for row in section.today if not row.verify])
@@ -147,12 +151,18 @@ def verify_v2(sections: list[brief_v2.Section], ndl: list[brief_v2.TodayRow], co
         inventory.add(section.unclear, lambda row: (row.deal, "Confirm deal status", None), notes)
         inventory.add(section.meetings, lambda row: (row[0].deal or row[0].title, row[1], None), notes, remove_prep=True)
     ndl_notes = brief.VerificationNotes()
-    ndl_sheet = [row for row in ndl if not row.verify]
-    ndl[:] = [row for row in ndl if row.verify]
-    inventory.add(ndl, describe, ndl_notes)
+    ndl_groups = [(ndl, ndl_notes)]
+    if full_ndl is not None:
+        ndl_groups.append((full_ndl, full_ndl_notes if full_ndl_notes is not None else brief.VerificationNotes()))
+    ndl_sheet = []
+    for rows, notes in ndl_groups:
+        ndl_sheet.append([row for row in rows if not row.verify])
+        rows[:] = [row for row in rows if row.verify]
+        inventory.add(rows, describe, notes)
     open_refs = inventory.apply(gate)
-    ndl[:] = brief_v2.sort_today(ndl + ndl_sheet)
-    for section, kept in zip(sections, sheet_dates):
+    for (rows, _), kept in zip(ndl_groups, ndl_sheet):
+        rows[:] = brief_v2.sort_today(rows + kept)
+    for section, kept in zip(all_sections, sheet_dates):
         section.today[:] = brief_v2.sort_today(section.today + kept)
         section.more_followups = section.more_waiting = 0
         section.all_items = [i for i in section.all_items if f"insight:{i.id}" in open_refs]

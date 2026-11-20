@@ -3,10 +3,11 @@
 import hashlib
 import json
 import logging
+from itertools import chain
 from dataclasses import replace
 from datetime import datetime, time, timedelta
 from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import anthropic
@@ -34,7 +35,6 @@ def _dumps(obj) -> str:
 router = APIRouter(prefix="/brief")
 
 FOUNDER_ORDER = ["RG", "NC"]  # sections in this order; NDL gets the small shared table
-AMP_EMAIL_MAX_BYTES = 200_000
 # Two founders are named Nicolás, so the brief uses these names, not first names.
 DISPLAY = {"RG": ("Ramiro", "Ramiro Godfrid"), "NC": ("Nico", "Nico Casaux"), "NDL": ("Nico DL", "Nico de León")}
 
@@ -367,6 +367,7 @@ def build_brief(dry_run: bool = False, version: str = "v1", x_ingest_token: str 
 
 def _finish(workspace_id, for_date, payload: dict, recipients: list[str], response: dict,
             dry_run: bool, gate: DeliveryGate | None, pipeline_sync_run_id: UUID | None = None) -> dict:
+    brief_id = UUID(response.setdefault("brief_id", str(uuid4())))
     if gate is not None:
         response.update(gate.ready_fields())
     if dry_run:
@@ -380,10 +381,11 @@ def _finish(workspace_id, for_date, payload: dict, recipients: list[str], respon
             check_fresh_pipeline(conn, workspace_id, pipeline_sync_run_id)
         if gate is not None:
             gate.finalize(conn, response)
-        conn.execute("insert into briefs (workspace_id, for_date, subject, html, payload, recipients)"
-                     " values (%s, %s, %s, %s, %s, %s)",
-                     (workspace_id, for_date, response["subject"], response["html"],
-                      Jsonb(payload, dumps=_dumps), recipients))
+        conn.execute("insert into briefs (id, workspace_id, for_date, subject, html, payload, recipients, full_html, full_payload)"
+                     " values (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                     (brief_id, workspace_id, for_date, response["subject"], response["html"],
+                      Jsonb(payload, dumps=_dumps), recipients, response.get("full_html"),
+                      Jsonb(response["full_payload"], dumps=_dumps) if "full_payload" in response else None))
     return response
 
 
@@ -1038,26 +1040,33 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
     max_rows = settings.brief_max_table_rows
     picked_waits = {code: brief_v2.pick_waiting(waits, code, max_rows) for code in FOUNDER_ORDER}
     sections = []
+    full_sections = []
     for code in FOUNDER_ORDER:
-        short, full = DISPLAY.get(code, (code, names.get(code, code)))
+        short, full_name = DISPLAY.get(code, (code, names.get(code, code)))
         shown, more = picked_waits[code]
+        full_waits, _ = brief_v2.pick_waiting(waits, code, max_rows, full=True)
 
-        def section(views, items, cadence, resurface):
+        def section(views, items, cadence, resurface, *, full=False):
             return brief_v2.build_section(
-                code, full, short, views, items, [(m, m.context) for m in meetings if code in m.attendees], today,
+                code, full_name, short, views, items, [(m, m.context) for m in meetings if code in m.attendees], today,
                 display, 0 if gate else hidden.get(code, 0), settings.brief_critical_ahead_days,
-                settings.brief_in_talks_target, waiting=shown, more_waiting=more,
-                left_waiting=brief_v2.waiting_left_out(waits, code, shown), waiting_candidates=waiting_candidates,
+                settings.brief_in_talks_target, waiting=full_waits if full else shown,
+                more_waiting=0 if full else more,
+                left_waiting=[] if full else brief_v2.waiting_left_out(waits, code, shown), waiting_candidates=waiting_candidates,
                 sheet_overdue_days=settings.brief_sheet_step_overdue_days, cadence=cadence, max_rows=max_rows,
-                resurface=resurface, resurfaced_recently=resurfaced_recently)
+                resurface=resurface, resurfaced_recently=resurfaced_recently, full=full)
         try:
-            sections.append(section(views, items, cadence, resurface))
+            email_section = section(views, items, cadence, resurface)
+            full_section = section(views, items, cadence, resurface, full=True)
         except Exception:
             # The 11/17 additions are extras. If one of them breaks on today's data, send the brief without them
             # rather than no brief: no Sheet dates, no time-based nudges, no quiet-deal batch for this founder.
             log.exception("brief section %s rebuilt without Sheet dates, nudges and the quiet-deal batch", code)
             plain = {name: replace(v, sheet_steps=[], held=0) for name, v in views.items()}
-            sections.append(section(plain, items_before_sheet, None, 0))
+            email_section = section(plain, items_before_sheet, None, 0)
+            full_section = section(plain, items_before_sheet, None, 0, full=True)
+        sections.append(email_section)
+        full_sections.append(full_section)
 
     ndl = [brief_v2.TodayRow(i.deal, views[i.deal].stage, "Due now", i.text, f"due {i.due:%b} {i.due.day}", "Nico DL",
                              i.link, i.id, i.source, f"insight:{i.id}", late=(today - i.due).days)
@@ -1070,14 +1079,21 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         if v.owner == "NDL":
             ndl += _safely("a Sheet date for Nico DL", lambda: brief_v2.sheet_rows(
                 v, today, settings.brief_sheet_step_overdue_days, "Nico DL (Sheet)")[0], [])
-    ndl = brief_v2.sort_today(ndl)[:brief.MAX_NDL]
-    ndl_review = brief_review.verify_v2(sections, ndl, {d["name"]: key for key, d in deals.items()}, sources, gate) \
-        if gate else None
+    full_ndl = brief_v2.sort_today(ndl)
+    ndl = full_ndl[:brief.MAX_NDL]
+    full_ndl_review = brief.VerificationNotes() if gate else None
+    ndl_review = brief_review.verify_v2(
+        sections, ndl, {d["name"]: key for key, d in deals.items()}, sources, gate,
+        full_sections=full_sections, full_ndl=full_ndl, full_ndl_notes=full_ndl_review) if gate else None
     # Prep is written last, from the rows that survived the check above, so it never revives a closed action.
     for s in sections:
         s.meetings = [(m, prep or _safely("a meeting's prep line", lambda: brief_v2.meeting_prep(
             m, s, views.get(m.deal), today, checked=gate is not None), ""))
                       for m, prep in s.meetings]
+    meeting_prep = {(s.code, m.at, m.title, m.deal): prep for s in sections for m, prep in s.meetings}
+    for s in full_sections:
+        s.meetings = [(m, meeting_prep.get((s.code, m.at, m.title, m.deal), prep)) for m, prep in s.meetings]
+    for s in sections:
         brief_v2.cap_tables(s, max_rows)    # after the check, so rows that passed it fill the tables
 
     changes: list[brief_v2.ChangeRow] = []
@@ -1091,6 +1107,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                          f"{ch['old_value']} → {ch['new_value']}")
         changes.append(brief_v2.ChangeRow(ch["name"], views[ch["name"]].rank if ch["name"] in views else None,
                                           text, "Sheet", None))
+    full_change_candidates = list(changes)
     explained: set[tuple[str, str]] = set()
     per_deal: dict[str, int] = {}
     order = {"blocker": 0, "buying_signal": 1, "objection": 2, "commitment": 3, "next_step": 4, "need": 5}
@@ -1099,8 +1116,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             continue
         d = deals[str(r["company_id"])]
         explained.add((r["source"], r["unit_id"]))
-        if per_deal.get(d["name"], 0) >= 1:
-            continue
+        show_in_email = per_deal.get(d["name"], 0) == 0
         per_deal[d["name"]] = per_deal.get(d["name"], 0) + 1
         event = _event_day(rec, tz)
         q = " ".join(r["quote"].split()).lower()
@@ -1114,10 +1130,13 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                                            rec["subject"], event, spk)
         if gate and ikind == "owed" and not title_only:
             text = f"Commitment recorded: {brief_v2.first_sentence(r['text'], 120)}"
-        changes.append(brief_v2.ChangeRow(d["name"], d["stage_rank"], text,
+        change = brief_v2.ChangeRow(d["name"], d["stage_rank"], text,
                                           f"{SOURCE_LABEL.get(r['source'], r['source'])} · {event:%b} {event.day}",
                                           _link_for(r["source"], r["unit_id"], r["meta"]), kind, event,
-                                          title_only=title_only, from_customer=spk == "customer"))
+                                          title_only=title_only, from_customer=spk == "customer")
+        full_change_candidates.append(change)
+        if show_in_email:
+            changes.append(change)
     seen: set[tuple[str, str]] = set()
     for rec in reversed(new_records):  # plain facts only where nothing was extracted, dated the same way
         key, d = (rec["source"], rec["thread_id"]), deals.get(str(rec["company_id"]))
@@ -1140,12 +1159,15 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         else:
             other = None
             text = f"Meeting notes added (nothing new extracted): {rec['subject'] or '(no subject)'}"
-        changes.append(brief_v2.ChangeRow(d["name"], d["stage_rank"], text, SOURCE_LABEL[rec["source"]],
+        change = brief_v2.ChangeRow(d["name"], d["stage_rank"], text, SOURCE_LABEL[rec["source"]],
                                           _link_for(rec["source"], rec["thread_id"], rec["meta"]), kind,
                                           _event_day(rec, tz), title_only=True,
-                                          from_customer=rec["source"] == "gmail" and not other))
+                                          from_customer=rec["source"] == "gmail" and not other)
+        changes.append(change)
+        full_change_candidates.append(change)
     every_change = changes
     changes = brief_v2.select_changes(changes, max_rows)
+    full_changes = brief_v2.select_changes(full_change_candidates, max_rows, full=True)
     more_changes = len(every_change) - len(changes)
     left_changes = [c.deal for c in every_change if all(c is not shown for shown in changes)]
     backfill_events = [(r, rec) for r, rec, kind in events if kind == "backfill"]
@@ -1165,17 +1187,31 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
                 "WhatsApp, so missing activity is not proof nothing happened." if NICO_INBOX_CONNECTED else
                 "Sources: pipeline Sheet, Ramiro's Gmail and Calendar, meeting notes. Not connected: Nico's inbox "
                 "and calendar, WhatsApp, so missing activity is not proof nothing happened.")
-    labels = brief_v2.completable(sections, ndl)  # ref -> (deal, text) for each row's "Mark as complete" link
-    action_url = (lambda ref: actions.link(ref, *labels[ref])) if settings.brief_action_secret else None
+    labels = brief_v2.completable(sections + full_sections, full_ndl)
+    completion_urls = {ref: actions.link(ref, *label) for ref, label in labels.items()} \
+        if settings.brief_action_secret else {}
+    action_url = completion_urls.__getitem__ if settings.brief_action_secret else None
     client = None if gate else _claude()   # verified builds keep wording stable: deterministic cut only
-    display = prepare_table_text(brief_v2.table_text_fields(sections, ndl, changes), client, settings.anthropic_model)
+    display = prepare_table_text(chain(brief_v2.table_text_fields(sections, ndl, changes),
+                                       brief_v2.table_text_fields(full_sections, full_ndl, full_changes)),
+                                 client, settings.anthropic_model)
+    brief_id = uuid4()
+    brief_url = None if dry_run else f"{settings.public_base_url.rstrip('/')}/review/app?tab=daily-brief&brief={brief_id}"
     html_body = brief_v2.render(sections, ndl, changes, today, len(deals), coverage, not NICO_INBOX_CONNECTED,
                                 backfill, action_url, ndl_review, display=display, more_changes=more_changes,
-                                left_changes=left_changes)
-    text_body = brief_v2.plain_text(sections, today, ndl_review, display=display)
+                                left_changes=left_changes, hub_url=brief_url)
+    full_backfill = backfill
+    if undated_events:
+        full_undated = brief_v2.undated_note(undated_events, undated, from_notes, full=True)
+        full_backfill = backfill.replace(brief_v2.undated_note(undated_events, undated, from_notes), full_undated)
+    full_html = brief_v2.render(full_sections, full_ndl, full_changes, today, len(deals), coverage,
+                                not NICO_INBOX_CONNECTED, full_backfill, action_url, full_ndl_review,
+                                display=display, full=True)
+    text_body = brief_v2.plain_text(sections, today, ndl_review, display=display, hub_url=brief_url)
     subj = brief_v2.subject(sections, today)
     to = settings.brief_to or [t["email"] for t in team if t["receives_brief"]]
     payload = brief_v2.to_payload(sections, ndl, changes)
+    full_payload = brief_v2.to_payload(full_sections, full_ndl, full_changes)
     if gate:
         payload["verification"] = gate.audit
         payload["ndl_verification"] = ndl_review.sections()
@@ -1187,10 +1223,7 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
     payload["change_cutoff"] = since.astimezone(tz).isoformat()
     log.info("brief v2 built for %s: items=%s changes=%s dry_run=%s", today, len(items), len(changes), dry_run)
     response = {"subject": subj, "html": html_body, "text": text_body, "to": ",".join(to), "for_date": today.isoformat(),
-                "candidates": len(items), "dry_run": dry_run, "version": "v2", "payload": json.loads(_dumps(payload))}
-    if any(len(s.highlights) > brief_v2.MAX_HIGHLIGHTS or s.more_waiting for s in sections):
-        amp_html = brief_v2.render(sections, ndl, changes, today, len(deals), coverage, not NICO_INBOX_CONNECTED,
-                                   backfill, action_url, ndl_review, display=display, amp=True)
-        if len(amp_html.encode("utf-8")) <= AMP_EMAIL_MAX_BYTES:
-            response["amp_html"] = amp_html
+                "candidates": len(items), "dry_run": dry_run, "version": "v2", "payload": json.loads(_dumps(payload)),
+                "brief_id": str(brief_id), "brief_url": brief_url, "full_html": full_html,
+                "full_payload": json.loads(_dumps(full_payload))}
     return _finish(workspace_id, today, payload, to, response, dry_run, gate, pipeline_sync_run_id)
