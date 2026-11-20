@@ -79,38 +79,6 @@ def test_v2_checks_every_action_section_and_only_keeps_verified_done_links():
     assert "Send a prep deck" in text and "Acme meeting — Send a prep deck" not in text
 
 
-def test_v2_verifies_overflow_before_counting_visible_rows():
-    section = brief_v2.build_section("RG", "Ramiro", "Ramiro", {}, [], [], NOW.date(), {})
-    sources = {}
-    companies = {}
-    for idx in range(8):
-        name = f"Company {idx}"
-        companies[name] = str(idx)
-        move_ref = f"rec:{idx}"
-        thread_id = f"thread-{idx}"
-        move = brief_v2.Move("AI recommendation", "Send pricing", "soon", None, done=move_ref)
-        section.highlights.append((brief_v2.DealView(name, "Pilot", 4, "RG"), move, None))
-        section.waiting.append(brief_v2.Waiting(name, "Pilot", "Ana", NOW.date(), 9, 1, False, False, None,
-                                                thread_id=thread_id))
-        sources[move_ref] = source("recommendation", f"move-{idx}")
-        sources[f"wait:{thread_id}"] = source("waiting", f"wait-{idx}")
-
-    def gate(actions):
-        assert len(actions) == 16
-        return {a.key: Verdict("handled" if a.origin_record_id.endswith("-6")
-                               else "waiting" if a.kind == "waiting" else "still_owed", "fixture")
-                for a in actions}
-
-    brief_review.verify_v2([section], [], companies, sources, gate)
-    payload = brief_v2.to_payload([section], [], [])["sections"][0]
-    assert [row["deal"] for row in payload["overflow_highlights"]] == ["Company 7"]
-    assert [row["deal"] for row in payload["overflow_waiting"]] == ["Company 7"]
-    assert payload["more_waiting"] == 1
-    labels = brief_v2.completable([section], [])
-    assert "rec:7" in labels and "thread:thread-7" in labels
-    assert "rec:6" not in labels and "thread:thread-6" not in labels
-
-
 @pytest.mark.parametrize("version", ["v1", "v2"])
 def test_pending_public_build_returns_no_sendable_body_for_both_versions(monkeypatch, version):
     sync_run_id, build_id = uuid4(), uuid4()

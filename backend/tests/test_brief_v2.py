@@ -14,7 +14,7 @@ from app.brief_v2 import (
     deal_status, describe_change,
     reply_text, first_sentence, has_request,
     is_new_insight, item_kind, norm, plain_text, primary_move, render, reply_label, resolve_owner, select_changes, subject,
-    to_payload, rank_waiting,
+    to_payload,
 )
 from app.main import app
 
@@ -173,22 +173,18 @@ def test_old_last_contact_means_confirm_status_not_active():
 
 # ---- density and stale noise (points 1 and 5)
 
-def test_deal_rows_keep_the_top_six_and_preserve_remaining_moves_in_the_payload_and_fallback():
+def test_deals_to_move_has_six_distinct_deals_and_the_same_heading_in_both_formats():
     views = [view(f"Deal {n}", 2) for n in range(8)]
     its = [item(f"Deal {n}", f"promise {n}-{k}", due=TODAY + timedelta(days=4), id=f"{n}-{k}")
            for n in range(8) for k in range(3)]
     s = section("NC", views, its)
-    assert [v.deal for v, _, _ in s.highlights] == [f"Deal {n}" for n in range(8)]
-    payload = to_payload([s], [], [])["sections"][0]
-    assert [row["deal"] for row in payload["highlights"]] == [f"Deal {n}" for n in range(6)]
-    assert [row["deal"] for row in payload["overflow_highlights"]] == ["Deal 6", "Deal 7"]
+    assert len(s.highlights) == len({v.deal for v, _, _ in s.highlights}) == 6
+    assert len(s.also_active) == 2
     assert all(m.tag == "We owe" for _, m, _ in s.highlights)
     html = render([s], [], [], TODAY, 8, "c", False)
     assert "Deals to Move" in re.findall(r"<h3[^>]*>([^<]*)</h3>", html)
-    text = plain_text([s], TODAY)
-    assert "Deals to Move" in text.splitlines()
-    for body in (html, text):
-        assert body.count("promise 0-") == body.count("promise 7-") == 1
+    assert "Deals to Move" in plain_text([s], TODAY).splitlines()
+    assert html.count("promise 0-") == 1                                   # one move shown, not the whole list
 
 
 def test_backlog_is_summarized_with_rare_exceptions_and_all_items_preserved():
@@ -382,9 +378,9 @@ def test_in_talks_deals_get_considered_and_two_are_shown():
     views += [view(f"Pilot {n}", 4, owner="RG", developments=1,
                    recommendation=Note("Send draft terms", verified=True)) for n in range(2)]
     s = section("RG", views, items)
-    shown = [v.deal for v, _, _ in s.highlights[:6]]
+    shown = [v.deal for v, _, _ in s.highlights]
     assert {"Pernod Ricard", "Campari"} <= set(shown)                       # time-critical first
-    assert sum(1 for v, _, _ in s.highlights[:6] if v.rank == 2) == 2       # In Talks preference met
+    assert sum(1 for v, _, _ in s.highlights if v.rank == 2) == 2           # In Talks preference met
     audit = {r.deal: r for r in s.audit}
     assert audit["Arca Peru"].signals and audit["Chifles"].signals          # both evaluated with evidence
     assert all(r.reason for r in s.audit)                                   # every eligible deal has a reason
@@ -397,8 +393,7 @@ def test_time_critical_pilots_are_never_displaced_for_in_talks():
     items = [item(v.deal, "promise", due=TODAY + timedelta(days=2), deal_owner="RG", id=f"p{n}")
              for n, v in enumerate(pilots)]
     s = section("RG", pilots + talks, items)
-    assert {v.deal for v, _, _ in s.highlights[:6]} == {v.deal for v in pilots}
-    assert s.highlights[6][0].deal == "Talks co"
+    assert {v.deal for v, _, _ in s.highlights} == {v.deal for v in pilots}
     assert {r.deal: r for r in s.audit}["Talks co"].reason.startswith("outranked")
 
 
@@ -646,7 +641,7 @@ def test_done_buttons_link_each_closable_row_and_skip_the_rest():
 
 # ---------------------------------------------------------------- Nov 4 founder feedback: automated mail, waiting list
 
-from app.brief_v2 import Waiting, is_automated, waiting_on_them, waiting_text  # noqa: E402
+from app.brief_v2 import Waiting, is_automated, pick_waiting, waiting_on_them, waiting_text  # noqa: E402
 
 NOV4 = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
 INTERNAL = {"bianca-ai.com"}
@@ -742,7 +737,8 @@ def wait(deal, days, owner="RG", rank=2, **kw):
 
 def test_waiting_list_is_per_founder_prospects_first_newest_silence_first():
     ws = [wait("Customer Co", 60, rank=5), wait("Andina Chile", 9), wait("Arca Peru", 50), wait("Nico deal", 7, owner="NC")]
-    assert [w.deal for w in rank_waiting(ws, "RG")] == ["Andina Chile", "Arca Peru", "Customer Co"]
+    shown, more = pick_waiting(ws, "RG")
+    assert [w.deal for w in shown] == ["Andina Chile", "Arca Peru", "Customer Co"] and more == 0
     assert waiting_text(wait("Arca Peru", 50, nudges=3, auto=True)) == "To Juan Pérez · no reply to our 3 emails, out-of-office received"
     assert waiting_text(wait("Farmater", 7, nudges=4, replied=True)) == "To Juan Pérez · 4 emails since their last reply"
     # B-11: from the fifth unanswered email the row suggests Paused - on the deal's weekly day only (decision 11/17).

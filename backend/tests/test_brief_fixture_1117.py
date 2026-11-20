@@ -189,3 +189,4 @@ def test_the_same_data_builds_the_same_brief_twice(monkeypatch, brief_client):
     first = brief_client(fixture()).post("/brief/build?dry_run=true&version=v2", headers=HEADERS).json()
     second = brief_client(fixture()).post("/brief/build?dry_run=true&version=v2", headers=HEADERS).json()
     assert first["html"] == second["html"] and first["text"] == second["text"]
+    assert first["full_html"] == second["full_html"]

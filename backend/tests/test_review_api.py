@@ -1,5 +1,6 @@
 """Transport/auth tests; no production database, Claude, or Google calls."""
 from contextlib import contextmanager
+from datetime import date, datetime, timezone
 from uuid import uuid4
 
 import pytest
@@ -114,7 +115,11 @@ def test_mcp_initialization_and_notification():
 def test_mcp_tools_are_narrow_and_include_review_version():
     tools = rpc("tools/list").json()["result"]["tools"]
     assert {t["name"] for t in tools} == {"bianca_review_workspace", "bianca_approve_update", "bianca_ignore_update",
-                                        "bianca_set_status"}
+                                        "bianca_set_status", "bianca_daily_brief"}
+    brief = next(t for t in tools if t["name"] == "bianca_daily_brief")
+    assert brief["annotations"]["readOnlyHint"] is True
+    assert brief["inputSchema"]["additionalProperties"] is False
+    assert set(brief["inputSchema"]["properties"]) == {"brief_id"}
     status = next(t for t in tools if t["name"] == "bianca_set_status")
     assert set(status["inputSchema"]["required"]) == {"row_id", "expected_status", "status"}
     assert "actor" not in status["inputSchema"]["properties"]
@@ -328,6 +333,106 @@ def test_status_change_errors_map_to_clear_http_codes(monkeypatch, error, code):
     monkeypatch.setattr(review_service, "change_status", change)
     body = {"expected_status": "1. Opening", "status": "0. Paused"}
     assert client.post(f"/review/rows/{uuid4()}/status", json=body, headers=HEADERS).status_code == code
+
+
+@pytest.fixture
+def archived_brief(monkeypatch):
+    state = {"row": {"id": uuid4(), "for_date": date(2026, 11, 19), "subject": "Today's Daily Brief",
+                     "html": "<table>Six email rows</table>", "full_html": "<table>All eight rows</table>",
+                     "created_at": datetime(2026, 11, 19, 12, tzinfo=timezone.utc)}, "queries": []}
+
+    class Conn:
+        def execute(self, query, params):
+            assert query.startswith("select ")
+            state["queries"].append((query, params))
+            return self
+
+        def fetchone(self):
+            return state["row"]
+
+    @contextmanager
+    def connect():
+        yield Conn()
+
+    monkeypatch.setattr(review_api.db, "connect", connect)
+    monkeypatch.setattr(review_api, "_workspace_id", lambda _conn: "review-workspace")
+    monkeypatch.setattr(review_api.brief_api, "build_brief", lambda *args, **kw: pytest.fail("must not build a brief"))
+    return state
+
+
+@pytest.mark.parametrize("path", ["/review/briefs/latest", f"/review/briefs/{uuid4()}"])
+def test_saved_brief_requires_founder_auth_and_allowed_origin(monkeypatch, path):
+    monkeypatch.setattr(review_api, "_daily_brief", lambda *args: pytest.fail("must not read a brief"))
+    assert client.get(path).status_code == 401
+    assert client.get(path, headers={"X-Ingest-Token": "test-token"}).status_code == 401
+    assert client.get(path, headers={**HEADERS, "Origin": "https://untrusted.example"}).status_code == 403
+    monkeypatch.setattr(settings, "review_enabled", False)
+    assert client.get(path, headers=HEADERS).status_code == 404
+
+
+def test_saved_brief_rest_and_mcp_share_full_snapshot_read(archived_brief):
+    brief_id = archived_brief["row"]["id"]
+    response = client.get(f"/review/briefs/{brief_id}", headers=HEADERS)
+    assert response.status_code == 200 and response.headers["cache-control"] == "no-store"
+    assert response.json() == {"id": str(brief_id), "for_date": "2026-11-19", "subject": "Today's Daily Brief",
+                               "html": "<table>All eight rows</table>", "full_available": True,
+                               "created_at": "2026-11-19T12:00:00+00:00"}
+    result = rpc("tools/call", {"name": "bianca_daily_brief", "arguments": {"brief_id": str(brief_id)}})
+    assert result.headers["cache-control"] == "no-store"
+    assert result.json()["result"]["structuredContent"] == response.json()
+    assert result.json()["result"]["isError"] is False
+    for query, params in archived_brief["queries"]:
+        assert "where workspace_id = %s and id = %s" in query
+        assert params == ("review-workspace", brief_id)
+
+
+def test_latest_saved_brief_is_limited_to_today_in_workspace_timezone(archived_brief):
+    result = client.get("/review/briefs/latest", headers=HEADERS)
+    assert result.status_code == 200 and result.json()["full_available"] is True
+    tool = rpc("tools/call", {"name": "bianca_daily_brief", "arguments": {}})
+    assert tool.json()["result"]["structuredContent"] == result.json()
+    for query, params in archived_brief["queries"]:
+        assert "where workspace_id = %s and for_date = (now() at time zone" in query
+        assert "select timezone from workspaces where id = %s" in query
+        assert query.endswith("order by created_at desc, id desc limit 1")
+        assert params == ("review-workspace", "review-workspace")
+
+
+def test_latest_saved_brief_does_not_fall_back_to_yesterday(archived_brief):
+    archived_brief["row"] = None
+    response = client.get("/review/briefs/latest", headers=HEADERS)
+    assert response.status_code == 404 and response.headers["cache-control"] == "no-store"
+    assert response.json() == {"detail": "No Daily Brief has been saved for today."}
+    result = rpc("tools/call", {"name": "bianca_daily_brief", "arguments": {}}).json()["result"]
+    assert result["isError"] is True
+    assert result["structuredContent"] == {"status": 404, "detail": response.json()["detail"]}
+
+
+def test_missing_or_foreign_saved_brief_returns_not_found(archived_brief):
+    archived_brief["row"] = None
+    foreign_id = uuid4()
+    response = client.get(f"/review/briefs/{foreign_id}", headers=HEADERS)
+    assert response.status_code == 404 and response.headers["cache-control"] == "no-store"
+    assert response.json() == {"detail": "Daily Brief not found."}
+    query, params = archived_brief["queries"][0]
+    assert "where workspace_id = %s and id = %s" in query
+    assert params == ("review-workspace", foreign_id)
+
+
+def test_legacy_saved_brief_is_identified_and_uses_its_saved_html(archived_brief):
+    archived_brief["row"]["full_html"] = None
+    response = client.get(f"/review/briefs/{archived_brief['row']['id']}", headers=HEADERS)
+    assert response.status_code == 200
+    assert response.json()["html"] == "<table>Six email rows</table>"
+    assert response.json()["full_available"] is False
+
+
+def test_saved_brief_rejects_invalid_ids_and_tool_arguments_before_read(monkeypatch):
+    monkeypatch.setattr(review_api, "_daily_brief", lambda *args: pytest.fail("must not read a brief"))
+    assert client.get("/review/briefs/invalid", headers=HEADERS).status_code == 422
+    for args in ({"brief_id": "invalid"}, {"actor": "RG"}, {"workspace_id": str(uuid4())}):
+        result = rpc("tools/call", {"name": "bianca_daily_brief", "arguments": args})
+        assert result.json()["error"]["code"] == -32602
 
 
 # ---- H-16: Keep current bullets + add these
