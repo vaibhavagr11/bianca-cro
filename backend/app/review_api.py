@@ -112,6 +112,34 @@ class StatusTool(StatusRequest):
     row_id: UUID
 
 
+class DailyBriefTool(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    brief_id: UUID | None = None
+
+
+def _daily_brief(brief_id: UUID | None = None) -> dict:
+    """Read a saved brief in this workspace without rebuilding or changing it."""
+    with db.connect() as conn:
+        workspace_id = _workspace_id(conn)
+        conn.row_factory = dict_row
+        query = "select id, for_date, subject, html, full_html, created_at from briefs where workspace_id = %s"
+        if brief_id is None:
+            query += (" and for_date = (now() at time zone"
+                      " (select timezone from workspaces where id = %s))::date"
+                      " order by created_at desc, id desc limit 1")
+            params = (workspace_id, workspace_id)
+        else:
+            query += " and id = %s"
+            params = (workspace_id, brief_id)
+        row = conn.execute(query, params).fetchone()
+    if row is None:
+        detail = "No Daily Brief has been saved for today." if brief_id is None else "Daily Brief not found."
+        raise HTTPException(404, detail, headers={"Cache-Control": "no-store"})
+    return {"id": str(row["id"]), "for_date": row["for_date"].isoformat(), "subject": row["subject"],
+            "html": row["full_html"] or row["html"], "full_available": bool(row["full_html"]),
+            "created_at": row["created_at"].isoformat()}
+
+
 def _status(row_id: str, actor: str, payload: StatusRequest) -> dict:
     with db.connect() as conn:
         workspace_id = _workspace_id(conn)
@@ -183,6 +211,18 @@ def _decision(proposal_id: str, actor: str, action: str, payload: IgnoreRequest)
 def workspace(response: Response, actor: str = Depends(reviewer)) -> dict:
     response.headers["Cache-Control"] = "no-store"
     return {**_workspace(), "viewer": actor}
+
+
+@router.get("/briefs/latest")
+def latest_daily_brief(response: Response, actor: str = Depends(reviewer)) -> dict:
+    response.headers["Cache-Control"] = "no-store"
+    return _daily_brief()
+
+
+@router.get("/briefs/{brief_id}")
+def daily_brief(brief_id: UUID, response: Response, actor: str = Depends(reviewer)) -> dict:
+    response.headers["Cache-Control"] = "no-store"
+    return _daily_brief(brief_id)
 
 
 @router.post("/build")
@@ -267,6 +307,9 @@ def _tools() -> list[dict]:
         {"name": "bianca_review_workspace", "description": "Read pending company sales updates and the review activity. Never approve an update without the founder's explicit decision.",
          "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
          "annotations": {"readOnlyHint": True, "openWorldHint": False}},
+        {"name": "bianca_daily_brief", "description": "Read today's latest saved Daily Brief, or a specific saved brief by brief_id, in this workspace. Returns the full saved tables when available and identifies older limited archives. This does not generate or send a brief.",
+         "inputSchema": DailyBriefTool.model_json_schema(),
+         "annotations": {"readOnlyHint": True, "openWorldHint": False}},
         {"name": "bianca_approve_update", "description": "On the founder's Approve or Save & approve action, write next steps, commitments, and blockers to Next step, rotating its previous value into Last progress only when action bullets are approved. With next_step_mode append (the founder chose Keep current bullets + add these) the approved steps are instead added below the existing Next step text, steps already there are not repeated, and Last progress is left unchanged. Write customer needs, buying signals, and objections to Client Context using the configured context policy. Empty sections leave their cells unchanged. Retry using the same idempotency key, both bullet lists and the same next_step_mode.",
          "inputSchema": ApproveTool.model_json_schema(),
          "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False}},
@@ -280,6 +323,8 @@ def _tools() -> list[dict]:
 
 
 def _tool_call(name: str, arguments: dict, actor: str) -> dict:
+    if name == "bianca_daily_brief":
+        return _daily_brief(DailyBriefTool.model_validate(arguments).brief_id)
     if name == "bianca_review_workspace":
         if arguments:
             raise ValueError("The workspace tool takes no arguments")

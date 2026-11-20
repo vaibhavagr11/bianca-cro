@@ -25,7 +25,7 @@ test('Live page starts without sample company data, browser storage, or hardcode
   assert.equal(html.includes('localStorage'),false);
   assert.equal(html.includes('sessionStorage'),false);
   assert.equal(html.includes('bianca-core'),false);
-  assert.ok(html.includes('<h1>Sales Pipeline Updates</h1>'));
+  assert.ok(html.includes('<h1 id="workspace-title">Sales Pipeline Updates</h1>'));
   assert.ok(html.includes('<option value="NDL">Nicolás de León · NDL</option>'));
   assert.ok(html.includes('id="pending-count">0'));
   for(const match of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g))new Function(match[1]);
@@ -182,24 +182,41 @@ test('A late refresh cannot put an old pending card back after a newer shared sn
   assert.equal(client.state.rows[0].nextStep,'- Confirm the scope.');
 });
 
-function fakePage(connector,pathname='/artifact'){
+function fakePage(connector,pathname='/artifact',{search='',fetcher,warRoom=false}={}){
   class Element {
-    constructor(){this.textContent='';this.innerHTML='';this.value='';this.hidden=false;this.disabled=false;this.handlers={};}
+    constructor(){this.textContent='';this.innerHTML='';this.value='';this.hidden=false;this.disabled=false;this.handlers={};this.attributes={};}
     addEventListener(name,handler){this.handlers[name]=handler;}
     dispatchEvent(event){this.handlers[event.type]?.(event);}
     replaceChildren(){this.textContent='';this.innerHTML='';}
-    close(){this.open=false;}showModal(){this.open=true;}focus(){}removeAttribute(name){delete this[name];}setAttribute(){}
+    close(){this.open=false;}showModal(){this.open=true;}focus(){this.focused=true;}
+    removeAttribute(name){delete this.attributes[name];delete this[name];}
+    setAttribute(name,value){this.attributes[name]=String(value);if(name==='id')this.id=String(value);}
+    getAttribute(name){return this.attributes[name]??null;}
     querySelectorAll(){return [];}querySelector(){return new Element();}
   }
   const elements=new Map(),events={};
-  const get=selector=>{if(!elements.has(selector))elements.set(selector,new Element());return elements.get(selector);};
+  const get=selector=>{
+    if(selector==='dialog[open]')return get('#edit-dialog').open?get('#edit-dialog'):null;
+    if(!elements.has(selector)){
+      const element=new Element();elements.set(selector,element);
+      if(selector.startsWith('#')){
+        const tag=html.match(new RegExp('<[^>]+\\bid="'+selector.slice(1)+'"[^>]*>'))?.[0]||'';
+        for(const match of tag.matchAll(/([\w:-]+)="([^"]*)"/g))element.setAttribute(match[1],match[2]);
+        element.hidden=/\shidden(?:\s|>)/.test(tag);
+      }
+    }
+    return elements.get(selector);
+  };
   get('#owner-filter').value='all';
-  const fakeDocument={querySelector:get,querySelectorAll:()=>[],addEventListener:(name,handler)=>{
+  const queryAll=selector=>selector==='#workspace-tabs [role=tab]'?['#pipeline-workspace-tab','#daily-brief-tab'].map(get):selector==='#pipeline-tabs [role=tab]'?['#review-tab','#activity-tab'].map(get):[];
+  const fakeDocument={querySelector:get,querySelectorAll:queryAll,addEventListener:(name,handler)=>{
     const previous=events[name];
     events[name]=previous?event=>{previous(event);handler(event);}:handler;
   }};
-  const fakeWindow={biancaConnector:connector,addEventListener:(name,handler)=>{events['window:'+name]=handler;},scrollTo:()=>{}};
-  const page=vm.createContext({document:fakeDocument,window:fakeWindow,location:{pathname,protocol:'https:'},crypto:{randomUUID:()=> 'new-key'},setTimeout:()=>0,clearTimeout:()=>{},Event,fetch:()=>{throw Error('Unexpected direct network call');}});
+  if(warRoom)fakeDocument.body={dataset:{theme:'war-room'}};
+  const location={pathname,protocol:'https:',hostname:'hub.test',search,href:'https://hub.test'+pathname+search};
+  const fakeWindow={biancaConnector:connector,addEventListener:(name,handler)=>{events['window:'+name]=handler;},scrollTo:()=>{},history:{replaceState:(_state,_unused,url)=>{const next=new URL(url);location.href=next.href;location.search=next.search;}}};
+  const page=vm.createContext({document:fakeDocument,window:fakeWindow,location,URL,URLSearchParams,crypto:{randomUUID:()=> 'new-key'},setTimeout:()=>0,clearTimeout:()=>{},Event,fetch:fetcher||(()=>{throw Error('Unexpected direct network call');})});
   for(const script of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g))vm.runInContext(script[1],page);
   return {get,events,context:page};
 }
@@ -1133,5 +1150,130 @@ test('Messages of one thread on one day show as a single What\'s new line',async
   assert.ok(card.includes('<span>Freestyle Snacks</span><span class="src">Source: Notes, Nov 5</span></summary><div class="ctx"><p>&ldquo;Notes passage.&rdquo;</p></div>'));
 });
 
+
+const briefId='81a993d4-f4fb-4d76-9fa8-c4b1a1fcb55e';
+const savedBrief=()=>({id:briefId,for_date:'2026-11-19',subject:'Pipeline brief · Nov 19',html:'<table><tr><td>First row</td></tr><tr><td>Final available row</td></tr></table>',full_available:true,created_at:'2026-11-19T12:00:00Z'});
+
+test('Daily Brief REST reads share header authentication and use fixed same-origin routes',async()=>{
+  const calls=[];
+  const transport=core.restTransport(async(url,options)=>{calls.push({url,options});return {ok:true,json:async()=>savedBrief()};},()=> 'founder-token');
+  await transport(core.TOOLS.brief,{});
+  await transport(core.TOOLS.brief,{brief_id:briefId});
+  assert.deepEqual(calls.map(c=>c.url),['/review/briefs/latest','/review/briefs/'+briefId]);
+  for(const call of calls){assert.equal(call.options.headers.Authorization,'Bearer founder-token');assert.equal(call.options.method,'GET');assert.equal(call.options.cache,'no-store');assert.equal(call.options.credentials,'omit');}
+  await assert.rejects(transport(core.TOOLS.brief,{brief_id:'https://other.test/private'}),/link is invalid/);
+  assert.equal(calls.length,2);
+});
+
+test('A normal Hub login opens Pipeline Updates and makes no Daily Brief request',async()=>{
+  const calls=[];
+  const page=fakePage(undefined,'/review/app',{fetcher:async(url)=>{calls.push(url);return {ok:true,json:async()=>snapshot()};}});
+  page.get('#access-token').value='founder-token';
+  await page.get('#sign-in-form').handlers.submit({preventDefault(){}});
+  assert.deepEqual(calls,['/review/workspace']);
+  assert.equal(page.get('#pipeline-workspace-tab').getAttribute('aria-selected'),'true');
+  assert.equal(page.get('#pipeline-workspace-panel').hidden,false);
+  assert.equal(page.get('#daily-brief-panel').hidden,true);
+});
+
+test('An emailed Daily Brief link survives login and reads the pinned brief independently of the Sheet',async()=>{
+  const calls=[],data=savedBrief();
+  const page=fakePage(undefined,'/review/app',{search:'?tab=daily-brief&brief='+briefId,fetcher:async(url,options)=>{calls.push({url,options});return {ok:true,json:async()=>data};}});
+  assert.equal(page.get('#daily-brief-tab').getAttribute('aria-selected'),'true');
+  assert.equal(page.get('#sign-in-form').hidden,false);
+  assert.equal(calls.length,0);
+  page.get('#access-token').value='founder-token';
+  await page.get('#sign-in-form').handlers.submit({preventDefault(){}});
+  assert.equal(calls.length,1);
+  assert.equal(calls[0].url,'/review/briefs/'+briefId);
+  assert.equal(calls[0].options.headers.Authorization,'Bearer founder-token');
+  assert.equal(page.get('#daily-brief-frame').hidden,false);
+  assert.ok(page.get('#daily-brief-frame').srcdoc.includes(data.html));
+  assert.equal(page.get('#daily-brief-frame').getAttribute('sandbox'),'allow-popups allow-popups-to-escape-sandbox');
+  assert.equal(page.get('#daily-brief-frame').getAttribute('referrerpolicy'),'no-referrer');
+  assert.equal(page.context.location.search,'?tab=daily-brief&brief='+briefId);
+  assert.equal(page.context.location.href.includes('founder-token'),false);
+  assert.equal(page.get('#connection-panel').hidden,true);
+});
+
+test('Daily Brief remains readable when the Pipeline Updates Sheet read fails',async()=>{
+  const calls=[];
+  const page=fakePage({callTool:async(name,args)=>{calls.push({name,args});if(name===core.TOOLS.workspace)throw new core.ReviewError('Sheet unavailable',503);return {structuredContent:savedBrief()};}});
+  await new Promise(resolve=>setImmediate(resolve));
+  page.get('#daily-brief-tab').onclick();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(calls.map(c=>c.name),[core.TOOLS.workspace,core.TOOLS.brief]);
+  assert.equal(page.get('#daily-brief-frame').hidden,false);
+  assert.equal(page.get('#connection-status').textContent,'Connected');
+});
+
+test('Workspace navigation and Pipeline Updates navigation keep independent selection',()=>{
+  const page=fakePage(undefined);
+  page.get('#activity-tab').onclick();
+  page.get('#daily-brief-tab').onclick();
+  assert.equal(page.get('#activity-tab').getAttribute('aria-selected'),'true');
+  assert.equal(page.get('#activity-panel').hidden,false);
+  assert.equal(page.get('#pipeline-workspace-panel').hidden,true);
+  page.get('#daily-brief-tab').onkeydown({key:'ArrowLeft',preventDefault(){}});
+  assert.equal(page.get('#pipeline-workspace-panel').hidden,false);
+  assert.equal(page.get('#activity-tab').getAttribute('aria-selected'),'true');
+  assert.equal(page.get('#review-tab').getAttribute('aria-selected'),'false');
+});
+
+test('A Daily Brief response arriving after disconnect cannot restore its contents',async()=>{
+  let resolveRead;
+  const page=fakePage({callTool:()=>new Promise(resolve=>{resolveRead=resolve;})},'/artifact',{search:'?tab=daily-brief'});
+  page.get('#disconnect').onclick();
+  resolveRead({structuredContent:savedBrief()});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(page.get('#daily-brief-frame').hidden,true);
+  assert.equal(page.get('#daily-brief-frame').srcdoc,undefined);
+  assert.equal(page.get('#connection-status').textContent,'Connection needed');
+});
+
+test('Changing login credentials invalidates a pending Daily Brief response',async()=>{
+  let resolveFirst;
+  const page=fakePage(undefined,'/review/app',{search:'?tab=daily-brief',fetcher:async(_url,options)=>{
+    if(options.headers.Authorization==='Bearer first-token')return new Promise(resolve=>{resolveFirst=resolve;});
+    return {ok:true,json:async()=>({...savedBrief(),html:'<p>Second login brief</p>'})};
+  }});
+  page.get('#access-token').value='first-token';
+  const first=page.get('#sign-in-form').handlers.submit({preventDefault(){}});
+  page.get('#access-token').value='second-token';
+  await page.get('#sign-in-form').handlers.submit({preventDefault(){}});
+  resolveFirst({ok:true,json:async()=>savedBrief()});
+  await first;
+  assert.ok(page.get('#daily-brief-frame').srcdoc.includes('Second login brief'));
+  assert.equal(page.get('#daily-brief-frame').srcdoc.includes('Final available row'),false);
+});
+
+test('A missing current Daily Brief has a visible empty state and no earlier content',async()=>{
+  const page=fakePage(undefined,'/review/app',{search:'?tab=daily-brief',fetcher:async()=>({ok:false,status:404,json:async()=>({detail:'No brief for today'})})});
+  page.get('#access-token').value='founder-token';
+  await page.get('#sign-in-form').handlers.submit({preventDefault(){}});
+  assert.ok(page.get('#brief-status').textContent.includes('Today’s Daily Brief is not available yet'));
+  assert.equal(page.get('#brief-status').hidden,false);
+  assert.equal(page.get('#daily-brief-frame').hidden,true);
+  assert.equal(page.get('#connection-panel').hidden,true);
+});
+
+test('Legacy archived briefs show their saved rows and disclose unavailable full content',async()=>{
+  const page=fakePage({callTool:async()=>({structuredContent:{...savedBrief(),full_available:false}})},'/artifact',{search:'?tab=daily-brief'});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(page.get('#brief-meta').hidden,false);
+  assert.ok(page.get('#brief-meta').textContent.includes('rows saved with its email'));
+  page.events['window:pagehide']();
+  assert.equal(page.get('#daily-brief-frame').hidden,true);
+  assert.equal(page.get('#daily-brief-frame').srcdoc,undefined);
+});
+
+test('War Room keyboard actions cannot activate a hidden card while Daily Brief is selected',()=>{
+  const page=fakePage(undefined,'/artifact',{search:'?tab=daily-brief',warRoom:true});
+  let hiddenCardReads=0;
+  const get=page.context.document.querySelector;
+  page.context.document.querySelector=selector=>{if(selector==='.wr-main .review-card')hiddenCardReads++;return get(selector);};
+  for(const key of ['a','e','i','j','k'])page.events.keydown({key,target:{tagName:'BUTTON'},preventDefault(){}});
+  assert.equal(hiddenCardReads,0);
+});
 
 (async()=>{for(const t of tests){try{await t.fn();passed++;process.stdout.write('PASS '+t.name+'\n');}catch(error){failed++;process.stdout.write('FAIL '+t.name+'\n  '+error.stack+'\n');}}process.stdout.write(`\n${passed} passed; ${failed} failed.\n`);process.exitCode=failed?1:0;})();

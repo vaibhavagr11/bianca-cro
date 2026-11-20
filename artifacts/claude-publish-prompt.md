@@ -4,7 +4,7 @@ Use this prompt in the actual account after the hosted backend and Bianca Review
 
 > Publish the attached HTML as a private, connector-backed artifact titled **Sales Pipeline Updates** for the Bianca founders. Preserve its approved layout, blue/navy styling, owner options RG / NC / NDL, company cards, bullet editing, and Approve / Edit / Ignore actions.
 >
-> Keep only the **To review** and **Activity** tabs. Show each source as its type and date (for example, **Notes · Sep 28** or **Email · Oct 6**) without quotations. Preserve the **Current Next steps** dropdown on every company card, including multiline cell contents and the empty state. Do not add a Sheet preview tab or the removed cell-movement footer text.
+> Keep the **Pipeline Updates** and **Daily Brief** workspace tabs below the status strip. Pipeline Updates opens by default and contains the **To review** and **Activity** tabs. Daily Brief uses `bianca_daily_brief` to read today's saved brief or the saved ID from an email link and displays its email tables in the isolated frame. Show each source as its type and date (for example, **Notes · Sep 28** or **Email · Oct 6**) without quotations. Preserve the **Current Next steps** dropdown on every company card, including multiline cell contents and the empty state. Do not add a Sheet preview tab or the removed cell-movement footer text.
 >
 > Preserve the separate **Next Step** and **Client Context** bullet sections and editors, and the **Current Client Context** dropdown. Next steps, commitments, and blockers belong to Next Step; customer needs, buying signals, and objections belong to Client Context. Approval arguments must include both `next_step_bullets` and `client_context_bullets` arrays. Never flatten them into the legacy `bullets` argument. Empty sections leave existing cells unchanged; context is added to the existing Client Context without repeating equivalent bullet lines.
 >
@@ -12,7 +12,7 @@ Use this prompt in the actual account after the hosted backend and Bianca Review
 >
 > The backend owns the one-time 14-day bootstrap and once-per-workspace-day accumulation. Keep prior unreviewed bullets until a founder decides. Do not add a rolling browser cutoff, independently regenerate bullets, or schedule writes from the Artifact. Refresh reads the persisted workspace; n8n runs ingestion and generation.
 >
-> Use the **Bianca Review** connector. Discover and validate its real tool names before publishing: `bianca_review_workspace`, `bianca_approve_update`, and `bianca_ignore_update`. Declare these connector capabilities in the artifact. Use only the viewing user's authorized connection.
+> Use the **Bianca Review** connector. Discover and validate its real tool names before publishing: `bianca_review_workspace`, `bianca_daily_brief`, `bianca_approve_update`, and `bianca_ignore_update`. Declare these connector capabilities in the artifact. Use only the viewing user's authorized connection.
 >
 > The HTML expects `window.biancaConnector.callTool(name, args)`. Implement that small adapter using the actual native artifact connector API available in this Claude account; do not invent an API signature. Install it before the page scripts initialize, or dispatch `bianca:connector-ready` afterward. Return plain JSON or standard MCP tool-result envelopes. Return failed operations as `isError: true` and include a safe `detail` string and HTTP-style numeric `status`.
 >

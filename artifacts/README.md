@@ -11,6 +11,8 @@ Both use the approved blue/navy design, the title **Sales Pipeline Updates**, an
 
 Open `/review/app` on the Bianca backend. Enter your assigned reviewer access token in the connection panel. It is held only in this page's memory, is sent in the Authorization header, and is cleared on disconnect or page exit. The live page does not put credentials or company data in localStorage, sessionStorage, a URL, or the HTML source. The page requests only fixed, same-origin `/review/...` routes.
 
+The workspace tabs below the status strip open **Pipeline Updates** and **Daily Brief**. A normal visit opens Pipeline Updates. The email's link uses `/review/app?tab=daily-brief&brief=<saved-brief-id>` and opens that saved brief after sign-in. Daily Brief loads independently of the live Pipeline Sheet read and displays the saved email tables in an isolated frame. New briefs include every available row. An earlier archive with only email HTML displays its saved rows with an explanation. Opening the tab without a brief ID requests today's saved brief and shows an empty state while it is unavailable.
+
 Each card separates proposed **Next Step** bullets from proposed **Client Context** bullets. The **Current Next steps** and **Current Client Context** dropdowns show the company's values from the backend's latest synced Pipeline row, falling back to the proposal snapshot if that row is unavailable. They preserve wording and line breaks and show explicit empty states. Approval re-reads the actual Google Sheet before writing; synced context may lag a collaborator's latest edit.
 
 ## Claude Enterprise artifact
@@ -20,6 +22,7 @@ Use `claude-publish-prompt.md` after an Enterprise administrator has added the B
 | Tool | Arguments |
 | --- | --- |
 | `bianca_review_workspace` | `{}` |
+| `bianca_daily_brief` | `{}` for today, or `{"brief_id":"<saved-brief-id>"}` |
 | `bianca_approve_update` | `{proposal_id, revision, idempotency_key, next_step_bullets, client_context_bullets}` |
 | `bianca_ignore_update` | `{proposal_id, revision, idempotency_key}` |
 
