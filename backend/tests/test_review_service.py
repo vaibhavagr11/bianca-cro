@@ -284,15 +284,16 @@ def approve(bullets=None, **kwargs):
     return review.decide(WORKSPACE, PROPOSAL, "NDL", "approve", 1, "approval-key-1", next_step_bullets=bullets, **kwargs)
 
 
-def test_approval_replaces_last_progress_exactly_and_updates_only_after_confirmed_write(service):
+@pytest.mark.parametrize("actor", ["NDL", "MG"])
+def test_approval_replaces_last_progress_exactly_and_updates_only_after_confirmed_write(service, actor):
     store, sheets = service
     old_last, old_next = sheets.last_progress, sheets.next_step
-    result = approve()
+    result = review.decide(WORKSPACE, PROPOSAL, actor, "approve", 1, "approval-key-1")
     assert sheets.last_progress == old_next
     assert sheets.last_progress != old_last
     assert sheets.next_step == "- " + proposal()["next_step_bullets"][0]
     assert store.data["proposal"]["status"] == "approved"
-    assert result["activity"]["actor"] == "NDL"
+    assert result["activity"]["actor"] == actor
     assert result["activity"]["before"] == {"lastProgress": old_last, "nextStep": old_next, "clientContext": ""}
     assert len(store.data["receipts"]) == 1
     assert store.events.index("commit", 1) < store.events.index("sheet-write")
@@ -1369,13 +1370,14 @@ def status_service(monkeypatch):
     return conn
 
 
-def test_status_change_writes_the_sheet_then_mirrors_the_stage_with_history(status_service):
-    result = review.change_status(WORKSPACE, OPPORTUNITY, "RG", "1. Opening", " 0. Paused ")
+@pytest.mark.parametrize("actor", ["RG", "MG"])
+def test_status_change_writes_the_sheet_then_mirrors_the_stage_with_history(status_service, actor):
+    result = review.change_status(WORKSPACE, OPPORTUNITY, actor, "1. Opening", " 0. Paused ")
     assert StatusSheets.calls == [("Diageo", "1. Opening", "0. Paused")]
     assert result["status"] == "0. Paused" and result["company"] == "Diageo" and result["inSalesPipeline"] is True
     assert status_service.row["stage"] == "0. Paused" and status_service.row["row_hash"] != "old-hash"
     assert status_service.changes == [("1. Opening", "0. Paused")]
-    assert status_service.runs == ["sheet_review_status:RG"] and status_service.committed
+    assert status_service.runs == [f"sheet_review_status:{actor}"] and status_service.committed
 
 
 def test_status_change_allows_only_statuses_already_in_the_sheet_and_valid_founders(status_service):
