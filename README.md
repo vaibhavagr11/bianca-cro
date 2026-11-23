@@ -14,14 +14,20 @@ n8n (Cloud) fetches data from Google and posts it to the backend; all business l
 ## Sales Pipeline Updates
 
 The founder review application groups proposed changes by company and supports **Approve**, **Edit → Save & approve**,
-and **Ignore**. Next steps, commitments, and blockers go to `Next step`; customer needs, buying signals, and objections
-go to `Client Context`. Action approval replaces `Last progress` with the exact previous `Next step`, then writes the
+and **Ignore**. Selected Bianca actions go to `Next step`; selected customer needs, buying signals, and objections
+go to `Client Context`. Blocker status alone is supporting detail; an explicit Bianca action addressing it can qualify.
+Action approval replaces `Last progress` with the exact previous `Next step`, then writes the
 approved action bullets into `Next step`. Context approval adds distinct reviewed bullets to the existing `Client Context`.
 An empty section leaves its cells unchanged. Ignore never writes to the Sheet. Owners RG, NC, and NDL are supported.
 
 The review queue uses the Daily Brief's action scope. Evidence-backed deal progression and legacy insights with blank
 scope can appear. Delivery and out-of-scope insights stay out of both writable sections. A requested deadline stays
 with the request. Only an agreed commitment is shown as owed.
+
+The Hub selects a few commercially important actions and context facts after comprehensive extraction. Usually
+0–3 bullets per section is a strong preference, never a hard cap or a quota. Routine checks and passive customer
+waiting do not become priority actions. Deferred details remain available and are not consumed by approval of
+the selected items. See [priority selection and rollout](docs/gsheet-updates.md#priority-selection-11232026).
 
 The first review cycle imports only sources dated within the preceding **14 days**. Later builds refresh each pending
 card from unreviewed evidence. The initial cutoff is persisted once. An earlier bullet remains eligible while its evidence
