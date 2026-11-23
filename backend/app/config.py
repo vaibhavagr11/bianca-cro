@@ -100,8 +100,13 @@ class Settings(BaseSettings):
     review_sheets_webhook_url: str | None = None
     review_sheets_webhook_secret: SecretStr | None = None
     review_build_batch: int = 20
-    # Most bullets one card may suggest per column; the newest stay. 0 turns a limit off.
-    # Client Context is kept whole by default: older customer needs stay useful.
+    # Select commercially important, actionable updates after comprehensive extraction. Usually 0–3
+    # per column, with no numerical cap when more distinct important items are justified.
+    # Requires the optional review selection migration and the existing Anthropic configuration.
+    review_priority_selection_enabled: bool = True
+    # Uncached selection calls per resumable build request; cached/empty results need no model call.
+    review_selection_batch: int = Field(default=2, gt=0)
+    # Legacy limits only; ignored when priority selection is enabled. 0 removes a limit.
     review_max_next_steps: int = 4
     review_max_context: int = 0
 

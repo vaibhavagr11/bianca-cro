@@ -9,9 +9,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import anthropic
 from collections.abc import Iterable
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from time import monotonic
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -19,7 +21,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg.errors import UniqueViolation
 
-from app import db
+from app import db, review_selection
 from app.config import settings
 from app.extractor import SALES_SCOPES
 from app.pipeline import PipelineRow, TRACKED_FIELDS, is_working_client, normalize_name
@@ -219,7 +221,19 @@ def _proposal_data(row: dict) -> dict:
             "bulletLineage": row.get("bullet_lineage") or {"nextStep": [], "clientContext": []},
             "lastProgress": row["snapshot_last_progress"], "nextStep": row["snapshot_next_step"],
             "clientContext": _cell(row.get("snapshot_client_context")),
-            "revision": row["revision"], "status": row["status"]}
+            "revision": row["revision"], "status": row["status"],
+            **({"supportingDetails": _supporting_details(row["selection_snapshot"])}
+               if row.get("selection_snapshot") else {})}
+
+
+def _supporting_details(snapshot: dict) -> dict:
+    """Disclosure only: these bullets never enter the approval payload."""
+    content = snapshot["candidates"]
+    keys = review_selection.candidate_keys(content)
+    selected = snapshot["selection"]
+    return {destination: [text for key, text in zip(keys[destination], content[index])
+                          if key not in selected[destination]]
+            for index, destination in enumerate(("nextStep", "clientContext"))}
 
 
 def _card_limit(name: str) -> int | None:
@@ -274,7 +288,7 @@ def _answered_asks(conn, workspace_id, company_id, insights: list[dict], cutoff)
 
 
 def _current_content(conn, workspace_id, deal: dict, records: list[dict], *,
-                     cutoff=None) -> tuple[Content, list[dict]]:
+                     cutoff=None, uncapped: bool = False) -> tuple[Content, list[dict]]:
     """Current card content, plus the versions of every source the card accounts for.
 
     The versions include sources whose only bullets fell outside the card limits, so a decision retires them too.
@@ -287,8 +301,9 @@ def _current_content(conn, workspace_id, deal: dict, records: list[dict], *,
         (workspace_id, deal["company_id"], deal["opportunity_id"], [r["id"] for r in records]),
     ).fetchall() if records else []
     answered = _answered_asks(conn, workspace_id, deal["company_id"], insights, cutoff)
-    content, retired = reviewed_content(records, insights, max_next_steps=_card_limit("review_max_next_steps"),
-                                        max_context=_card_limit("review_max_context"), answered=answered)
+    content, retired = reviewed_content(records, insights,
+                                        max_next_steps=None if uncapped else _card_limit("review_max_next_steps"),
+                                        max_context=None if uncapped else _card_limit("review_max_context"), answered=answered)
     return content, sorted(_content_versions(content[2]) + retired, key=_source_key)
 
 
@@ -297,10 +312,101 @@ def _content_versions(sources: list[dict]) -> list[dict]:
                    for s in sources), key=_source_key)
 
 
+def _priority_enabled() -> bool:
+    return bool(getattr(settings, "review_priority_selection_enabled", False))
+
+
+def _require_safe_legacy_build(conn, workspace_id) -> None:
+    """Disabling a deployed selector must not revive or retire candidate-level work."""
+    if _priority_enabled():
+        return
+    migrated = conn.execute("select to_regclass('review_selection_cache') as found").fetchone()
+    if not migrated or migrated["found"] is None:
+        return  # The compatibility path also runs before the optional migration.
+    used = conn.execute(
+        "select exists(select 1 from review_candidate_receipts where workspace_id = %s)"
+        " or exists(select 1 from review_proposals where workspace_id = %s and selection_snapshot is not null"
+        " and status in ('pending', 'applying')) as started", (workspace_id, workspace_id)).fetchone()
+    if used and used["started"]:
+        raise ReviewUnavailable("Priority review is already in use. Re-enable priority selection before rebuilding.")
+
+
+def _priority_deal(deal: dict) -> dict:
+    """The same facts at build and approval, independent of database column aliases."""
+    return {"company_name": deal.get("company_name"), "owner_code": deal.get("owner_code"),
+            "stage": deal.get("current_stage", deal.get("stage")), "country": deal.get("country"),
+            "last_progress": deal.get("snapshot_last_progress", deal.get("last_progress", "")),
+            "next_step": deal.get("snapshot_next_step", deal.get("next_step", "")),
+            "client_context": deal.get("snapshot_client_context", deal.get("client_context", ""))}
+
+
+def _unreviewed_candidates(conn, workspace_id, company_id, content: Content) -> Content:
+    receipts = [row["candidate_key"] for row in conn.execute(
+        "select candidate_key from review_candidate_receipts where workspace_id = %s and company_id = %s",
+        (workspace_id, company_id))]
+    return review_selection.filter_reviewed(content, receipts)
+
+
+def _select_priorities(content: Content, deal: dict, as_of: str) -> tuple[Content, dict]:
+    if settings.anthropic_api_key is None:
+        raise ReviewUnavailable("Priority selection requires the configured model connection. The queue was not changed.")
+    headers = {"anthropic-workspace-id": settings.anthropic_workspace_id} if settings.anthropic_workspace_id else None
+    try:
+        with anthropic.Anthropic(api_key=settings.anthropic_api_key.get_secret_value(), default_headers=headers,
+                                 timeout=45, max_retries=0) as client:
+            return review_selection.select(client, settings.anthropic_model, content, deal, as_of)
+    except (anthropic.APIError, ValueError, review_selection.SelectionError) as exc:
+        # Never publish a broad fallback or expose source text/model responses in the error.
+        raise ReviewUnavailable("Priority selection could not be verified. Retry the review build.") from exc
+
+
+def _priority_content(conn, workspace_id, deal: dict, records: list[dict], state: dict,
+                      budget: list[int], deadline: float) -> tuple[Content, list[dict], dict] | None:
+    full, observed = _current_content(conn, workspace_id, deal, records,
+                                      cutoff=state["cycle_started_at"], uncapped=True)
+    candidates = _unreviewed_candidates(conn, workspace_id, deal["company_id"], full)
+    facts = _priority_deal(deal)
+    as_of = state["cycle_for_date"].isoformat()
+    digest = review_selection.fingerprint(candidates, facts, as_of)
+    cached = conn.execute(
+        "select input_fingerprint, snapshot from review_selection_cache where workspace_id = %s and company_id = %s",
+        (workspace_id, deal["company_id"])).fetchone()
+    if cached and cached["input_fingerprint"] == digest:
+        snapshot = cached["snapshot"]
+        try:
+            if snapshot["selection"]["fingerprint"] != digest:
+                raise ValueError("Cached selection fingerprint mismatch")
+            selected = review_selection.apply_selection(candidates, snapshot["selection"])
+        except (KeyError, ValueError, review_selection.SelectionError) as exc:
+            raise ReviewUnavailable("The stored priority selection needs to be rebuilt.") from exc
+        return selected, observed, snapshot
+    if candidates[0] or candidates[1]:
+        if budget[0] <= 0 or monotonic() >= deadline:
+            return None
+        budget[0] -= 1  # Empty selections count too; cached results let later batches advance.
+        selected, selection = _select_priorities(candidates, facts, as_of)
+        if selection.get("fingerprint") != digest:
+            raise ReviewUnavailable("Priority selection did not match the reviewed evidence.")
+    else:
+        selection = {"version": review_selection.VERSION, "fingerprint": digest, "nextStep": [], "clientContext": []}
+        selected = review_selection.apply_selection(candidates, selection)
+    snapshot = {"asOf": as_of, "selection": selection, "candidates": list(candidates)}
+    conn.execute(
+        "insert into review_selection_cache (workspace_id, company_id, input_fingerprint, snapshot) values (%s, %s, %s, %s)"
+        " on conflict (workspace_id, company_id) do update set input_fingerprint = excluded.input_fingerprint,"
+        " snapshot = excluded.snapshot, updated_at = now()",
+        (workspace_id, deal["company_id"], digest, Jsonb(snapshot)))
+    return selected, observed, snapshot
+
+
 def build_proposals(conn, workspace_id, *, force: bool = False) -> dict:
     """Resume today's bounded build; only the initial import has a 14-day window."""
+    # Do not start another 45-second model request after the first minute. This
+    # leaves time to return/commit within the existing 120-second workflow request.
+    selection_deadline = monotonic() + 60
     conn.row_factory = dict_row
     conn.execute("select pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"review-build:{workspace_id}",))
+    _require_safe_legacy_build(conn, workspace_id)
     state, skip = _cycle(conn, workspace_id, force=force)
     counts = {"created": 0, "updated": 0, "unchanged": 0, "applying": 0, "remaining": 0}
     if skip:
@@ -314,6 +420,8 @@ def build_proposals(conn, workspace_id, *, force: bool = False) -> dict:
     exclusions = {_source_key(r) for r in conn.execute(
         "select source, external_id, version from review_bootstrap_exclusions where workspace_id = %s", (workspace_id,))}
     limit = max(1, settings.review_build_batch)
+    priority = _priority_enabled()
+    selection_budget = [min(limit, max(1, getattr(settings, "review_selection_batch", 2)))]
     for deal in deals:
         existing = conn.execute(
             "select * from review_proposals where workspace_id = %s and company_id = %s"
@@ -339,8 +447,18 @@ def build_proposals(conn, workspace_id, *, force: bool = False) -> dict:
                    and _source_key(source_version(r)) + (str(deal["company_id"]),) not in receipts
                    and (state["bootstrap_completed"] or _in_bootstrap_window(r, state))]
         # Re-extraction can change an insight's scope without changing its source version.
-        (next_steps, context, sources, lineage), versions = _current_content(
-            conn, workspace_id, deal, records, cutoff=state["cycle_started_at"])
+        snapshot = None
+        if priority:
+            result = _priority_content(conn, workspace_id, deal, records, state, selection_budget, selection_deadline)
+            if result is None:
+                counts["remaining"] += 1
+                continue
+            (next_steps, context, sources, lineage), observed, snapshot = result
+            versions = _content_versions(sources)
+        else:
+            (next_steps, context, sources, lineage), versions = _current_content(
+                conn, workspace_id, deal, records, cutoff=state["cycle_started_at"])
+            observed = versions
         if not existing and not (next_steps or context):
             counts["unchanged"] += 1
             continue
@@ -349,8 +467,10 @@ def build_proposals(conn, workspace_id, *, force: bool = False) -> dict:
                 "country": deal["country"], "bullets": next_steps + context, "sources": sources, "source_versions": versions,
                 "next_step_bullets": next_steps, "client_context_bullets": context, "routing_version": ROUTING_VERSION,
                 "snapshot_last_progress": baseline["lastProgress"], "snapshot_next_step": baseline["nextStep"],
-                "snapshot_client_context": baseline["clientContext"], "observed_source_versions": versions,
+                "snapshot_client_context": baseline["clientContext"], "observed_source_versions": observed,
                 "bullet_lineage": lineage, "lineage_version": 1}
+        if priority or (existing and existing.get("selection_snapshot")):
+            data["selection_snapshot"] = snapshot
         if existing and (next_steps or context) and all(existing.get(k) == value for k, value in data.items()):
             counts["unchanged"] += 1
             continue
@@ -367,22 +487,29 @@ def build_proposals(conn, workspace_id, *, force: bool = False) -> dict:
                 " bullets = %s, sources = %s, source_versions = %s, snapshot_last_progress = %s,"
                 " snapshot_next_step = %s, snapshot_client_context = %s, next_step_bullets = %s,"
                 " client_context_bullets = %s, routing_version = %s, observed_source_versions = %s,"
-                " bullet_lineage = %s, lineage_version = %s, revision = revision + 1 where id = %s",
+                " bullet_lineage = %s, lineage_version = %s"
+                + (", selection_snapshot = %s" if priority else ", selection_snapshot = null"
+                   if existing.get("selection_snapshot") else "")
+                + ", revision = revision + 1 where id = %s",
                 (data["company_name"], data["owner_code"], data["stage"], data["country"], Jsonb(next_steps + context), Jsonb(sources),
                  Jsonb(versions), baseline["lastProgress"], baseline["nextStep"], baseline["clientContext"],
-                 Jsonb(next_steps), Jsonb(context), ROUTING_VERSION, Jsonb(versions), Jsonb(lineage), 1, existing["id"]))
+                 Jsonb(next_steps), Jsonb(context), ROUTING_VERSION, Jsonb(observed), Jsonb(lineage), 1)
+                + ((Jsonb(snapshot),) if priority else ()) + (existing["id"],))
             counts["updated"] += 1
         else:
             conn.execute(
                 "insert into review_proposals (workspace_id, company_id, opportunity_id, company_name, owner_code,"
                 " stage, country, bullets, sources, source_versions, snapshot_last_progress, snapshot_next_step,"
                 " snapshot_client_context, next_step_bullets, client_context_bullets, routing_version,"
-                " observed_source_versions, bullet_lineage, lineage_version)"
-                " values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                " observed_source_versions, bullet_lineage, lineage_version"
+                + (", selection_snapshot" if priority else "")
+                + ") values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s"
+                + (", %s" if priority else "") + ")",
                 (workspace_id, deal["company_id"], deal["opportunity_id"], data["company_name"], data["owner_code"],
                  data["stage"], data["country"], Jsonb(next_steps + context), Jsonb(sources), Jsonb(versions),
                  baseline["lastProgress"], baseline["nextStep"], baseline["clientContext"],
-                 Jsonb(next_steps), Jsonb(context), ROUTING_VERSION, Jsonb(versions), Jsonb(lineage), 1))
+                 Jsonb(next_steps), Jsonb(context), ROUTING_VERSION, Jsonb(observed), Jsonb(lineage), 1)
+                + ((Jsonb(snapshot),) if priority else ()))
             counts["created"] += 1
     done = counts["remaining"] == 0
     if done:
@@ -602,6 +729,14 @@ def _append_context(existing: str, bullets: list[str]) -> str:
 
 
 def _consume_sources(conn, proposal: dict) -> None:
+    if proposal.get("selection_snapshot"):
+        selected = proposal["selection_snapshot"]["selection"]
+        for key in selected["nextStep"] + selected["clientContext"]:
+            conn.execute(
+                "insert into review_candidate_receipts (workspace_id, company_id, candidate_key, proposal_id)"
+                " values (%s, %s, %s, %s) on conflict do nothing",
+                (proposal["workspace_id"], proposal["company_id"], key, proposal["id"]))
+        return
     for version in proposal["source_versions"]:
         conn.execute(
             "insert into review_source_receipts (workspace_id, company_id, source, external_id, version, proposal_id)"
@@ -663,7 +798,22 @@ def _require_current_content(conn, workspace_id, proposal: dict) -> list[dict]:
     if any(key not in by_version for key in expected):
         raise ReviewConflict("The source material changed since this card was generated. Refresh the review queue before deciding.")
     records = [by_version[key] for key in expected]
-    (next_steps, context, sources, lineage), versions = _current_content(conn, workspace_id, proposal, records)
+    snapshot = proposal.get("selection_snapshot")
+    if snapshot:
+        full, _ = _current_content(conn, workspace_id, proposal, records, uncapped=True)
+        candidates = _unreviewed_candidates(conn, workspace_id, proposal["company_id"], full)
+        try:
+            digest = review_selection.fingerprint(candidates, _priority_deal(proposal), snapshot["asOf"])
+            if digest != snapshot["selection"]["fingerprint"]:
+                raise ValueError("Selection evidence changed")
+            next_steps, context, sources, lineage = review_selection.apply_selection(candidates, snapshot["selection"])
+        except (KeyError, ValueError, review_selection.SelectionError) as exc:
+            raise ReviewConflict("The sales evidence changed since this card was generated. Refresh the review queue before deciding.") from exc
+        versions = _content_versions(sources)
+    else:
+        if _priority_enabled():
+            raise ReviewConflict("This card predates priority selection. Rebuild the review queue before deciding.")
+        (next_steps, context, sources, lineage), versions = _current_content(conn, workspace_id, proposal, records)
     if (not (next_steps or context) or next_steps != proposal["next_step_bullets"]
             or context != proposal["client_context_bullets"] or lineage != proposal["bullet_lineage"]
             or versions != proposal["source_versions"]):
@@ -907,3 +1057,4 @@ def decide(workspace_id, proposal_id: str, actor: str, action: str, revision: in
         if excluded or is_working_client(live.status):
             raise ReviewConflict(OUTSIDE_SALES_PIPELINE)
         return _result(intent, proposal, mirror_refreshed)
+

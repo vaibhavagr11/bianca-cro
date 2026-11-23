@@ -166,10 +166,13 @@ def _workspace() -> dict:
 
 
 def _build(force: bool = False) -> dict:
-    with db.connect() as conn:
-        workspace_id = _workspace_id(conn)
-        conn.row_factory = dict_row
-        return review_service.build_proposals(conn, workspace_id, force=force)
+    try:
+        with db.connect() as conn:
+            workspace_id = _workspace_id(conn)
+            conn.row_factory = dict_row
+            return review_service.build_proposals(conn, workspace_id, force=force)
+    except review_service.ReviewUnavailable as exc:
+        raise HTTPException(503, str(exc), headers={"Cache-Control": "no-store"}) from exc
 
 
 def _daily_ready() -> None:
@@ -404,3 +407,4 @@ async def mcp(request: Request, actor: str = Depends(reviewer)) -> Response:
         return _rpc_error(request_id, -32601, "Method not found")
     return JSONResponse(jsonable_encoder({"jsonrpc": "2.0", "id": request_id, "result": result}),
                         headers={"Cache-Control": "no-store"})
+
