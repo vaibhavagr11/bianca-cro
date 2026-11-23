@@ -484,7 +484,7 @@ def workspace_view(conn, workspace_id) -> dict:
     return {"proposals": proposals, "rows": rows, "activity": activity, "sheetUrl": sheet_url,
             "routingVersion": ROUTING_VERSION, "clientContextMode": settings.review_client_context_mode,
             "statusOptions": status_options(statuses),
-            "owners": [{"code": "RG", "name": "Ramiro"}, {"code": "NC", "name": "Nico"}, {"code": "NDL", "name": "Nico"}]}
+            "owners": [{"code": "RG", "name": "Ramiro"}, {"code": "NC", "name": "Nico"}, {"code": "NDL", "name": "Nico"}, {"code": "MG", "name": "Matias"}]}
 
 
 def status_options(statuses: dict[str, str | None]) -> list[str]:
@@ -494,7 +494,7 @@ def status_options(statuses: dict[str, str | None]) -> list[str]:
 
 def change_status(workspace_id, row_id: str, actor: str, expected_status: str, new_status: str) -> dict:
     """A founder's explicit Status change for one pipeline company. Writes that one Sheet cell and nothing else."""
-    if actor not in ("RG", "NC", "NDL"):
+    if actor not in ("RG", "NC", "NDL", "MG"):
         raise ValueError("A valid founder is required.")
     if not isinstance(expected_status, str) or not isinstance(new_status, str) or not new_status.strip():
         raise ValueError("Choose a status.")
@@ -824,7 +824,7 @@ def decide(workspace_id, proposal_id: str, actor: str, action: str, revision: in
     ``next_step_mode`` is "replace" (approved steps become Next step, the old Next step moves to Last progress)
     or "append" (approved steps are added below the existing Next step text; Last progress is left alone).
     """
-    if action not in ("approve", "ignore") or actor not in ("RG", "NC", "NDL"):
+    if action not in ("approve", "ignore") or actor not in ("RG", "NC", "NDL", "MG"):
         raise ValueError("A valid founder and decision are required.")
     if next_step_mode not in NEXT_STEP_MODES or (action == "ignore" and next_step_mode != "replace"):
         raise ValueError("Choose whether to replace Next step or add to it.")

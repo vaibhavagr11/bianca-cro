@@ -30,7 +30,7 @@ router = APIRouter(prefix="/review", tags=["Sheet review"])
 publish_router = APIRouter(prefix="/process", tags=["Sheet review"])
 ARTIFACT_DIR = Path(__file__).resolve().parents[2] / "artifacts"
 PROTOCOLS = ("2025-06-18", "2025-03-26")
-ACTORS = {"RG", "NC", "NDL"}
+ACTORS = {"RG", "NC", "NDL", "MG"}
 
 
 def enabled() -> None:
