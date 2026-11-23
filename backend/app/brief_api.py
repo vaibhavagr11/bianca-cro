@@ -34,9 +34,10 @@ def _dumps(obj) -> str:
     return json.dumps(obj, default=str, ensure_ascii=False)
 router = APIRouter(prefix="/brief")
 
-FOUNDER_ORDER = ["RG", "NC"]  # sections in this order; NDL gets the small shared table
+FOUNDER_ORDER = ["RG", "NC", "MG"]  # sales-owner sections in this order; NDL gets the small shared table
 # Two founders are named Nicolás, so the brief uses these names, not first names.
-DISPLAY = {"RG": ("Ramiro", "Ramiro Godfrid"), "NC": ("Nico", "Nico Casaux"), "NDL": ("Nico DL", "Nico de León")}
+DISPLAY = {"RG": ("Ramiro", "Ramiro Godfrid"), "NC": ("Nico", "Nico Casaux"), "NDL": ("Nico DL", "Nico de León"),
+           "MG": ("Matias", "Matias Grinberg")}
 
 
 def _optional(conn, what: str, read, default):

@@ -109,7 +109,7 @@ matches an original bullet in the same destination; manual edits are recorded as
 | Setting | Purpose |
 | --- | --- |
 | `REVIEW_ENABLED` | Defaults to `false`; gates all review and publish routes. |
-| `REVIEW_TOKENS` | JSON mapping of `RG`, `NC`, `NDL` to **distinct**, random bearer tokens of at least 32 characters. Configure only enabled reviewers. |
+| `REVIEW_TOKENS` | JSON mapping of `RG`, `NC`, `NDL`, `MG` to **distinct**, random bearer tokens of at least 32 characters. Configure only enabled reviewers. |
 | `REVIEW_SPREADSHEET_ID` | Defaults to `14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw`; check existing environment overrides. |
 | `REVIEW_SHEET_TAB` | Exact tab name, default `Pipeline`. |
 | `REVIEW_SHEET_ID` | Numeric tab ID, default `1869050409`; validates that the named tab is the intended destination. |

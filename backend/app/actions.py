@@ -24,7 +24,7 @@ from app.ingest import _workspace_id
 router = APIRouter(prefix="/actions")
 LINK_DAYS = 14
 KINDS = ("insight", "thread", "rec")
-WHO = {"RG": "Ramiro", "NC": "Nico", "NDL": "Nicolás de León"}
+WHO = {"RG": "Ramiro", "NC": "Nico", "NDL": "Nicolás de León", "MG": "Matias"}
 WHAT = {"insight": "It won't appear in the next brief.",
         "thread": "This email won't show as waiting on a reply until the customer writes again.",
         "rec": "This suggestion won't be shown again."}

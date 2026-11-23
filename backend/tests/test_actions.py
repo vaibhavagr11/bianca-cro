@@ -45,6 +45,7 @@ def test_opening_the_link_changes_nothing(monkeypatch):
     monkeypatch.setattr(actions.db, "connect", lambda: pytest.fail("GET must not touch the database"))
     r = client.get("/actions/complete", params={"t": actions.sign("insight:42", "Campari", "Add data")})
     assert r.status_code == 200 and "Mark as complete?" in r.text and "Campari" in r.text and 'method="post"' in r.text
+    assert 'name="who" value="MG"' in r.text and "I'm Matias" in r.text
 
 
 class FakeConn:
@@ -62,14 +63,15 @@ class FakeConn:
         return self
 
 
-def test_confirm_records_who_and_closes_the_insight(monkeypatch):
+@pytest.mark.parametrize("actor", ["RG", "MG"])
+def test_confirm_records_who_and_closes_the_insight(monkeypatch, actor):
     conn = FakeConn()
     monkeypatch.setattr(actions.db, "connect", lambda: conn)
     monkeypatch.setattr(actions, "_workspace_id", lambda c: "ws")
     t = actions.sign("insight:42", "Campari", "Add data")
-    r = client.post("/actions/complete", data={"t": t, "who": "RG"})
+    r = client.post("/actions/complete", data={"t": t, "who": actor})
     assert r.status_code == 200 and "Marked complete" in r.text and "Undo" in r.text
-    assert conn.sql[0][0].startswith("insert into brief_actions") and conn.sql[0][1] == ("ws", "insight", "42", "done", "RG")
+    assert conn.sql[0][0].startswith("insert into brief_actions") and conn.sql[0][1] == ("ws", "insight", "42", "done", actor)
     assert "set status = 'done'" in conn.sql[1][0]
 
 

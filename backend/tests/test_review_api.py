@@ -48,12 +48,30 @@ def test_duplicate_or_invalid_actor_credentials_fail_closed(monkeypatch):
         assert client.get("/review/workspace", headers=HEADERS).status_code == 503
 
 
-def test_workspace_uses_ndl_identity(monkeypatch):
+@pytest.mark.parametrize("actor", ["RG", "NC", "NDL", "MG"])
+def test_workspace_uses_authenticated_identity(monkeypatch, actor):
+    monkeypatch.setattr(settings, "review_tokens", {actor: SecretStr(TOKEN)})
     monkeypatch.setattr(review_api, "_workspace", lambda: {"proposals": [], "rows": [], "activity": []})
     result = client.get("/review/workspace", headers=HEADERS)
     assert result.status_code == 200
     assert result.headers["cache-control"] == "no-store"
-    assert result.json()["viewer"] == "NDL"
+    assert result.json()["viewer"] == actor
+
+
+def test_matias_credentials_preserve_existing_reviewers_and_attribute_his_decisions(monkeypatch):
+    tokens = {actor: SecretStr(actor + "-" + TOKEN) for actor in ("RG", "NC", "NDL", "MG")}
+    monkeypatch.setattr(settings, "review_tokens", tokens)
+    monkeypatch.setattr(review_api, "_workspace", lambda: {"proposals": [], "rows": [], "activity": []})
+    for actor, token in tokens.items():
+        response = client.get("/review/workspace", headers={"Authorization": "Bearer " + token.get_secret_value()})
+        assert response.status_code == 200 and response.json()["viewer"] == actor
+    calls = []
+    monkeypatch.setattr(review_api, "_decision", lambda proposal_id, actor, action, payload:
+                        calls.append((actor, action)) or {"status": "ignored"})
+    response = client.post(f"/review/proposals/{uuid4()}/ignore",
+                           json={"revision": 1, "idempotency_key": KEY},
+                           headers={"Authorization": "Bearer " + tokens["MG"].get_secret_value()})
+    assert response.status_code == 200 and calls == [("MG", "ignore")]
 
 
 def test_workspace_live_status_failure_returns_no_workspace_data(monkeypatch):
