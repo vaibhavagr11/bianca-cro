@@ -27,6 +27,8 @@ test('Live page starts without sample company data, browser storage, or hardcode
   assert.equal(html.includes('bianca-core'),false);
   assert.ok(html.includes('<h1 id="workspace-title">Sales Pipeline Updates</h1>'));
   assert.ok(html.includes('<option value="NDL">Nicolás de León · NDL</option>'));
+  assert.ok(html.includes('<option value="MG">Matias · MG</option>'));
+  assert.ok(html.includes('data-owner="MG"'));
   assert.ok(html.includes('id="pending-count">0'));
   for(const match of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g))new Function(match[1]);
 });
@@ -1150,6 +1152,28 @@ test('Messages of one thread on one day show as a single What\'s new line',async
   assert.ok(card.includes('<span>Freestyle Snacks</span><span class="src">Source: Notes, Nov 5</span></summary><div class="ctx"><p>&ldquo;Notes passage.&rdquo;</p></div>'));
 });
 
+
+test('Matias has an MG section before assignment and sees only his assigned companies',async()=>{
+  const data=snapshot();
+  data.proposals.push({...data.proposals[0],id:'mg-1',company:'Matias prospect',owner:'MG'});
+  data.rows.push({...data.rows[0],id:'mg-row',company:'Matias prospect',owner:'MG'});
+  const page=fakePage({callTool:async()=>({structuredContent:data})});
+  await new Promise(resolve=>setImmediate(resolve));
+  page.get('#owner-filter').value='MG';
+  page.get('#owner-filter').handlers.change();
+  assert.ok(page.get('#review-list').innerHTML.includes('Matias prospect'));
+  assert.ok(page.get('#review-list').innerHTML.includes('Matias'));
+  assert.equal(page.get('#review-list').innerHTML.includes('A real company'),false);
+  page.get('#owner-filter').value='NDL';
+  page.get('#owner-filter').handlers.change();
+  assert.ok(page.get('#review-list').innerHTML.includes('A real company'));
+  assert.equal(page.get('#review-list').innerHTML.includes('Matias prospect'),false);
+  const emptyPage=fakePage({callTool:async()=>({structuredContent:snapshot()})});
+  await new Promise(resolve=>setImmediate(resolve));
+  emptyPage.get('#owner-filter').value='MG';
+  emptyPage.get('#owner-filter').handlers.change();
+  assert.ok(emptyPage.get('#review-list').innerHTML.includes('No companies match'));
+});
 
 const briefId='81a993d4-f4fb-4d76-9fa8-c4b1a1fcb55e';
 const savedBrief=()=>({id:briefId,for_date:'2026-11-19',subject:'Pipeline brief · Nov 19',html:'<table><tr><td>First row</td></tr><tr><td>Final available row</td></tr></table>',full_available:true,created_at:'2026-11-19T12:00:00Z'});
