@@ -508,6 +508,8 @@ class BuildConnection:
 
     def execute(self, sql, params=()):
         q = " ".join(sql.split())
+        if q == "select to_regclass('review_selection_cache') as found":
+            return Result([{"found": None}])
         if "pg_advisory_xact_lock" in q:
             return Result([])
         if q.startswith("select now()"):
