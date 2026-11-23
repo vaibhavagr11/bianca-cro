@@ -17,7 +17,7 @@ The founder review application groups proposed changes by company and supports *
 and **Ignore**. Next steps, commitments, and blockers go to `Next step`; customer needs, buying signals, and objections
 go to `Client Context`. Action approval replaces `Last progress` with the exact previous `Next step`, then writes the
 approved action bullets into `Next step`. Context approval adds distinct reviewed bullets to the existing `Client Context`.
-An empty section leaves its cells unchanged. Ignore never writes to the Sheet. Owners RG, NC, and NDL are supported.
+An empty section leaves its cells unchanged. Ignore never writes to the Sheet. Owners RG, NC, NDL, and MG are supported.
 
 The review queue uses the Daily Brief's action scope. Evidence-backed deal progression and legacy insights with blank
 scope can appear. Delivery and out-of-scope insights stay out of both writable sections. A requested deadline stays
