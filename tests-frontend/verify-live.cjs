@@ -231,6 +231,57 @@ test('The actual live UI starts empty and explains missing connector access',()=
   assert.equal(page.get('#pipeline-sheet-link').href,undefined);
 });
 
+test('Supporting details stay collapsed, escaped, and outside both editing and approval',async()=>{
+  const s=snapshot(),p=s.proposals[0],writes=[];
+  p.supportingDetails={nextStep:['Customer review is pending.','<img src=x onerror=alert(1)> Access check.'],clientContext:['Routine usage update.',null,'']};
+  const page=fakePage({callTool:async(name,args)=>{
+    if(name===core.TOOLS.workspace)return {structuredContent:s};
+    writes.push(json(args));return {structuredContent:{status:'approved'}};
+  }});
+  await new Promise(resolve=>setImmediate(resolve));
+  let card=page.get('#review-list').innerHTML;
+  const details=card.match(/<details class="current-next-steps supporting-details"[^>]*>([\s\S]*?)<\/details>/);
+  assert.ok(details);
+  assert.equal(/\sopen(?:[\s=>])/.test(details[0].slice(0,details[0].indexOf('>'))),false);
+  assert.ok(details[1].includes('Other recorded details (3)'));
+  assert.ok(details[1].includes('For reference; not included in this approval.'));
+  assert.ok(details[1].includes('&lt;img src=x onerror=alert(1)&gt; Access check.'));
+  assert.equal(card.includes('<img src=x'),false);
+  assert.equal(details[1].includes('data-destination='),false,'Supporting text is not an approvable bullet.');
+  const article={dataset:{id:'p-1'}};
+  page.events.toggle({target:{open:true,dataset:{supportingDetails:''},matches:selector=>selector.includes('[data-supporting-details]'),closest:()=>article}});
+  page.get('#company-search').handlers.input();
+  card=page.get('#review-list').innerHTML;
+  assert.ok(/<details class="current-next-steps supporting-details"[^>]* open>/.test(card));
+  assert.equal(writes.length,0,'Opening a disclosure never makes a write.');
+  page.events.click({target:{closest:()=>({dataset:{action:'edit'},closest:()=>article})}});
+  assert.equal(page.get('#edit-content').value,'- Confirm the scope.');
+  assert.equal(page.get('#edit-client-context').value,'');
+  page.get('#edit-dialog').close();
+  page.events.click({target:{closest:()=>({dataset:{action:'approve'},closest:()=>article})}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(writes.length,1);
+  assert.deepEqual(writes[0].next_step_bullets,['Confirm the scope.']);
+  assert.deepEqual(writes[0].client_context_bullets,[]);
+  assert.equal(JSON.stringify(writes[0]).includes('Customer review'),false);
+  assert.equal('supportingDetails' in writes[0],false);
+});
+
+test('Every selected priority renders even above three, with no empty supporting disclosure',async()=>{
+  const s=snapshot(),p=s.proposals[0];
+  p.nextStepBullets=Array.from({length:5},(_,i)=>`Important action ${i+1}.`);
+  p.clientContextBullets=Array.from({length:4},(_,i)=>`Decisive context ${i+1}.`);
+  for(const [destination,field] of [['nextStep','nextStepBullets'],['clientContext','clientContextBullets']]){
+    p.bulletLineage[destination]=p[field].map((text,i)=>({bulletId:destination+'-'+i,text,sourceIds:['email-scope']}));
+  }
+  p.supportingDetails={nextStep:[],clientContext:[]};
+  const page=fakePage({callTool:async()=>({structuredContent:s})});
+  await new Promise(resolve=>setImmediate(resolve));
+  const card=page.get('#review-list').innerHTML;
+  for(const text of [...p.nextStepBullets,...p.clientContextBullets])assert.ok(card.includes('>'+text+'</li>'),text);
+  assert.equal(card.includes('Other recorded details'),false);
+});
+
 test('Header and cards follow the connected Pipeline Sheet and clear invalid or stale links',async()=>{
   const stageUrl='https://docs.google.com/spreadsheets/d/staging-sheet/edit?gid=0#gid=0';
   const productionUrl='https://docs.google.com/spreadsheets/d/production-sheet/edit?gid=42#gid=42';

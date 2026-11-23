@@ -215,6 +215,21 @@ test('Demo navigation and actions contain no Sheet preview or bottom rotation hi
   assert.ok(page.get('#review-list').innerHTML.includes('data-action="ignore"'));
 });
 
+test('Demo supporting details are optional reference text and never added to approved cells',()=>{
+  const state=core.initial(),p=state.proposals[0];
+  assert.equal(demoArticle(fakePage(state),p.id).includes('Other recorded details'),false);
+  p.supportingDetails={nextStep:['The customer will get back to us.'],clientContext:['<img src=x> Routine activity.']};
+  const page=fakePage(state),card=demoArticle(page,p.id);
+  assert.ok(card.includes('<details class="current-next-steps supporting-details" data-supporting-details>'));
+  assert.ok(card.includes('Other recorded details (2)'));
+  assert.ok(card.includes('For reference; not included in this approval.'));
+  assert.ok(card.includes('&lt;img src=x&gt; Routine activity.'));
+  assert.equal(card.includes('<img src=x>'),false);
+  const after=core.approve(state,p.id,{nextStepBullets:p.nextStepBullets,clientContextBullets:p.clientContextBullets},at);
+  assert.equal(JSON.stringify(after.rows).includes('The customer will get back to us.'),false);
+  assert.equal(JSON.stringify(after.rows).includes('Routine activity.'),false);
+});
+
 test('Demo sources show types and dates and keep escaped excerpts in closed disclosures',()=>{
   const state=core.initial();
   state.proposals[0].sources=[
