@@ -16,7 +16,8 @@ from app import db
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 MIGRATIONS_DIR = BACKEND_DIR / "migrations"
 SEEDS_DIR = BACKEND_DIR / "seeds"
-SHEET_REVIEW_MIGRATIONS = {"012_sheet_review", "013_sheet_review_columns", "014_review_daily_lineage"}
+SHEET_REVIEW_MIGRATIONS = {"012_sheet_review", "013_sheet_review_columns", "014_review_daily_lineage",
+                           "021_review_priority_selection"}
 
 
 def main() -> int:
