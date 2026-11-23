@@ -5,17 +5,62 @@
 The founder interface preserves the approved Bianca layout, title **Sales Pipeline Updates**, and owners Ramiro (`RG`),
 Nico Casaux (`NC`), and Nico de León (`NDL`). One card holds the context and next actions for one pipeline company.
 
-- **Next Step** contains next steps, commitments, and blockers; **Client Context** contains customer needs, buying signals, and objections. Routing uses the stored insight type, not the wording of an editable bullet.
+- Before priority selection, next steps, commitments, and blockers are action candidates; customer needs, buying signals, and objections are Client Context candidates. Only selected items become proposed updates. Passive customer obligations and standalone blocker status stay in supporting detail. Routing uses the stored insight type, not the wording of an editable bullet.
 - **Approve** sends both reviewed lists. **Edit → Save & approve** uses separate editors for the founder's changes.
 - If action bullets are present, they replace `Next step` and its **exact previous value replaces `Last progress`**, including an empty old Next step. The previous Last progress is overwritten, not appended.
 - If context bullets are present, they are added to existing `Client Context`, deduplicating equivalent bullet lines. The existing text is preserved. An empty approved section leaves its corresponding cells unchanged, so context-only approval never rotates action cells.
 - Before/after values for all three cells and the exact destination are stored in the durable audit.
 - **Ignore** dismisses the card for all founders without writing any Sheet cell. It remains in the activity history.
 
-### Card limits, order and Status (11/16/2026)
+### Priority selection (11/23/2026)
+
+Extraction remains comprehensive. With `REVIEW_PRIORITY_SELECTION_ENABLED=true` (the default), a separate
+selection step chooses the important updates from the eligible, deduplicated evidence. **Usually 0–3 bullets
+per section** is a strong preference, not a quota or a maximum. Return fewer when little matters; retain more
+when multiple distinct important items are warranted. No selected list is truncated to meet that preference.
+
+- **Suggested next steps:** unresolved actions Bianca can take now that materially advance a commercial
+  decision or address a significant commercial risk. Routine login/access/adoption checks do not qualify merely
+  because a founder owns them, they have a date, or two follow-ups went unanswered. An explicit consequential
+  commercial dependency can make a related action important. Passive promises that the customer will review,
+  discuss internally, or get back to Bianca stay in supporting detail; they are not rewritten into invented
+  follow-ups. Completed Bianca work is history, even if a customer decision remains pending.
+- **Client context:** the few facts that materially change the sales approach: central needs and desired outcomes,
+  decisive buying criteria, substantive objections, and purchasing constraints. Prefer representative facts over
+  repeated descriptions of the same theme. Consider existing Sheet context when deciding whether a proposed
+  addition is useful. Routine activity, generic interest, and waiting status do not move here just because they
+  were excluded from Next Steps. Older evidence can remain central; recency alone does not determine importance.
+- The model selects existing bullet IDs in priority order. Code retains their exact text, owners, requested-versus-
+  agreed dates, and source lineage, and rejects invalid or cross-section selections. It does not invent actions or
+  compress unrelated tasks into one bullet to achieve a count. Supporting details on a selected card are collapsed
+  and explicitly excluded from its approval. A company with no meaningful proposed updates needs no new card.
+- Selection is cached against its evidence, deal context, policy version, and review date. Approval revalidates the
+  saved selection against current evidence without another model call. Failed or invalid model responses stop the
+  build rather than falling back to the previous broad list. `REVIEW_SELECTION_BATCH` defaults to two uncached
+  model calls per request; repeat builds until `done=true`. Cached and empty results need no model call.
+- Approve and Ignore account for the selected candidates only. Deferred candidates are retained, including when
+  they share a source with a selected bullet. They can be reconsidered when circumstances change. Older source-level
+  receipts remain honored. This does not recover evidence already consumed by a previous approval under legacy rules.
+
+The change selects concise **proposed updates**; it does not automatically rewrite a founder's existing Sheet cells.
+Client Context approval still appends by default, so historical Sheet context remains available in Current Sheet cells.
+Existing context may need a separately reviewed cleanup if a concise replacement of that whole cell is desired.
+
+Rollout: apply `uv run python -m scripts.migrate --sheet-review` (includes `021_review_priority_selection`),
+configure the existing Anthropic API key/model settings, then run `/review/build?force=true` to completion to rebuild
+pending cards. Keep already-applying approvals on their saved retry path. Review representative examples with the
+founders, including the login check, both customer-review promises, a commercially critical access dependency,
+zero relevant items, older important context, and a deal with more than three independent priorities. Automated
+tests validate selection contracts and review persistence with simulated model responses; live semantic quality
+still needs that staging review. `REVIEW_PRIORITY_SELECTION_ENABLED=false` supports deployments that have not
+started priority review. Once priority cards or candidate decisions exist, disabling selection cannot safely restore
+source-level review: builds refuse that switch rather than reintroducing reviewed items or consuming deferred siblings.
+Keep selection enabled for that lifecycle. The legacy `REVIEW_MAX_*` values are ignored when selection is enabled.
+
+### Legacy card limits, order and Status (11/16/2026)
 
 - **Order.** Next Step bullets lead with Bianca's own actions, newest first, then items with no clear owner, then customer-owed items, then blockers. Two wordings of the same step (at least three in four meaningful words shared, four words minimum) become one bullet that keeps both sources.
-- **Limit.** A card suggests at most `REVIEW_MAX_NEXT_STEPS` next steps (default 4) and `REVIEW_MAX_CONTEXT` context bullets (default `0` = no limit, so older customer needs are kept). The newest stay. Sources that supported only the removed bullets are still recorded on the card (`source_versions`), so Approve or Ignore retires them and the old bullets do not come back on the next build.
+- **Legacy limit (priority selection disabled only).** A card suggests at most `REVIEW_MAX_NEXT_STEPS` next steps (default 4) and `REVIEW_MAX_CONTEXT` context bullets (default `0` = no limit). The newest stay. Sources that supported only removed bullets are recorded on the card (`source_versions`), so legacy Approve or Ignore retires them. The enabled priority-selection path above does not use this cap or retire deferred candidates.
 - **Status.** `POST /review/rows/{row_id}/status` with `{"expected_status", "status"}` (tool `bianca_set_status`) writes the one Status cell of that company after checking it still holds the value the founder saw. Only labels already used in the Sheet's Status column are accepted. The pipeline mirror and `opportunity_changes` are updated; the change is logged in `sync_runs` with source `sheet_review_status:<founder>`. It is a single-cell write, so the n8n Sheets proxy needs no change.
 - **Dates.** The editor's Complete by field is plain text read day first (`16/11/2026`, `16/11`, `16 Nov`, `16 de noviembre`), independent of the browser language. An impossible date shows why and blocks Save & approve. The Sheet text stays `(complete by Nov 16, 2026)`.
 - **After deploying this change** run `/review/build?force=true` until `done=true`: pending cards built before it hold the old order and are refused at approval with "The sales evidence changed" until rebuilt.
