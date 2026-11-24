@@ -49,19 +49,16 @@ POPUP_SCRIPT = """(() => {
   const message = {type: 'bianca-hub-auth-complete', success: page.dataset.success === 'true'};
   if (page.dataset.error) message.error = page.dataset.error;
   const destination = document.getElementById('return-link').getAttribute('href');
-  let notified = false;
   try {
     if (window.opener && !window.opener.closed) {
       window.opener.postMessage(message, window.location.origin);
-      notified = true;
     }
   } catch (_) {}
-  if (notified) {
-    window.close();
-    window.setTimeout(() => window.location.replace(destination), 150);
-  } else {
-    window.location.replace(destination);
-  }
+  // Provider navigation may sever opener while this remains a script-opened
+  // window. Closing does not depend on the opener; the Hub polls its session.
+  try { window.close(); } catch (_) {}
+  // Only a window whose close was denied reaches this safe fallback.
+  window.setTimeout(() => window.location.replace(destination), 150);
 })();"""
 
 
