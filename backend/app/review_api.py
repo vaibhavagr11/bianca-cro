@@ -276,7 +276,8 @@ def application() -> FileResponse:
     # Only the shell is public. Every data and decision call requires its own credential.
     return FileResponse(ARTIFACT_DIR / "sales-pipeline-updates.html", media_type="text/html",
                         headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
-                                 "Referrer-Policy": "no-referrer"})
+                                 "Referrer-Policy": "no-referrer",
+                                 "Cross-Origin-Opener-Policy": "same-origin-allow-popups"})
 
 
 @router.get("/demo", response_class=FileResponse)

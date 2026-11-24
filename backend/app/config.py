@@ -97,8 +97,8 @@ class Settings(BaseSettings):
     hub_google_client_secret: SecretStr | None = None
     hub_google_domain: str = "bianca-ai.com"
     hub_google_users: dict[str, str] = Field(default_factory=dict)
-    # Absolute lifetime: activity never extends a session.
-    hub_session_hours: int = Field(default=12, ge=1, le=168)
+    # Seven-day absolute lifetime: activity never extends a session.
+    hub_session_hours: int = Field(default=168, ge=1, le=168)
     review_spreadsheet_id: str | None = "14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw"
     review_sheet_tab: str = "Pipeline"
     review_sheet_id: int | None = 1869050409

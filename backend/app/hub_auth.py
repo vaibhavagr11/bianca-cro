@@ -7,15 +7,16 @@ cookies are opaque, host-only and hashed at rest. MCP and n8n auth stay separate
 import base64
 import hashlib
 import hmac
+import html
 import logging
 import re
 import secrets
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import httpx
 import jwt
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from psycopg import Error as DatabaseError
 from psycopg.rows import dict_row
 
@@ -35,9 +36,33 @@ JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs"
 ISSUERS = ["https://accounts.google.com", "accounts.google.com"]
 _jwks = jwt.PyJWKClient(JWKS_URL, timeout=5, lifespan=300)
 _OPAQUE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+_OAUTH_STATE = re.compile(r"^(?:p\.)?[A-Za-z0-9_-]{43}$")
 _DOMAIN = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 _EMAIL_LOCAL = re.compile(r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}$")
 NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "no-referrer"}
+AUTH_ERRORS = frozenset({"cancelled", "invalid_state", "not_allowed", "identity_mismatch", "unavailable", "invalid_identity"})
+# This script is constant: all variable values are escaped HTML attributes, and
+# the CSP authorizes this exact script by hash. No Google code/token/state enters
+# the completion page. The opener always rechecks /auth/session for identity.
+POPUP_SCRIPT = """(() => {
+  const page = document.body;
+  const message = {type: 'bianca-hub-auth-complete', success: page.dataset.success === 'true'};
+  if (page.dataset.error) message.error = page.dataset.error;
+  const destination = document.getElementById('return-link').getAttribute('href');
+  let notified = false;
+  try {
+    if (window.opener && !window.opener.closed) {
+      window.opener.postMessage(message, window.location.origin);
+      notified = true;
+    }
+  } catch (_) {}
+  if (notified) {
+    window.close();
+    window.setTimeout(() => window.location.replace(destination), 150);
+  } else {
+    window.location.replace(destination);
+  }
+})();"""
 
 
 class OAuthAccessLogFilter(logging.Filter):
@@ -114,6 +139,24 @@ def _return_to(value: str) -> str:
     if parsed.scheme or parsed.netloc or parsed.path != "/review/app" or parsed.fragment:
         return "/review/app"
     return value
+
+
+def _error_destination(return_to: str, error: str) -> str:
+    parsed = urlsplit(_return_to(return_to))
+    query = [(name, value) for name, value in parse_qsl(parsed.query, keep_blank_values=True) if name != "auth_error"]
+    query.append(("auth_error", error if error in AUTH_ERRORS else "unavailable"))
+    return "/review/app?" + urlencode(query)
+
+
+def _callback_result(*, popup: bool, return_to: str, error: str | None = None) -> RedirectResponse:
+    if popup:
+        query = {"success": "0" if error else "1", "return_to": _return_to(return_to)}
+        if error:
+            query["error"] = error if error in AUTH_ERRORS else "unavailable"
+        destination = "/auth/google/complete?" + urlencode(query)
+    else:
+        destination = _error_destination(return_to, error) if error else _return_to(return_to)
+    return RedirectResponse(destination, status_code=303, headers=NO_STORE)
 
 
 def _cookie(response, name: str, value: str, seconds: int) -> None:
@@ -269,18 +312,24 @@ def session(request: Request) -> JSONResponse:
         return JSONResponse({"mode": "token", "authenticated": False}, headers=NO_STORE)
     current = require_session(request, optional=True)
     if current is None:
-        response = JSONResponse({"mode": "google", "authenticated": False}, headers=NO_STORE)
-        _clear_cookie(response, SESSION_COOKIE)
-        return response
+        # Discovery is read-only. A delayed pre-login popup/focus probe must not
+        # delete the new cookie set by a callback that completed in the meantime.
+        # Expired/revoked cookies remain unusable; explicit logout clears them.
+        return JSONResponse({"mode": "google", "authenticated": False}, headers=NO_STORE)
     return JSONResponse({"mode": "google", "authenticated": True, "actor": current["actor"],
                          "email": current["email"], "expires_at": current["expires_at"].isoformat(),
                          "csrf_token": current["csrf_token"]}, headers=NO_STORE)
 
 
 @router.get("/google/login")
-def google_login(return_to: str = "/review/app") -> RedirectResponse:
+def google_login(return_to: str = "/review/app", popup: bool = False) -> RedirectResponse:
     origin, _ = _configuration()
     state, browser = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+    if popup:
+        # The mode is covered by the server-stored state hash. Existing state
+        # records and ordinary redirect sign-in remain compatible, without a
+        # schema change or relying on arbitrary callback query parameters.
+        state = "p." + state
     verifier = _proof(browser, "pkce:" + state)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).decode("ascii").rstrip("=")
     try:
@@ -299,14 +348,17 @@ def google_login(return_to: str = "/review/app") -> RedirectResponse:
 
 @router.get("/google/callback")
 def google_callback(request: Request, state: str = "", code: str = "", error: str = "") -> RedirectResponse:
+    popup = state.startswith("p.")
+    return_to = "/review/app"
     try:
         origin, _ = _configuration()
         browser = request.cookies.get(STATE_COOKIE, "")
-        if not _OPAQUE.fullmatch(state) or not _OPAQUE.fullmatch(browser):
+        if not _OAUTH_STATE.fullmatch(state) or not _OPAQUE.fullmatch(browser):
             raise LoginError("invalid_state")
         flow = _consume_state(state, browser)
         if flow is None:
             raise LoginError("invalid_state")
+        return_to = _return_to(flow["return_to"])
         if error:
             raise LoginError("cancelled")
         if not code or len(code) > 4096:
@@ -315,18 +367,39 @@ def google_callback(request: Request, state: str = "", code: str = "", error: st
         identity = _verify_identity(token, _proof(browser, "nonce:" + state))
         session_token = secrets.token_urlsafe(32)
         _create_session(flow["workspace_id"], identity, session_token, request.cookies.get(SESSION_COOKIE))
-        response = RedirectResponse(_return_to(flow["return_to"]), status_code=303, headers=NO_STORE)
+        response = _callback_result(popup=popup, return_to=return_to)
         _cookie(response, SESSION_COOKIE, session_token, settings.hub_session_hours * 3600)
     except LoginError as exc:
-        response = RedirectResponse("/review/app?auth_error=" + exc.code, status_code=303, headers=NO_STORE)
+        response = _callback_result(popup=popup, return_to=return_to, error=exc.code)
     except jwt.PyJWTError:
-        response = RedirectResponse("/review/app?auth_error=invalid_identity", status_code=303, headers=NO_STORE)
+        response = _callback_result(popup=popup, return_to=return_to, error="invalid_identity")
     except (DatabaseError, httpx.HTTPError, HTTPException, ValueError, TypeError, KeyError):
         # Provider / database responses and exception messages must not be echoed
         # into URLs, logs, or the frontend. The user can safely restart sign-in.
-        response = RedirectResponse("/review/app?auth_error=unavailable", status_code=303, headers=NO_STORE)
+        response = _callback_result(popup=popup, return_to=return_to, error="unavailable")
     _clear_cookie(response, STATE_COOKIE)
     return response
+
+
+@router.get("/google/complete", response_class=HTMLResponse)
+def google_complete(success: bool = False, error: str = "", return_to: str = "/review/app") -> HTMLResponse:
+    """A same-origin popup signal; it conveys no authentication authority or data."""
+    safe_error = error if error in AUTH_ERRORS else "unavailable"
+    destination = _return_to(return_to) if success else _error_destination(return_to, safe_error)
+    script_hash = base64.b64encode(hashlib.sha256(POPUP_SCRIPT.encode("utf-8")).digest()).decode("ascii")
+    headers = {**NO_STORE,
+               "Content-Security-Policy": "default-src 'none'; script-src 'sha256-" + script_hash + "'; "
+                                          "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+               "Cross-Origin-Opener-Policy": "same-origin-allow-popups",
+               "X-Content-Type-Options": "nosniff"}
+    body = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<title>Returning to War Room</title></head>'
+            f'<body data-success="{str(success).lower()}" data-error="{safe_error if not success else ""}">'
+            '<p>Returning to the War Room Hub…</p>'
+            f'<p><a id="return-link" href="{html.escape(destination, quote=True)}">Continue to War Room</a></p>'
+            f'<script>{POPUP_SCRIPT}</script></body></html>')
+    return HTMLResponse(body, headers=headers)
 
 
 @router.post("/logout")
