@@ -140,6 +140,11 @@ matches an original bullet in the same destination; manual edits are recorded as
 
 ## Deploy the backend
 
+For Google account sign-in on the hosted Hub, follow the [Google Cloud and Render setup](google-hub-sign-in.md).
+It adds a separate optional authentication migration and 12-hour browser sessions. The bearer-token
+instructions below remain applicable to the review connector and to hosted deployments with Google
+sign-in disabled.
+
 1. Check out this branch and install the locked Python dependencies with `uv sync` in `backend/`.
 2. Apply migrations with `uv run python -m scripts.migrate --sheet-review`. Migrations 012–014 add proposals, decision history,
    source receipts, Client Context, daily queue state, and source lineage. The default migration command defers these three files.
