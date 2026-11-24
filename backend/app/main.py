@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 
-from app import actions, brief_api, daily, db, ingest, opportunities, process, review_api
+from app import actions, brief_api, daily, db, hub_auth, ingest, opportunities, process, review_api
 from app.config import Settings, settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -27,6 +27,7 @@ def health_db() -> dict:
 
 
 def create_app(config: Settings = settings) -> FastAPI:
+    hub_auth.install_access_log_redaction()
     transport = None
     lifespan = None
     if config.sales_mcp_enabled:
@@ -48,6 +49,7 @@ def create_app(config: Settings = settings) -> FastAPI:
     app.include_router(actions.router)
     app.include_router(review_api.router)
     app.include_router(review_api.publish_router)
+    app.include_router(hub_auth.router)
     app.add_api_route("/health", health, methods=["GET"])
     app.add_api_route("/health/db", health_db, methods=["GET"])
     if transport is not None:
