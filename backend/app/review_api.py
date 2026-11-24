@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, Validation
 from psycopg.rows import dict_row
 from starlette.concurrency import run_in_threadpool
 
-from app import brief_api, db, review_service
+from app import brief_api, db, hub_auth, review_service
 from app.config import settings
 from app.ingest import _workspace_id, require_token
 from app.pipeline_freshness import require_fresh_pipeline
@@ -48,7 +48,7 @@ def validate_origin(request: Request) -> None:
             raise HTTPException(403, "Origin is not allowed")
 
 
-def reviewer(request: Request, authorization: str | None = Header(default=None)) -> str:
+def token_reviewer(request: Request, authorization: str | None = Header(default=None)) -> str:
     enabled()
     validate_origin(request)
     tokens = settings.review_tokens
@@ -62,6 +62,14 @@ def reviewer(request: Request, authorization: str | None = Header(default=None))
     if scheme.lower() != "bearer" or not supplied or not matches:
         raise HTTPException(401, "A founder review credential is required", headers={"WWW-Authenticate": "Bearer"})
     return matches[0]
+
+
+def reviewer(request: Request, authorization: str | None = Header(default=None)) -> str:
+    """Hosted APIs use Google sessions after rollout; never fall back to tokens."""
+    enabled()
+    if settings.hub_google_auth_enabled:
+        return hub_auth.require_session(request)["actor"]
+    return token_reviewer(request, authorization)
 
 
 Bullet = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4000)]
@@ -268,7 +276,8 @@ def application() -> FileResponse:
     # Only the shell is public. Every data and decision call requires its own credential.
     return FileResponse(ARTIFACT_DIR / "sales-pipeline-updates.html", media_type="text/html",
                         headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
-                                 "Referrer-Policy": "no-referrer"})
+                                 "Referrer-Policy": "no-referrer",
+                                 "Cross-Origin-Opener-Policy": "same-origin-allow-popups"})
 
 
 @router.get("/demo", response_class=FileResponse)
@@ -347,13 +356,13 @@ def _rpc_error(request_id, code: int, message: str) -> JSONResponse:
 
 
 @router.get("/mcp")
-def mcp_get(actor: str = Depends(reviewer)) -> Response:
+def mcp_get(actor: str = Depends(token_reviewer)) -> Response:
     # Stateless JSON responses; unsolicited SSE streams are optional in MCP.
     return Response(status_code=405, headers={"Allow": "POST"})
 
 
 @router.post("/mcp")
-async def mcp(request: Request, actor: str = Depends(reviewer)) -> Response:
+async def mcp(request: Request, actor: str = Depends(token_reviewer)) -> Response:
     protocol = request.headers.get("mcp-protocol-version")
     if protocol and protocol not in PROTOCOLS:
         raise HTTPException(400, "Unsupported MCP protocol version")
