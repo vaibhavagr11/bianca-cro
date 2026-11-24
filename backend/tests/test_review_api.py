@@ -48,7 +48,7 @@ def test_duplicate_or_invalid_actor_credentials_fail_closed(monkeypatch):
         assert client.get("/review/workspace", headers=HEADERS).status_code == 503
 
 
-@pytest.mark.parametrize("actor", ["RG", "NC", "NDL", "MG"])
+@pytest.mark.parametrize("actor", ["RG", "NC", "NDL", "MG", "GA"])
 def test_workspace_uses_authenticated_identity(monkeypatch, actor):
     monkeypatch.setattr(settings, "review_tokens", {actor: SecretStr(TOKEN)})
     monkeypatch.setattr(review_api, "_workspace", lambda: {"proposals": [], "rows": [], "activity": []})

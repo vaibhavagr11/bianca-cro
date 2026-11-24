@@ -26,6 +26,7 @@ from app.config import settings
 from app.extractor import SALES_SCOPES
 from app.pipeline import PipelineRow, TRACKED_FIELDS, is_working_client, normalize_name
 from app.review_sheets import SheetsClient, SheetConflict, SheetError, SheetWorkingClient, SheetWriteUncertain
+from app.review_identity import REVIEW_ACTORS
 from app.review_content import (
     Content, answered_email_asks, approved_lineage, is_email_ask, is_waiting_on_them, proposal_content, reviewed_content,
     review_next_step_bullets, source_id, source_version, validate_lineage,
@@ -621,8 +622,8 @@ def status_options(statuses: dict[str, str | None]) -> list[str]:
 
 def change_status(workspace_id, row_id: str, actor: str, expected_status: str, new_status: str) -> dict:
     """A founder's explicit Status change for one pipeline company. Writes that one Sheet cell and nothing else."""
-    if actor not in ("RG", "NC", "NDL", "MG"):
-        raise ValueError("A valid founder is required.")
+    if actor not in REVIEW_ACTORS:
+        raise ValueError("A valid reviewer is required.")
     if not isinstance(expected_status, str) or not isinstance(new_status, str) or not new_status.strip():
         raise ValueError("Choose a status.")
     new_status = new_status.strip()
@@ -974,8 +975,8 @@ def decide(workspace_id, proposal_id: str, actor: str, action: str, revision: in
     ``next_step_mode`` is "replace" (approved steps become Next step, the old Next step moves to Last progress)
     or "append" (approved steps are added below the existing Next step text; Last progress is left alone).
     """
-    if action not in ("approve", "ignore") or actor not in ("RG", "NC", "NDL", "MG"):
-        raise ValueError("A valid founder and decision are required.")
+    if action not in ("approve", "ignore") or actor not in REVIEW_ACTORS:
+        raise ValueError("A valid reviewer and decision are required.")
     if next_step_mode not in NEXT_STEP_MODES or (action == "ignore" and next_step_mode != "replace"):
         raise ValueError("Choose whether to replace Next step or add to it.")
     if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:

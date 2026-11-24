@@ -24,13 +24,13 @@ from app import brief_api, db, hub_auth, review_service
 from app.config import settings
 from app.ingest import _workspace_id, require_token
 from app.pipeline_freshness import require_fresh_pipeline
+from app.review_identity import REVIEW_ACTORS as ACTORS
 
 log = logging.getLogger("bianca_cro.review")
 router = APIRouter(prefix="/review", tags=["Sheet review"])
 publish_router = APIRouter(prefix="/process", tags=["Sheet review"])
 ARTIFACT_DIR = Path(__file__).resolve().parents[2] / "artifacts"
 PROTOCOLS = ("2025-06-18", "2025-03-26")
-ACTORS = {"RG", "NC", "NDL", "MG"}
 
 
 def enabled() -> None:

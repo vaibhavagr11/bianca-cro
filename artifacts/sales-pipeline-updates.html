@@ -708,7 +708,7 @@ const BiancaWarRoom = (() => {
       if(!data||!['google','token'].includes(data.mode)||typeof data.authenticated!=='boolean')throw Error('Invalid sign-in response');
       authMode=data.mode;
       if(data.mode==='google'&&data.authenticated){
-        if(!['RG','NC','NDL','MG'].includes(data.actor)||typeof data.email!=='string'||!data.email||typeof data.csrf_token!=='string'||!data.csrf_token||typeof data.expires_at!=='string'||!Number.isFinite(Date.parse(data.expires_at)))throw Error('Invalid session');
+        if(!['RG','NC','NDL','MG','GA'].includes(data.actor)||typeof data.email!=='string'||!data.email||typeof data.csrf_token!=='string'||!data.csrf_token||typeof data.expires_at!=='string'||!Number.isFinite(Date.parse(data.expires_at)))throw Error('Invalid session');
         stopGooglePopup(true);$('#google-sign-in-fallback').hidden=true;
         authSession={actor:data.actor,email:data.email,csrf_token:data.csrf_token,expires_at:data.expires_at};
         if(Date.parse(data.expires_at)<=Date.now()){expireSession();return;}

@@ -284,7 +284,7 @@ def approve(bullets=None, **kwargs):
     return review.decide(WORKSPACE, PROPOSAL, "NDL", "approve", 1, "approval-key-1", next_step_bullets=bullets, **kwargs)
 
 
-@pytest.mark.parametrize("actor", ["NDL", "MG"])
+@pytest.mark.parametrize("actor", ["NDL", "MG", "GA"])
 def test_approval_replaces_last_progress_exactly_and_updates_only_after_confirmed_write(service, actor):
     store, sheets = service
     old_last, old_next = sheets.last_progress, sheets.next_step
@@ -344,12 +344,14 @@ def test_approved_deadline_preserves_provenance_only_for_the_automatic_format(se
     }
 
 
-def test_ignore_only_reads_live_status_and_consumes_source_versions(service):
+@pytest.mark.parametrize("actor", ["RG", "GA"])
+def test_ignore_only_reads_live_status_and_consumes_source_versions(service, actor):
     store, sheets = service
-    result = review.decide(WORKSPACE, PROPOSAL, "RG", "ignore", 1, "ignored-key-1")
+    result = review.decide(WORKSPACE, PROPOSAL, actor, "ignore", 1, "ignored-key-1")
     assert result["status"] == "ignored"
     assert store.data["proposal"]["status"] == "ignored"
     assert result["activity"]["before"] == result["activity"]["after"]
+    assert result["activity"]["actor"] == actor and store.data["proposal"]["decided_by"] == actor
     assert store.data["receipts"]
     assert "status-read" in store.events and "sheet-read" not in store.events
     assert not sheets.calls
@@ -929,7 +931,9 @@ def test_workspace_recovery_exposes_exact_split_payload_and_not_legacy_or_redire
                 ])
             raise AssertionError(sql)
 
-    pending = review.workspace_view(WorkspaceConnection(), WORKSPACE)["proposals"][0]
+    workspace = review.workspace_view(WorkspaceConnection(), WORKSPACE)
+    assert [owner["code"] for owner in workspace["owners"]] == ["RG", "NC", "NDL", "MG"]
+    pending = workspace["proposals"][0]
     assert pending["nextStepBullets"] == store.data["proposal"]["next_step_bullets"]
     assert pending["reviewNextStepBullets"] == [
         "We owe: Send the checklist. (complete by Nov 6, 2026)"
@@ -1372,7 +1376,7 @@ def status_service(monkeypatch):
     return conn
 
 
-@pytest.mark.parametrize("actor", ["RG", "MG"])
+@pytest.mark.parametrize("actor", ["RG", "MG", "GA"])
 def test_status_change_writes_the_sheet_then_mirrors_the_stage_with_history(status_service, actor):
     result = review.change_status(WORKSPACE, OPPORTUNITY, actor, "1. Opening", " 0. Paused ")
     assert StatusSheets.calls == [("Diageo", "1. Opening", "0. Paused")]

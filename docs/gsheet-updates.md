@@ -141,13 +141,18 @@ matches an original bullet in the same destination; manual edits are recorded as
 ## Deploy the backend
 
 For Google account sign-in on the hosted Hub, follow the [Google Cloud and Render setup](google-hub-sign-in.md).
-It adds popup sign-in, a full-page fallback, a separate optional authentication migration, and 7-day browser sessions. The bearer-token
+It adds popup sign-in, a full-page fallback, optional authentication migrations 022 and 023, and 7-day browser sessions. The bearer-token
 instructions below remain applicable to the review connector and to hosted deployments with Google
 sign-in disabled.
 
+Gibb's Google account uses the `GA` reviewer identity for access and action attribution. The sales-owner
+dropdown and assignments remain limited to `RG`, `NC`, `NDL`, and `MG`. Apply additive migration 023
+with `--hub-auth` before adding Gibb's account; this flag does not enable the separate optional migration 021.
+
 1. Check out this branch and install the locked Python dependencies with `uv sync` in `backend/`.
 2. Apply migrations with `uv run python -m scripts.migrate --sheet-review`. Migrations 012–014 add proposals, decision history,
-   source receipts, Client Context, daily queue state, and source lineage. The default migration command defers these three files.
+   source receipts, Client Context, daily queue state, and source lineage; migration 021 adds priority-selection state.
+   The default migration command defers these four files. This flag does not enable Hub authentication migrations 022 and 023.
    Existing domain tables and the new tables retain RLS with backend-only access.
 3. Enable the Google Sheets API in the service account's Google Cloud project. Share the intended spreadsheet with that
    service-account email as **Editor**. The application reads the configured tab and writes only changed values among Client Context, Last progress, and Next step.
@@ -159,7 +164,7 @@ sign-in disabled.
 | Setting | Purpose |
 | --- | --- |
 | `REVIEW_ENABLED` | Defaults to `false`; gates all review and publish routes. |
-| `REVIEW_TOKENS` | JSON mapping of `RG`, `NC`, `NDL`, `MG` to **distinct**, random bearer tokens of at least 32 characters. Configure only enabled reviewers. |
+| `REVIEW_TOKENS` | JSON mapping of enabled reviewer codes (`RG`, `NC`, `NDL`, `MG`, optionally `GA`) to **distinct**, random bearer tokens of at least 32 characters. Gibb's Google sign-in does not require a new bearer token. |
 | `REVIEW_SPREADSHEET_ID` | Defaults to `14lXRsWoEY63tOsz4SwggiItgTNPFWI4KDVTLay3MLDw`; check existing environment overrides. |
 | `REVIEW_SHEET_TAB` | Exact tab name, default `Pipeline`. |
 | `REVIEW_SHEET_ID` | Numeric tab ID, default `1869050409`; validates that the named tab is the intended destination. |
