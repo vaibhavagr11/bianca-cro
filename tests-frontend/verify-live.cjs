@@ -184,7 +184,7 @@ test('A late refresh cannot put an old pending card back after a newer shared sn
   assert.equal(client.state.rows[0].nextStep,'- Confirm the scope.');
 });
 
-function fakePage(connector,pathname='/artifact',{search='',fetcher,sessionFetcher,warRoom=false}={}){
+function fakePage(connector,pathname='/artifact',{search='',fetcher,sessionFetcher,popupOpen,warRoom=false}={}){
   class Element {
     constructor(){this.textContent='';this.innerHTML='';this.value='';this.hidden=false;this.disabled=false;this.handlers={};this.attributes={};}
     addEventListener(name,handler){this.handlers[name]=handler;}
@@ -216,8 +216,8 @@ function fakePage(connector,pathname='/artifact',{search='',fetcher,sessionFetch
     events[name]=previous?event=>{previous(event);handler(event);}:handler;
   }};
   if(warRoom)fakeDocument.body={dataset:{theme:'war-room'}};
-  const location={pathname,protocol:'https:',hostname:'hub.test',search,href:'https://hub.test'+pathname+search};
-  const fakeWindow={biancaConnector:connector,addEventListener:(name,handler)=>{events['window:'+name]=handler;},scrollTo:()=>{},history:{replaceState:(_state,_unused,url)=>{const next=new URL(url);location.href=next.href;location.search=next.search;}}};
+  const location={pathname,protocol:'https:',hostname:'hub.test',origin:'https://hub.test',search,href:'https://hub.test'+pathname+search};
+  const fakeWindow={open:popupOpen||(()=>null),biancaConnector:connector,addEventListener:(name,handler)=>{events['window:'+name]=handler;},scrollTo:()=>{},history:{replaceState:(_state,_unused,url)=>{const next=new URL(url);location.href=next.href;location.search=next.search;}}};
   const page=vm.createContext({document:fakeDocument,window:fakeWindow,location,URL,URLSearchParams,crypto:{randomUUID:()=> 'new-key'},setTimeout:(fn,ms)=>{timers.set(++timerId,{fn,ms});return timerId;},clearTimeout:id=>timers.delete(id),Event,fetch:(url,options)=>url==='/auth/session'?(sessionFetcher||(()=>Promise.resolve({ok:true,status:200,json:async()=>({mode:'token',authenticated:false})})))(url,options):(fetcher||(()=>{throw Error('Unexpected direct network call');}))(url,options)});
   for(const script of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g))vm.runInContext(script[1],page);
   return {get,events,context:page,timers};
@@ -1354,7 +1354,7 @@ test('War Room keyboard actions cannot activate a hidden card while Daily Brief 
   assert.equal(hiddenCardReads,0);
 });
 
-const signedInSession=()=>({mode:'google',authenticated:true,actor:'RG',email:'ramiro@bianca-ai.com',expires_at:new Date(Date.now()+12*60*60*1000).toISOString(),csrf_token:'session-csrf-value'});
+const signedInSession=()=>({mode:'google',authenticated:true,actor:'RG',email:'ramiro@bianca-ai.com',expires_at:new Date(Date.now()+7*24*60*60*1000).toISOString(),csrf_token:'session-csrf-value'});
 const authResponse=data=>({ok:true,status:200,json:async()=>data});
 const flush=()=>new Promise(resolve=>setImmediate(resolve));
 
@@ -1427,11 +1427,11 @@ test('A valid Google session restores the Hub automatically without sliding its 
   assert.ok(page.get('#account-status').textContent.includes(auth.email));
   assert.ok(page.get('#account-status').textContent.includes('Sign-in expires'));
   assert.equal(page.get('#disconnect').textContent,'Sign out');
-  const timer=[...page.timers.values()].find(t=>t.ms>40000000);
-  assert.ok(timer&&timer.ms<=43200000);
+  const timer=[...page.timers.values()].find(t=>t.ms>600000000);
+  assert.ok(timer&&timer.ms<=604800000);
   await page.get('#refresh-updates').onclick();
-  assert.equal([...page.timers.values()].filter(t=>t.ms>40000000).length,1,'Refreshing does not reset the session timer.');
-  assert.equal([...page.timers.values()].find(t=>t.ms>40000000),timer);
+  assert.equal([...page.timers.values()].filter(t=>t.ms>600000000).length,1,'Refreshing does not reset the session timer.');
+  assert.equal([...page.timers.values()].find(t=>t.ms>600000000),timer);
 });
 
 test('Google session login opens a saved brief without reading the Pipeline Sheet',async()=>{
@@ -1464,7 +1464,7 @@ test('Absolute expiry clears cards, open edits, account identity and pending wri
   page.events.click({target:{closest:()=>({dataset:{action:'edit'},closest:()=>({dataset:{id:'p-1'}})})}});
   assert.equal(page.get('#edit-dialog').open,true);
   assert.ok(page.get('#edit-content').value.includes('Confirm the scope'));
-  [...page.timers.values()].find(t=>t.ms>40000000).fn();
+  [...page.timers.values()].find(t=>t.ms>600000000).fn();
   assert.equal(page.get('#pending-count').textContent,0);
   assert.equal(page.get('#review-list').innerHTML.includes('A real company'),false);
   assert.equal(page.get('#edit-dialog').open,false);
@@ -1585,6 +1585,122 @@ test('An old transport unauthorized response cannot expire a newly restored sess
   assert.ok(page.get('#account-status').textContent.includes('new-account@bianca-ai.com'));
   assert.equal(page.get('#connection-panel').hidden,true);
   assert.ok(page.get('#review-list').innerHTML.includes('A real company'));
+});
+
+function popupWindow(){return {closed:false,focusCalls:0,closeCalls:0,focus(){this.focusCalls++;},close(){this.closeCalls++;this.closed=true;}};}
+function popupClick(page,overrides={}){let prevented=false;page.get('#google-sign-in').onclick({preventDefault(){prevented=true;},...overrides});return prevented;}
+function popupMessage(page,popup,data,origin='https://hub.test'){page.events['window:message']({origin,source:popup,data});}
+
+test('Google sign-in opens a real popup synchronously with its own URL and preserved Daily Brief',async()=>{
+  const popup=popupWindow(),opens=[];let clicksReturned=false;
+  const page=fakePage(undefined,'/review/app',{search:'?tab=daily-brief&brief='+briefId,sessionFetcher:async()=>authResponse({mode:'google',authenticated:false}),popupOpen:(url,name,features)=>{assert.equal(clicksReturned,false);opens.push({url,name,features});return popup;}});
+  await flush();const previous=page.context.location.href;
+  assert.equal(popupClick(page),true);clicksReturned=true;
+  assert.equal(opens.length,1);assert.match(opens[0].features,/popup=yes/);
+  const opened=new URL(opens[0].url);assert.equal(opened.origin,'https://hub.test');assert.equal(opened.pathname,'/auth/google/login');assert.equal(opened.searchParams.get('popup'),'1');assert.equal(opened.searchParams.get('return_to'),'/review/app?tab=daily-brief&brief='+briefId);
+  assert.equal(page.context.location.href,previous,'The original Hub stays on its current page.');
+  assert.equal(page.get('#connection-status').textContent,'Waiting for Google sign-in');
+  assert.ok(popup.focusCalls>=1);
+  assert.equal(page.get('#google-sign-in').textContent,'Return to Google sign-in');
+});
+
+test('A second sign-in click focuses its existing popup instead of starting another OAuth request',async()=>{
+  const popup=popupWindow();let opens=0;
+  const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>authResponse({mode:'google',authenticated:false}),popupOpen:()=>{opens++;return popup;}});
+  await flush();popupClick(page);popupClick(page);
+  assert.equal(opens,1);assert.equal(popup.focusCalls,2);
+});
+
+test('A blocked popup exposes an explicit same-tab fallback while keeping the brief link',async()=>{
+  const page=fakePage(undefined,'/review/app',{search:'?tab=daily-brief&brief='+briefId,sessionFetcher:async()=>authResponse({mode:'google',authenticated:false}),popupOpen:()=>null});
+  await flush();const before=page.context.location.href;popupClick(page);
+  assert.equal(page.get('#google-sign-in-fallback').hidden,false);
+  assert.ok(page.get('#connection-error').textContent.includes('blocked'));
+  const fallback=new URL(page.get('#google-sign-in-fallback').href,'https://hub.test');
+  assert.equal(fallback.searchParams.has('popup'),false);assert.equal(fallback.searchParams.get('return_to'),'/review/app?tab=daily-brief&brief='+briefId);
+  assert.equal(page.context.location.href,before,'Fallback is a user choice, not an unexpected navigation.');
+});
+
+test('Popup completion messages from other origins or windows cannot trigger authentication',async()=>{
+  const popup=popupWindow();let sessionReads=0;
+  const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>{sessionReads++;return authResponse({mode:'google',authenticated:false});},popupOpen:()=>popup});
+  await flush();popupClick(page);
+  popupMessage(page,popup,{type:'bianca-hub-auth-complete',success:true},'https://attacker.test');
+  popupMessage(page,popupWindow(),{type:'bianca-hub-auth-complete',success:true});
+  popupMessage(page,popup,{type:'other',success:true});
+  popupMessage(page,popup,{type:'bianca-hub-auth-complete',success:'true'});
+  await flush();assert.equal(sessionReads,1);assert.equal(popup.closeCalls,0);
+});
+
+test('A valid popup completion restores a server-verified session and the original pinned brief',async()=>{
+  const popup=popupWindow();let authenticated=false;const reads=[];
+  const page=fakePage(undefined,'/review/app',{search:'?tab=daily-brief&brief='+briefId,sessionFetcher:async()=>authResponse(authenticated?signedInSession():{mode:'google',authenticated:false}),popupOpen:()=>popup,fetcher:async url=>{reads.push(url);return authResponse(savedBrief());}});
+  await flush();popupClick(page);authenticated=true;
+  popupMessage(page,popup,{type:'bianca-hub-auth-complete',success:true});await flush();
+  assert.equal(popup.closed,true);assert.equal(page.get('#connection-panel').hidden,true);
+  assert.equal(page.get('#account-status').hidden,false);assert.deepEqual(reads,['/review/briefs/'+briefId]);
+  assert.ok(page.get('#daily-brief-frame').srcdoc.includes('Final available row'));
+  assert.equal(page.context.location.search,'?tab=daily-brief&brief='+briefId);
+});
+
+test('A popup success claim cannot create a session without the server cookie',async()=>{
+  const popup=popupWindow();let businessReads=0;
+  const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>authResponse({mode:'google',authenticated:false}),popupOpen:()=>popup,fetcher:async()=>{businessReads++;return authResponse(snapshot());}});
+  await flush();popupClick(page);
+  popupMessage(page,popup,{type:'bianca-hub-auth-complete',success:true,actor:'RG',csrf_token:'fake'});await flush();
+  assert.equal(businessReads,0);assert.equal(page.get('#account-status').hidden,true);assert.equal(page.get('#google-sign-in-panel').hidden,false);assert.ok(page.get('#connection-error').textContent.includes('could not be confirmed'));
+});
+
+test('Popup cancellation and unknown error codes show safe retry messages',async()=>{
+  for(const error of ['cancelled','not_allowed','<img src=x onerror=alert(1)>']){
+    const popup=popupWindow();
+    const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>authResponse({mode:'google',authenticated:false}),popupOpen:()=>popup});
+    await flush();popupClick(page);popupMessage(page,popup,{type:'bianca-hub-auth-complete',success:false,error});
+    assert.equal(popup.closed,true);assert.equal(page.get('#google-sign-in-panel').hidden,false);assert.equal(page.get('#google-sign-in').textContent,'Continue with Google');assert.equal(page.get('#connection-error').hidden,false);assert.equal(page.get('#connection-error').textContent.includes('<img'),false);
+  }
+});
+
+test('Closing a popup checks for a finished session and otherwise leaves a retry available',async()=>{
+  const first=popupWindow(),second=popupWindow();let opens=0,sessionReads=0;
+  const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>{sessionReads++;return authResponse({mode:'google',authenticated:false});},popupOpen:()=>++opens===1?first:second});
+  await flush();popupClick(page);first.closed=true;
+  [...page.timers.values()].find(t=>t.ms===500).fn();await flush();
+  assert.equal(sessionReads,2);assert.ok(page.get('#connection-error').textContent.includes('closed'));assert.equal(page.get('#google-sign-in').textContent,'Continue with Google');
+  popupClick(page);assert.equal(opens,2);assert.equal(page.get('#connection-status').textContent,'Waiting for Google sign-in');
+});
+
+test('Returning focus can recover sign-in when the browser severed the popup opener',async()=>{
+  const popup=popupWindow();let authenticated=false;
+  const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>authResponse(authenticated?signedInSession():{mode:'google',authenticated:false}),popupOpen:()=>popup,fetcher:async()=>authResponse(snapshot())});
+  await flush();popupClick(page);popup.closed=true;
+  [...page.timers.values()].find(t=>t.ms===500).fn();await flush();
+  authenticated=true;page.events['window:focus']();await flush();
+  assert.equal(page.get('#account-status').hidden,false);assert.equal(page.get('#connection-panel').hidden,true);assert.ok(page.get('#review-list').innerHTML.includes('A real company'));
+});
+
+test('A popup message arriving during a pending focus check is checked again after it completes',async()=>{
+  const popup=popupWindow();let finishFocus,reads=0,authenticated=false;
+  const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>{reads++;if(reads===2)return new Promise(resolve=>{finishFocus=resolve;});return authResponse(authenticated?signedInSession():{mode:'google',authenticated:false});},popupOpen:()=>popup,fetcher:async()=>authResponse(snapshot())});
+  await flush();popupClick(page);page.events['window:focus']();
+  authenticated=true;popupMessage(page,popup,{type:'bianca-hub-auth-complete',success:true});
+  finishFocus(authResponse({mode:'google',authenticated:false}));await flush();
+  assert.equal(page.get('#account-status').hidden,false);assert.equal(page.get('#connection-panel').hidden,true);
+});
+
+test('Leaving the Hub cancels its popup watcher and ignores later completion messages',async()=>{
+  const popup=popupWindow();let reads=0;
+  const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>{reads++;return authResponse({mode:'google',authenticated:false});},popupOpen:()=>popup});
+  await flush();popupClick(page);page.events['window:pagehide']();
+  popupMessage(page,popup,{type:'bianca-hub-auth-complete',success:true});await flush();
+  assert.equal(popup.closed,true);assert.equal(reads,1);assert.equal([...page.timers.values()].some(t=>t.ms===500),false);
+});
+
+test('The hosted page describes seven-day persistence and modified link clicks retain native behavior',async()=>{
+  let opens=0;
+  const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>authResponse({mode:'google',authenticated:false}),popupOpen:()=>{opens++;return popupWindow();}});
+  await flush();assert.ok(html.includes('Your session lasts 7 days from sign-in'));assert.equal(html.includes('Your session lasts 12 hours'),false);
+  assert.equal(popupClick(page,{ctrlKey:true}),false);assert.equal(opens,0);
+  assert.equal(new URL(page.get('#google-sign-in').href,'https://hub.test').searchParams.has('popup'),false);
 });
 
 (async()=>{for(const t of tests){try{await t.fn();passed++;process.stdout.write('PASS '+t.name+'\n');}catch(error){failed++;process.stdout.write('FAIL '+t.name+'\n  '+error.stack+'\n');}}process.stdout.write(`\n${passed} passed; ${failed} failed.\n`);process.exitCode=failed?1:0;})();
