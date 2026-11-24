@@ -40,7 +40,8 @@ The configured default destination is the [Pipeline tab of the designated source
 - [Daily n8n workflow and scheduling setup](n8n/README.md)
 - [Google sign-in for the hosted Hub: Google Cloud and Render setup](docs/google-hub-sign-in.md)
 
-The hosted Hub can use approved Bianca Google Workspace accounts with 12-hour absolute sessions.
+The hosted Hub can use approved Bianca Google Workspace accounts with popup sign-in and 7-day absolute sessions.
+The Hub stays open during sign-in; a full-page fallback is available when popups are blocked.
 Google sign-in is opt-in: apply the separate `--hub-auth` migration and configure the account allowlist
 before enabling `HUB_GOOGLE_AUTH_ENABLED` in Render. The review connector keeps its individual bearer
 credentials, and scheduled n8n requests keep their ingest credential.
