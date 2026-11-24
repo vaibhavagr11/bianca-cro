@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import logging
+import re
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -20,7 +21,7 @@ from psycopg import OperationalError
 from pydantic import SecretStr
 
 from app import hub_auth, review_api
-from app.config import settings
+from app.config import Settings, settings
 from app.main import app
 
 ORIGIN = "https://hub.example.com"
@@ -39,7 +40,7 @@ def config(monkeypatch):
     monkeypatch.setattr(settings, "hub_google_client_secret", SecretStr("client-secret"))
     monkeypatch.setattr(settings, "hub_google_domain", "bianca-ai.com")
     monkeypatch.setattr(settings, "hub_google_users", {EMAIL: "RG"})
-    monkeypatch.setattr(settings, "hub_session_hours", 12)
+    monkeypatch.setattr(settings, "hub_session_hours", 168)
     monkeypatch.setattr(settings, "public_base_url", ORIGIN)
     monkeypatch.setattr(settings, "review_tokens", {"RG": SecretStr(BEARER)})
     # If a test misses a DB boundary, fail rather than accidentally connecting.
@@ -55,7 +56,7 @@ def client():
 @pytest.fixture
 def active_session(monkeypatch, client):
     current = {"google_sub": "google-user-1", "email": EMAIL, "actor": "RG",
-               "expires_at": datetime.now(timezone.utc) + timedelta(hours=12)}
+               "expires_at": datetime.now(timezone.utc) + timedelta(days=7)}
     monkeypatch.setattr(hub_auth, "_read_session", lambda token: current if token == COOKIE else None)
     client.cookies.set(hub_auth.SESSION_COOKIE, COOKIE)
     return current
@@ -67,6 +68,10 @@ def test_disabled_mode_keeps_old_browser_and_mcp_credentials(monkeypatch, client
     assert client.get("/auth/session").json() == {"mode": "token", "authenticated": False}
     assert client.get("/review/workspace", headers={"Authorization": "Bearer " + BEARER}).json()["viewer"] == "RG"
     assert client.get("/auth/google/login").status_code == 404
+
+
+def test_default_session_lifetime_is_seven_days():
+    assert Settings.model_fields["hub_session_hours"].default == 7 * 24
 
 
 def test_google_mode_never_accepts_browser_bearer_but_mcp_still_does(client):
@@ -110,7 +115,7 @@ def test_removed_mapping_revokes_existing_session(monkeypatch, client, active_se
     result = client.get("/auth/session")
     assert result.json() == {"mode": "google", "authenticated": False}
     assert revoked == [COOKIE]
-    assert "Max-Age=0" in result.headers["set-cookie"]
+    assert "set-cookie" not in result.headers
 
 
 def test_expired_or_revoked_session_denied(monkeypatch, client):
@@ -267,7 +272,7 @@ def test_successful_callback_exchanges_code_and_preserves_deep_link(monkeypatch,
     assert calls[0] == ("google-code", hub_auth._proof(BROWSER, "pkce:" + STATE), ORIGIN)
     assert calls[1][0] == "workspace" and calls[1][1]["actor"] == "RG"
     cookie = response.headers.get_list("set-cookie")[0]
-    assert all(part in cookie for part in ("Secure", "HttpOnly", "SameSite=lax", "Path=/", "Max-Age=43200"))
+    assert all(part in cookie for part in ("Secure", "HttpOnly", "SameSite=lax", "Path=/", "Max-Age=604800"))
     assert "Domain=" not in cookie
     # An already consumed callback cannot replay even with its old browser cookie.
     client.cookies.set(hub_auth.STATE_COOKIE, BROWSER)
@@ -338,7 +343,7 @@ def test_session_storage_hashes_secret_and_uses_absolute_expiry(monkeypatch):
     connect_fake(monkeypatch, conn)
     hub_auth._create_session("workspace", {"google_sub": "sub", "email": EMAIL, "actor": "RG"}, COOKIE, BROWSER)
     inserts = [(query, args) for query, args in conn.calls if "insert into hub_sessions" in query]
-    assert inserts[0][1] == (hashlib.sha256(COOKIE.encode()).hexdigest(), "workspace", "sub", 12)
+    assert inserts[0][1] == (hashlib.sha256(COOKIE.encode()).hexdigest(), "workspace", "sub", 168)
     assert "now() + %s * interval '1 hour'" in inserts[0][0]
     assert not any(COOKIE in args or BROWSER in args for _, args in conn.calls)
 
@@ -374,3 +379,105 @@ def test_uvicorn_access_log_redacts_oauth_callback_query():
     unrelated = logger.makeRecord("uvicorn.access", logging.INFO, "", 1, '%s - "%s %s HTTP/%s" %d',
                                   ("127.0.0.1", "GET", "/health", "1.1", 200), None)
     assert logger.filter(unrelated) and "/health" in unrelated.getMessage()
+
+
+def test_popup_login_mode_is_bound_to_state_and_uses_existing_callback(monkeypatch, client):
+    calls = []
+    monkeypatch.setattr(hub_auth, "_new_state", lambda *args: calls.append(args))
+    response = client.get("/auth/google/login?popup=1&return_to=/review/app?tab=daily-brief")
+    query = parse_qs(urlsplit(response.headers["location"]).query)
+    state, browser, target = calls[0]
+    assert state.startswith("p.") and len(state) == 45
+    assert query["state"] == [state]
+    assert query["nonce"] == [hub_auth._proof(browser, "nonce:" + state)]
+    assert query["redirect_uri"] == [ORIGIN + "/auth/google/callback"]
+    assert target == "/review/app?tab=daily-brief"
+
+
+def test_popup_callback_removes_google_secrets_before_completion(monkeypatch, client):
+    popup_state = "p." + STATE
+    path = "/review/app?tab=daily-brief&brief=" + str(uuid4())
+    client.cookies.set(hub_auth.STATE_COOKIE, BROWSER)
+    flows = {(popup_state, BROWSER): {"workspace_id": "workspace", "return_to": path}}
+    monkeypatch.setattr(hub_auth, "_consume_state", lambda state, browser: flows.pop((state, browser), None))
+    monkeypatch.setattr(hub_auth, "_exchange_code", lambda *_: "secret-id-token")
+    monkeypatch.setattr(hub_auth, "_verify_identity", lambda *_: {"google_sub": "sub", "email": EMAIL, "actor": "RG"})
+    created = []
+    monkeypatch.setattr(hub_auth, "_create_session", lambda *args: created.append(args))
+    response = client.get("/auth/google/callback", params={"state": popup_state, "code": "private-google-code"})
+    destination = urlsplit(response.headers["location"])
+    query = parse_qs(destination.query)
+    assert response.status_code == 303 and destination.path == "/auth/google/complete"
+    assert query == {"success": ["1"], "return_to": [path]}
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert "Max-Age=604800" in response.headers.get_list("set-cookie")[0]
+    assert len(created) == 1
+    complete = client.get(response.headers["location"])
+    assert complete.status_code == 200
+    assert all(secret not in complete.text for secret in (popup_state, "private-google-code", "secret-id-token", created[0][2]))
+    client.cookies.set(hub_auth.STATE_COOKIE, BROWSER)
+    replay = client.get("/auth/google/callback", params={"state": popup_state, "code": "private-google-code"})
+    assert parse_qs(urlsplit(replay.headers["location"]).query)["error"] == ["invalid_state"]
+
+
+@pytest.mark.parametrize("state", ["p." + STATE, "p.malformed"])
+def test_popup_invalid_state_still_signals_safe_failure_without_exchange(client, state):
+    response = client.get("/auth/google/callback", params={"state": state, "code": "private-google-code"})
+    destination = urlsplit(response.headers["location"])
+    assert destination.path == "/auth/google/complete"
+    assert parse_qs(destination.query) == {"success": ["0"], "return_to": ["/review/app"], "error": ["invalid_state"]}
+
+
+def test_popup_cancelled_login_preserves_deep_link_and_has_no_session_cookie(monkeypatch, client):
+    path = "/review/app?tab=daily-brief&brief=" + str(uuid4())
+    client.cookies.set(hub_auth.STATE_COOKIE, BROWSER)
+    monkeypatch.setattr(hub_auth, "_consume_state", lambda *_: {"workspace_id": "workspace", "return_to": path})
+    response = client.get("/auth/google/callback", params={"state": "p." + STATE, "error": "private-provider-error"})
+    assert parse_qs(urlsplit(response.headers["location"]).query) == {
+        "success": ["0"], "return_to": [path], "error": ["cancelled"],
+    }
+    assert all(not cookie.startswith(hub_auth.SESSION_COOKIE + "=") for cookie in response.headers.get_list("set-cookie"))
+    page = client.get(response.headers["location"])
+    assert 'data-error="cancelled"' in page.text and "auth_error=cancelled" in page.text
+    assert "private-provider-error" not in page.text
+
+
+def test_popup_completion_has_exact_script_csp_and_no_token_payload(client):
+    page = client.get("/auth/google/complete?success=1&return_to=/review/app?tab=daily-brief")
+    script = re.search(r"<script>(.*?)</script>", page.text, re.S).group(1)
+    digest = base64.b64encode(hashlib.sha256(script.encode()).digest()).decode()
+    csp = page.headers["content-security-policy"]
+    assert "default-src 'none'" in csp and "'sha256-" + digest + "'" in csp
+    assert "'unsafe-inline'" not in csp and "frame-ancestors 'none'" in csp
+    assert page.headers["cross-origin-opener-policy"] == "same-origin-allow-popups"
+    assert page.headers["referrer-policy"] == "no-referrer" and page.headers["cache-control"] == "no-store"
+    assert "postMessage(message, window.location.origin)" in script and "window.close()" in script
+    assert "window.location.replace(destination)" in script
+    assert "token" not in script and "google_sub" not in page.text
+    assert client.get("/review/app").headers["cross-origin-opener-policy"] == page.headers["cross-origin-opener-policy"]
+
+
+def test_popup_completion_escapes_deep_link_and_rejects_external_fallback(client):
+    hostile = '/review/app?x="><script>alert(1)</script>'
+    page = client.get("/auth/google/complete", params={"success": "1", "return_to": hostile})
+    assert page.text.count("<script>") == 1 and "&lt;script&gt;" in page.text
+    external = client.get("/auth/google/complete", params={"success": "1", "return_to": "https://evil.example"})
+    assert 'href="/review/app"' in external.text and "evil.example" not in external.text
+    error = client.get("/auth/google/complete", params={"error": '"><script>alert(1)</script>'})
+    assert 'data-error="unavailable"' in error.text and "alert(1)" not in error.text
+
+
+def test_forged_popup_success_page_does_not_authenticate(client):
+    assert client.get("/auth/google/complete?success=1").status_code == 200
+    assert client.get("/auth/session").json() == {"mode": "google", "authenticated": False}
+    assert client.get("/review/workspace").status_code == 401
+
+
+def test_unauthenticated_session_probe_cannot_erase_new_popup_login_cookie(monkeypatch, client):
+    # Both a probe sent before login and one carrying a stale cookie can finish
+    # after the callback rotates the browser cookie. Neither response may delete it.
+    assert "set-cookie" not in client.get("/auth/session").headers
+    client.cookies.set(hub_auth.SESSION_COOKIE, COOKIE)
+    monkeypatch.setattr(hub_auth, "_read_session", lambda _: None)
+    stale = client.get("/auth/session")
+    assert stale.json()["authenticated"] is False and "set-cookie" not in stale.headers
