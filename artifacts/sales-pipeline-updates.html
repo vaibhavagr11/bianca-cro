@@ -153,7 +153,7 @@ body[data-theme=focus] .company-title{font-size:18px}
 <div class="eyebrow">Commercial intelligence</div>
 <div class="page-heading"><div><h1 id="workspace-title">Sales Pipeline Updates</h1><p class="intro" id="workspace-intro">Review what changed, keep your next steps current.</p></div><span class="demo-badge" id="connection-status">Connection needed</span></div>
 <div class="demo-caption"><span id="workspace-help">Approve or edit to update Pipeline Next Steps.</span><div class="connection-actions"><span id="account-status" class="account-status" hidden></span><button class="text-control" id="refresh-updates" type="button">Refresh updates</button><button class="text-control" id="disconnect" type="button">Disconnect</button></div></div>
-<section class="connection-panel" id="connection-panel" aria-labelledby="connection-title"><h2 id="connection-title">Connect your Bianca workspace</h2><p id="connector-sign-in-help">In Claude, connect <strong>Bianca Review</strong>, allow this artifact to use it, then refresh.</p><div id="google-sign-in-panel" hidden><p>Use your approved Bianca Google account to open the War Room Hub.</p><a class="google-sign-in" id="google-sign-in" href="/auth/google/login">Continue with Google</a><p class="field-help">Your session lasts 12 hours from sign-in, including when you close and reopen this page.</p></div><button id="auth-retry" class="text-control" type="button" hidden>Try sign-in again</button><form id="sign-in-form" hidden><label for="access-token">Workspace access token</label><div class="sign-in-controls"><input id="access-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Enter your access token" required><button class="primary" type="submit">Connect</button></div><p class="field-help">On this hosted Bianca page, your access token stays in memory until you disconnect or close it.</p></form><p class="validation" id="connection-error" role="alert" hidden></p></section>
+<section class="connection-panel" id="connection-panel" aria-labelledby="connection-title"><h2 id="connection-title">Connect your Bianca workspace</h2><p id="connector-sign-in-help">In Claude, connect <strong>Bianca Review</strong>, allow this artifact to use it, then refresh.</p><div id="google-sign-in-panel" hidden><p>Use your approved Bianca Google account to open the War Room Hub. Google sign-in opens in a separate window.</p><a class="google-sign-in" id="google-sign-in" href="/auth/google/login">Continue with Google</a><p><a id="google-sign-in-fallback" class="text-control" href="/auth/google/login" hidden>Continue in this tab instead</a></p><p class="field-help">Your session lasts 7 days from sign-in, including when you close and reopen this page.</p></div><button id="auth-retry" class="text-control" type="button" hidden>Try sign-in again</button><form id="sign-in-form" hidden><label for="access-token">Workspace access token</label><div class="sign-in-controls"><input id="access-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Enter your access token" required><button class="primary" type="submit">Connect</button></div><p class="field-help">On this hosted Bianca page, your access token stays in memory until you disconnect or close it.</p></form><p class="validation" id="connection-error" role="alert" hidden></p></section>
 <section id="pipeline-workspace-panel" role="tabpanel" aria-labelledby="pipeline-workspace-tab">
 <p class="sync-notice" id="mirror-sync-notice" role="status" hidden></p>
 <div class="tabbar" id="pipeline-tabs" role="tablist" aria-label="Pipeline review views">
@@ -543,6 +543,7 @@ const BiancaWarRoom = (() => {
   let requestedBrief=workspaceTab==='daily-brief'?initialQuery.get('brief'):null,briefRequest=0,briefLoaded=false,briefLoading=false,liveTransport=null;
   let client=null,token='',editingId=null,editingRevision=null,toastTimer,loaded=false,refreshing=false,session=0;
   let authMode='unknown',authSession=null,authCheck=0,expiryTimer=null,authReady=Promise.resolve(),signingOut=false;
+  let loginPopup=null,popupTimer=null;
   let state={proposals:[],rows:[],activity:[]};
   const mirrorPending=new Map();
   // Cards with a decision on its way to the service: id -> 'approve' | 'ignore'. Drawn by paintSaving, also after a re-render.
@@ -588,7 +589,8 @@ const BiancaWarRoom = (() => {
     const query=new URLSearchParams();
     if(workspaceTab==='daily-brief'){query.set('tab','daily-brief');if(requestedBrief)query.set('brief',requestedBrief);}
     const returnTo='/review/app'+(query.toString()?'?'+query.toString():'');
-    $('#google-sign-in').href='/auth/google/login?return_to='+encodeURIComponent(returnTo);
+    const loginUrl='/auth/google/login?return_to='+encodeURIComponent(returnTo);
+    $('#google-sign-in').href=loginUrl;$('#google-sign-in-fallback').href=loginUrl;
   }
   function paintAuth(){
     $('#connector-sign-in-help').hidden=hosted;
@@ -596,10 +598,11 @@ const BiancaWarRoom = (() => {
     $('#google-sign-in-panel').hidden=!hosted||authMode!=='google'||Boolean(authSession)||signingOut;
     $('#auth-retry').hidden=!hosted||authMode!=='unavailable';
     $('#account-status').hidden=!authSession;
-    setText('#account-status',authSession?authSession.email+' · Sign-in expires '+new Date(authSession.expires_at).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'}):'');
+    setText('#account-status',authSession?authSession.email+' · Sign-in expires '+new Date(authSession.expires_at).toLocaleString([],{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}):'');
     setText('#disconnect',hosted&&authMode==='google'?'Sign out':'Disconnect');
     $('#disconnect').hidden=hosted&&authMode!=='token'&&!authSession;
     $('#disconnect').disabled=signingOut;
+    setText('#google-sign-in',loginPopup&&!loginPopup.closed?'Return to Google sign-in':'Continue with Google');
     updateLoginLink();
   }
   function clearWorkspace(){
@@ -625,6 +628,72 @@ const BiancaWarRoom = (() => {
     // The server enforces the absolute deadline; this timer also clears an idle page.
     expiryTimer=setTimeout(expireSession,Math.min(remaining,2147483647));
   }
+  function loginErrorMessage(reason){
+    const messages={cancelled:'Google sign-in was cancelled. Try again when you’re ready.',not_allowed:'This Google account is not approved for the Hub. Choose your Bianca account.',identity_mismatch:'This account needs to be confirmed by your Hub administrator.',unavailable:'Google sign-in is temporarily unavailable. Please try again.',invalid_identity:'Google could not verify this sign-in. Please try again.',invalid_state:'This sign-in attempt expired. Please try again.'};
+    return messages[reason]||'Google sign-in could not be completed. Please try again.';
+  }
+  function stopGooglePopup(close=false){
+    clearTimeout(popupTimer);popupTimer=null;
+    const attempt=loginPopup;loginPopup=null;
+    if(close&&attempt){try{attempt.window.close();}catch(_){}}
+  }
+  async function checkPopupResult(attempt,reason){
+    if(loginPopup!==attempt)return;
+    if(attempt.checking){if(reason!=='focus')attempt.pendingReason=reason;return;}
+    attempt.checking=true;
+    try{
+      const response=await fetch('/auth/session',{headers:{Accept:'application/json'},credentials:'same-origin',cache:'no-store',redirect:'error'});
+      const data=response.ok?await response.json():null;
+      if(loginPopup!==attempt)return;
+      if(data?.mode==='google'&&data.authenticated===true){
+        stopGooglePopup(true);authReady=checkHostedSession();await authReady;
+      }else if(reason==='success'){
+        stopGooglePopup(true);paintAuth();connectionError('Sign-in could not be confirmed. Please try again.');
+      }else if(reason==='closed'){
+        // Some browsers sever the popup's opener while Google is open. Keep a
+        // focus-based recovery check available, but let the user start again.
+        paintAuth();connectionError('The Google window closed before sign-in was confirmed. If sign-in is still open, finish there and return here; otherwise try again.');
+      }
+    }catch(_){
+      if(loginPopup===attempt&&reason!=='focus'){
+        if(reason==='success')stopGooglePopup(true);
+        paintAuth();connectionError('Sign-in could not be confirmed. Please try again.');
+      }
+    }finally{
+      attempt.checking=false;
+      if(loginPopup===attempt&&attempt.pendingReason){const pending=attempt.pendingReason;attempt.pendingReason=null;checkPopupResult(attempt,pending);}
+    }
+  }
+  function watchGooglePopup(attempt){
+    if(loginPopup!==attempt)return;
+    if(Date.now()-attempt.startedAt>=10*60*1000){stopGooglePopup(true);paintAuth();connectionError('This Google sign-in attempt expired. Please try again.');return;}
+    let closed=false;try{closed=attempt.window.closed;}catch(_){}
+    if(closed){attempt.closed=true;paintAuth();checkPopupResult(attempt,'closed');return;}
+    popupTimer=setTimeout(()=>watchGooglePopup(attempt),500);
+  }
+  function beginGoogleLogin(event){
+    // A normal click opens the window synchronously so browsers retain the user
+    // gesture. Modified link clicks keep the native new-tab/redirect behavior.
+    if(event.metaKey||event.ctrlKey||event.shiftKey||event.altKey||event.button>0)return;
+    event.preventDefault();
+    if(!hosted||authMode!=='google'||authSession||signingOut)return;
+    if(loginPopup&&!loginPopup.closed){
+      try{if(!loginPopup.window.closed){loginPopup.window.focus();return;}}catch(_){}
+    }
+    stopGooglePopup(true);$('#google-sign-in-fallback').hidden=true;updateLoginLink();
+    const popupUrl=new URL($('#google-sign-in').href,location.href);popupUrl.searchParams.set('popup','1');
+    let popup=null;
+    try{popup=window.open(popupUrl.href,'bianca-google-sign-in-'+crypto.randomUUID(),'popup=yes,width=500,height=650,resizable=yes,scrollbars=yes');}catch(_){}
+    if(!popup){
+      $('#google-sign-in-fallback').hidden=false;
+      connectionError('Your browser blocked the sign-in window. Allow pop-ups and try again, or continue in this tab.');return;
+    }
+    loginPopup={window:popup,startedAt:Date.now(),closed:false,checking:false,pendingReason:null};
+    paintAuth();$('#connection-error').hidden=true;setText('#connection-status','Waiting for Google sign-in');
+    announce('Complete sign-in in the Google window. Your Hub will open here when it is ready.');
+    try{popup.focus();}catch(_){}
+    watchGooglePopup(loginPopup);
+  }
   async function checkHostedSession(){
     if(!hosted||signingOut)return;
     const check=++authCheck;authMode='checking';paintAuth();
@@ -638,6 +707,7 @@ const BiancaWarRoom = (() => {
       authMode=data.mode;
       if(data.mode==='google'&&data.authenticated){
         if(!['RG','NC','NDL','MG'].includes(data.actor)||typeof data.email!=='string'||!data.email||typeof data.csrf_token!=='string'||!data.csrf_token||typeof data.expires_at!=='string'||!Number.isFinite(Date.parse(data.expires_at)))throw Error('Invalid session');
+        stopGooglePopup(true);$('#google-sign-in-fallback').hidden=true;
         authSession={actor:data.actor,email:data.email,csrf_token:data.csrf_token,expires_at:data.expires_at};
         if(Date.parse(data.expires_at)<=Date.now()){expireSession();return;}
         const authenticatedSession=authSession;
@@ -652,8 +722,7 @@ const BiancaWarRoom = (() => {
         authSession=null;paintAuth();setText('#connection-status','Connection needed');
         const reason=initialQuery.get('auth_error');
         if(reason){
-          const messages={cancelled:'Google sign-in was cancelled. Try again when you’re ready.',not_allowed:'This Google account is not approved for the Hub. Choose your Bianca account.',identity_mismatch:'This account needs to be confirmed by your Hub administrator.',unavailable:'Google sign-in is temporarily unavailable. Please try again.',invalid_identity:'Google could not verify this sign-in. Please try again.',invalid_state:'This sign-in attempt expired. Please try again.'};
-          connectionError(messages[reason]||'Google sign-in could not be completed. Please try again.');
+          connectionError(loginErrorMessage(reason));
           initialQuery.delete('auth_error');const url=new URL(location.href);url.searchParams.delete('auth_error');window.history.replaceState(null,'',url);
         }
       }
@@ -898,6 +967,7 @@ ${traceNote?`<p class="approval-note trace-note" role="status">${esc(traceNote)}
   paintAuth();
   $('#sign-in-form').addEventListener('submit',async event=>{event.preventDefault();const supplied=$('#access-token').value.trim();$('#access-token').value='';await authReady;if(!hosted||authMode!=='token')return;token=supplied;if(!token){connectionError('Enter your workspace access token.');return;}attach(BiancaLive.restTransport(fetch.bind(window),()=>token));await refresh();});
   $('#auth-retry').onclick=()=>{authReady=checkHostedSession();return authReady;};
+  $('#google-sign-in').onclick=beginGoogleLogin;
   $('#disconnect').onclick=disconnect;
   $('#company-search').addEventListener('input',()=>{render();announce($('#results-count').textContent);});$('#owner-filter').addEventListener('change',()=>{render();announce($('#results-count').textContent);});
   function bindTabs(selector,select){
@@ -908,9 +978,18 @@ ${traceNote?`<p class="approval-note trace-note" role="status">${esc(traceNote)}
   bindTabs('#workspace-tabs [role=tab]',setWorkspace);
   $('.brand').onclick=event=>{event.preventDefault();setWorkspace('pipeline-workspace-tab',true);setTab('review-tab');window.scrollTo({top:0,behavior:'smooth'});};
   window.addEventListener('bianca:connector-ready',()=>{if(hosted)return;authSession=null;clearWorkspace();refresh();});
-  window.addEventListener('pagehide',()=>{signingOut=false;authSession=null;clearWorkspace();if(hosted)authMode='unknown';paintAuth();});
+  window.addEventListener('pagehide',()=>{stopGooglePopup(true);signingOut=false;authSession=null;clearWorkspace();if(hosted)authMode='unknown';paintAuth();});
   window.addEventListener('pageshow',event=>{if(event.persisted){if(hosted)authReady=checkHostedSession();else if(window.biancaConnector?.callTool)refresh();}});
-  document.addEventListener('visibilitychange',()=>{if(!document.hidden&&authSession)armExpiry();});
+  window.addEventListener('message',event=>{
+    const attempt=loginPopup;
+    if(!attempt||event.origin!==location.origin||event.source!==attempt.window)return;
+    const data=event.data;
+    if(!data||data.type!=='bianca-hub-auth-complete'||typeof data.success!=='boolean')return;
+    if(data.success)checkPopupResult(attempt,'success');
+    else{stopGooglePopup(true);paintAuth();connectionError(loginErrorMessage(data.error));}
+  });
+  window.addEventListener('focus',()=>{if(loginPopup)checkPopupResult(loginPopup,'focus');});
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden){if(authSession)armExpiry();if(loginPopup)checkPopupResult(loginPopup,'focus');}});
   setWorkspace(workspaceTab==='daily-brief'?'daily-brief-tab':'pipeline-workspace-tab',false,false);
   render();if(hosted)authReady=checkHostedSession();else if(window.biancaConnector?.callTool)refresh();
 })();
