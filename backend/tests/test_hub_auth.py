@@ -2,8 +2,11 @@
 
 import base64
 import hashlib
+import json
 import logging
 import re
+import shutil
+import subprocess
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -481,3 +484,48 @@ def test_unauthenticated_session_probe_cannot_erase_new_popup_login_cookie(monke
     monkeypatch.setattr(hub_auth, "_read_session", lambda _: None)
     stale = client.get("/auth/session")
     assert stale.json()["authenticated"] is False and "set-cookie" not in stale.headers
+
+
+@pytest.mark.parametrize("opener_mode", ["absent", "closed", "throws", "available"])
+def test_popup_script_always_attempts_close_even_when_provider_severs_opener(opener_mode):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is needed to execute the popup completion script")
+    # Run the actual rendered script against window doubles. This exercises the
+    # missing-opener behavior observed after real cross-origin provider navigation.
+    harness = r"""
+const {script, mode} = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const events = [], timers = [];
+const opener = mode === 'absent' ? null : {
+  closed: mode === 'closed',
+  postMessage(message, origin) {
+    if (mode === 'throws') throw new Error('opener inaccessible');
+    events.push(['message', message, origin]);
+  }
+};
+const window = {
+  opener,
+  location: {origin: 'https://hub.example.com', replace: path => events.push(['redirect', path])},
+  close: () => events.push(['close']),
+  setTimeout: (callback, delay) => timers.push({callback, delay})
+};
+const document = {
+  body: {dataset: {success: 'true', error: ''}},
+  getElementById: () => ({getAttribute: () => '/review/app?tab=daily-brief'})
+};
+require('vm').runInNewContext(script, {window, document});
+const immediate = events.slice();
+timers.forEach(timer => timer.callback());
+process.stdout.write(JSON.stringify({immediate, events, delays: timers.map(timer => timer.delay)}));
+"""
+    completed = subprocess.run([node, "-e", harness], input=json.dumps({"script": hub_auth.POPUP_SCRIPT, "mode": opener_mode}),
+                               text=True, capture_output=True, check=True)
+    result = json.loads(completed.stdout)
+    assert ["close"] in result["immediate"]
+    assert not any(event[0] == "redirect" for event in result["immediate"])
+    assert result["delays"] == [150]
+    assert result["events"][-1] == ["redirect", "/review/app?tab=daily-brief"]
+    messages = [event for event in result["immediate"] if event[0] == "message"]
+    assert bool(messages) is (opener_mode == "available")
+    if messages:
+        assert messages[0][1:] == [{"type": "bianca-hub-auth-complete", "success": True}, "https://hub.example.com"]
