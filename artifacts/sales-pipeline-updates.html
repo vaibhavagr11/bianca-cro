@@ -153,7 +153,7 @@ body[data-theme=focus] .company-title{font-size:18px}
 <div class="eyebrow">Commercial intelligence</div>
 <div class="page-heading"><div><h1 id="workspace-title">Sales Pipeline Updates</h1><p class="intro" id="workspace-intro">Review what changed, keep your next steps current.</p></div><span class="demo-badge" id="connection-status">Connection needed</span></div>
 <div class="demo-caption"><span id="workspace-help">Approve or edit to update Pipeline Next Steps.</span><div class="connection-actions"><span id="account-status" class="account-status" hidden></span><button class="text-control" id="refresh-updates" type="button">Refresh updates</button><button class="text-control" id="disconnect" type="button">Disconnect</button></div></div>
-<section class="connection-panel" id="connection-panel" aria-labelledby="connection-title"><h2 id="connection-title">Connect your Bianca workspace</h2><p id="connector-sign-in-help">In Claude, connect <strong>Bianca Review</strong>, allow this artifact to use it, then refresh.</p><div id="google-sign-in-panel" hidden><p>Use your approved Bianca Google account to open the War Room Hub. Google sign-in opens in a separate window.</p><a class="google-sign-in" id="google-sign-in" href="/auth/google/login">Continue with Google</a><p><a id="google-sign-in-fallback" class="text-control" href="/auth/google/login" hidden>Continue in this tab instead</a></p><p class="field-help">Your session lasts 7 days from sign-in, including when you close and reopen this page.</p></div><button id="auth-retry" class="text-control" type="button" hidden>Try sign-in again</button><form id="sign-in-form" hidden><label for="access-token">Workspace access token</label><div class="sign-in-controls"><input id="access-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Enter your access token" required><button class="primary" type="submit">Connect</button></div><p class="field-help">On this hosted Bianca page, your access token stays in memory until you disconnect or close it.</p></form><p class="validation" id="connection-error" role="alert" hidden></p></section>
+<section class="connection-panel" id="connection-panel" aria-labelledby="connection-title"><h2 id="connection-title">Connect your Bianca workspace</h2><p id="connector-sign-in-help">In Claude, connect <strong>Bianca Review</strong>, allow this artifact to use it, then refresh.</p><div id="google-sign-in-panel" hidden><p>Use your approved Bianca Google account to open the War Room Hub. Google sign-in opens in a separate window.</p><a class="google-sign-in" id="google-sign-in" href="/auth/google/login">Continue with Google</a><p id="google-popup-status" role="status" hidden></p><p><a id="google-sign-in-fallback" class="text-control" href="/auth/google/login" hidden>Continue in this tab instead</a></p><p class="field-help">Your session lasts 7 days from sign-in, including when you close and reopen this page.</p></div><button id="auth-retry" class="text-control" type="button" hidden>Try sign-in again</button><form id="sign-in-form" hidden><label for="access-token">Workspace access token</label><div class="sign-in-controls"><input id="access-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Enter your access token" required><button class="primary" type="submit">Connect</button></div><p class="field-help">On this hosted Bianca page, your access token stays in memory until you disconnect or close it.</p></form><p class="validation" id="connection-error" role="alert" hidden></p></section>
 <section id="pipeline-workspace-panel" role="tabpanel" aria-labelledby="pipeline-workspace-tab">
 <p class="sync-notice" id="mirror-sync-notice" role="status" hidden></p>
 <div class="tabbar" id="pipeline-tabs" role="tablist" aria-label="Pipeline review views">
@@ -603,6 +603,8 @@ const BiancaWarRoom = (() => {
     $('#disconnect').hidden=hosted&&authMode!=='token'&&!authSession;
     $('#disconnect').disabled=signingOut;
     setText('#google-sign-in',loginPopup&&!loginPopup.closed?'Return to Google sign-in':'Continue with Google');
+    $('#google-popup-status').hidden=!loginPopup;
+    setText('#google-popup-status',loginPopup?(loginPopup.closed?'Finish sign-in in the Google window. If you closed it, choose Continue with Google to try again.':'Complete sign-in in the Google window. This page will open your workspace automatically.'):'');
     updateLoginLink();
   }
   function clearWorkspace(){
@@ -639,7 +641,7 @@ const BiancaWarRoom = (() => {
   }
   async function checkPopupResult(attempt,reason){
     if(loginPopup!==attempt)return;
-    if(attempt.checking){if(reason!=='focus')attempt.pendingReason=reason;return;}
+    if(attempt.checking){if(reason==='success')attempt.pendingReason=reason;return;}
     attempt.checking=true;
     try{
       const response=await fetch('/auth/session',{headers:{Accept:'application/json'},credentials:'same-origin',cache:'no-store',redirect:'error'});
@@ -649,13 +651,9 @@ const BiancaWarRoom = (() => {
         stopGooglePopup(true);authReady=checkHostedSession();await authReady;
       }else if(reason==='success'){
         stopGooglePopup(true);paintAuth();connectionError('Sign-in could not be confirmed. Please try again.');
-      }else if(reason==='closed'){
-        // Some browsers sever the popup's opener while Google is open. Keep a
-        // focus-based recovery check available, but let the user start again.
-        paintAuth();connectionError('The Google window closed before sign-in was confirmed. If sign-in is still open, finish there and return here; otherwise try again.');
       }
     }catch(_){
-      if(loginPopup===attempt&&reason!=='focus'){
+      if(loginPopup===attempt&&reason==='success'){
         if(reason==='success')stopGooglePopup(true);
         paintAuth();connectionError('Sign-in could not be confirmed. Please try again.');
       }
@@ -664,12 +662,16 @@ const BiancaWarRoom = (() => {
       if(loginPopup===attempt&&attempt.pendingReason){const pending=attempt.pendingReason;attempt.pendingReason=null;checkPopupResult(attempt,pending);}
     }
   }
-  function watchGooglePopup(attempt){
+  function watchGooglePopup(attempt,probe=true){
     if(loginPopup!==attempt)return;
     if(Date.now()-attempt.startedAt>=10*60*1000){stopGooglePopup(true);paintAuth();connectionError('This Google sign-in attempt expired. Please try again.');return;}
     let closed=false;try{closed=attempt.window.closed;}catch(_){}
-    if(closed){attempt.closed=true;paintAuth();checkPopupResult(attempt,'closed');return;}
-    popupTimer=setTimeout(()=>watchGooglePopup(attempt),500);
+    if(closed&&!attempt.closed){attempt.closed=true;paintAuth();}
+    // Browser isolation can report a closed handle while Google is still open.
+    // Poll only our server session, at most once per two seconds for ten minutes;
+    // neither a popup message nor its window state grants access.
+    if(probe)checkPopupResult(attempt,'poll');
+    popupTimer=setTimeout(()=>watchGooglePopup(attempt),2000);
   }
   function beginGoogleLogin(event){
     // A normal click opens the window synchronously so browsers retain the user
@@ -692,7 +694,7 @@ const BiancaWarRoom = (() => {
     paintAuth();$('#connection-error').hidden=true;setText('#connection-status','Waiting for Google sign-in');
     announce('Complete sign-in in the Google window. Your Hub will open here when it is ready.');
     try{popup.focus();}catch(_){}
-    watchGooglePopup(loginPopup);
+    watchGooglePopup(loginPopup,false);
   }
   async function checkHostedSession(){
     if(!hosted||signingOut)return;
