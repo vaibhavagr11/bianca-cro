@@ -73,6 +73,7 @@ dependencies = [
     { name = "anthropic" },
     { name = "fastapi" },
     { name = "google-auth" },
+    { name = "httpx" },
     { name = "mcp" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pydantic-settings" },
@@ -82,7 +83,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "pytest" },
 ]
 
@@ -91,6 +91,7 @@ requires-dist = [
     { name = "anthropic", specifier = ">=2.1.0" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "google-auth", specifier = ">=2.38" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "mcp", specifier = "==2.3.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pydantic-settings", specifier = ">=2.4" },
@@ -99,10 +100,7 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-dev = [
-    { name = "httpx", specifier = ">=0.27" },
-    { name = "pytest", specifier = ">=8.3" },
-]
+dev = [{ name = "pytest", specifier = ">=8.3" }]
 
 [[package]]
 name = "certifi"
