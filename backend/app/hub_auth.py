@@ -23,13 +23,13 @@ from psycopg.rows import dict_row
 from app import db
 from app.config import settings
 from app.ingest import _workspace_id
+from app.review_identity import REVIEW_ACTORS as ACTORS
 
 router = APIRouter(prefix="/auth", tags=["Hub sign-in"])
 log = logging.getLogger("bianca_cro.hub_auth")
 SESSION_COOKIE = "__Host-bianca-hub"
 STATE_COOKIE = "__Host-bianca-hub-oauth"
 STATE_SECONDS = 600
-ACTORS = frozenset({"RG", "NC", "NDL", "MG"})
 AUTHORIZATION_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs"
@@ -40,7 +40,15 @@ _OAUTH_STATE = re.compile(r"^(?:p\.)?[A-Za-z0-9_-]{43}$")
 _DOMAIN = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 _EMAIL_LOCAL = re.compile(r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}$")
 NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "no-referrer"}
-AUTH_ERRORS = frozenset({"cancelled", "invalid_state", "not_allowed", "identity_mismatch", "unavailable", "invalid_identity"})
+AUTH_ERROR_MESSAGES = {
+    "cancelled": "Google sign-in was cancelled. Return to War Room to try again when you are ready.",
+    "invalid_state": "This sign-in attempt expired. Return to War Room and start a new Google sign-in.",
+    "not_allowed": "This Google account is not approved for the War Room Hub. Return to War Room and choose your approved Bianca account.",
+    "identity_mismatch": "This account needs to be confirmed by your Hub administrator before you can sign in.",
+    "unavailable": "Google sign-in is temporarily unavailable. Return to War Room and try again.",
+    "invalid_identity": "Google could not verify this sign-in. Return to War Room and try again with your Bianca account.",
+}
+AUTH_ERRORS = frozenset(AUTH_ERROR_MESSAGES)
 # This script is constant: all variable values are escaped HTML attributes, and
 # the CSP authorizes this exact script by hash. No Google code/token/state enters
 # the completion page. The opener always rechecks /auth/session for identity.
@@ -49,11 +57,16 @@ POPUP_SCRIPT = """(() => {
   const message = {type: 'bianca-hub-auth-complete', success: page.dataset.success === 'true'};
   if (page.dataset.error) message.error = page.dataset.error;
   const destination = document.getElementById('return-link').getAttribute('href');
+  let notified = false;
   try {
     if (window.opener && !window.opener.closed) {
       window.opener.postMessage(message, window.location.origin);
+      notified = true;
     }
   } catch (_) {}
+  // If isolation prevents the Hub receiving a denial, leave its explanation and
+  // return link visible here. Closing would silently discard the only error UI.
+  if (!message.success && !notified) return;
   // Provider navigation may sever opener while this remains a script-opened
   // window. Closing does not depend on the opener; the Hub polls its session.
   try { window.close(); } catch (_) {}
@@ -389,11 +402,13 @@ def google_complete(success: bool = False, error: str = "", return_to: str = "/r
                                           "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
                "Cross-Origin-Opener-Policy": "same-origin-allow-popups",
                "X-Content-Type-Options": "nosniff"}
+    title = "Returning to War Room" if success else "Google sign-in not completed"
+    message = "Returning to the War Room Hub…" if success else AUTH_ERROR_MESSAGES[safe_error]
     body = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
-            '<title>Returning to War Room</title></head>'
+            f'<title>{title}</title></head>'
             f'<body data-success="{str(success).lower()}" data-error="{safe_error if not success else ""}">'
-            '<p>Returning to the War Room Hub…</p>'
+            f'<h1>{title}</h1><p role="status">{html.escape(message)}</p>'
             f'<p><a id="return-link" href="{html.escape(destination, quote=True)}">Continue to War Room</a></p>'
             f'<script>{POPUP_SCRIPT}</script></body></html>')
     return HTMLResponse(body, headers=headers)
