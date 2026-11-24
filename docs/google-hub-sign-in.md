@@ -1,13 +1,14 @@
 # Google sign-in for the War Room Hub
 
-The Hub can authenticate approved Bianca team members with their Google Workspace accounts. Google verifies the account; the Hub maps it to the existing `RG`, `NC`, `NDL`, or `MG` reviewer and keeps the same reviewer permissions and attribution.
+The Hub can authenticate approved Bianca team members with their Google Workspace accounts. Google verifies the account; the Hub maps it to a reviewer identity for permissions and action attribution. The approved reviewers are `RG`, `NC`, `NDL`, `MG`, and Gibb's `GA`. The sales pipeline still has four owners: `RG`, `NC`, `NDL`, and `MG`; `GA` is a Hub reviewer, not an additional sales owner.
 
-This feature is off by default. Deploying the code does not enable Google sign-in until the database migration, Google OAuth client, and Render settings below are ready.
+This feature is off by default. Deploying the code does not enable Google sign-in until the database migrations, Google OAuth client, and Render settings below are ready.
 
 ## Sign-in and session behavior
 
 - **Continue with Google** opens a separate sign-in window so the Hub stays open at the selected tab or Daily Brief. The popup starts at `/auth/google/login?popup=1` and returns through `/auth/google/callback`.
-- The popup finishes at `/auth/google/complete`, notifies the original Hub tab, and closes. The Hub then checks `/auth/session` before showing company data; the popup message does not contain a Google token or session credential. A full-page sign-in fallback uses `/auth/google/login` without `popup=1`.
+- The popup finishes at `/auth/google/complete`. A successful sign-in notifies the original Hub tab when the browser permits it and attempts to close the window. The Hub checks `/auth/session` before showing company data; the popup message does not contain a Google token or session credential. During an active attempt, the Hub also checks its own session every two seconds for up to ten minutes, so a browser that disconnects the two windows can still finish sign-in.
+- If sign-in fails and the browser prevents the popup from notifying the Hub, the popup keeps the error explanation and a **Continue to War Room** link visible. It does not silently close. A full-page sign-in fallback uses `/auth/google/login` without `popup=1`.
 - The backend checks Google's identity token, verified email, Workspace domain, and the explicit `HUB_GOOGLE_USERS` mapping. Being in the company domain alone does not grant access.
 - The first successful sign-in binds the approved email and reviewer to Google's permanent account ID (`sub`). A different Google account cannot inherit access merely by receiving that email address later.
 - The browser receives an opaque, secure, HttpOnly session cookie. The database stores a hash of its value, not the usable cookie. No `SESSION_SECRET` is required.
@@ -48,11 +49,11 @@ uv run python -m scripts.migrate --hub-auth
 uv run python -m scripts.migrate --hub-auth --status
 ```
 
-Confirm `022_hub_google_auth.sql` is applied. It creates `hub_google_identities`, `hub_sessions`, and `hub_oauth_states`. The dedicated `--hub-auth` flag includes this otherwise optional migration. A fresh installation that also needs the existing War Room schema can combine `--hub-auth --sheet-review`.
+Confirm **`022_hub_google_auth.sql` and `023_hub_gibb_reviewer.sql`** are applied. Migration 022 creates `hub_google_identities`, `hub_sessions`, and `hub_oauth_states`; additive migration 023 permits the `GA` reviewer identity and attribution. It does not add a sales owner or move any assignments. The dedicated `--hub-auth` flag includes these otherwise optional migrations. A fresh installation that also needs the existing War Room schema can combine `--hub-auth --sheet-review`.
 
-The runner applies **all pending eligible migrations**, not only migration 022. Review the status output before applying it. Do not add `--seed` during this rollout.
+The runner applies **all pending eligible migrations**, not only the Hub authentication migrations. Review the status output before applying it. `--hub-auth` alone does not opt into optional Sheet-review migration 021; use `--sheet-review` only when that separate upgrade is intended. Do not add `--seed` during this rollout.
 
-Session and OAuth state records use the existing database. No new Render service, Redis instance, local disk, or session-signing secret is required. Database-backed state also lets the sign-in redirect finish after a request is routed to a different application instance. The popup flow uses the same tables; if migration 022 is already applied, the popup and 7-day session update needs no additional migration.
+Session and OAuth state records use the existing database. No new Render service, Redis instance, local disk, or session-signing secret is required. Database-backed state also lets the sign-in redirect finish after a request is routed to a different application instance. The popup flow and 7-day sessions use the same tables. If migration 022 is already applied, run the command above to apply additive migration 023 before enabling Gibb's `GA` mapping; do not replace or rerun migration 022 manually.
 
 ## 3. Configure the Render service
 
@@ -68,20 +69,21 @@ Select the existing `bianca-cro-api` web service in Render and open **Environmen
 | `HUB_SESSION_HOURS` | `168` (7 days), the absolute lifetime for new Hub sessions. Accepts whole hours from 1 to 168. Changing it does not extend already-issued sessions. |
 | `PUBLIC_BASE_URL` | `https://bianca-cro-api.onrender.com`, without a trailing path. The callback is derived from this canonical public address. |
 
-The initial team mapping follows the existing founder records and Matias onboarding. Confirm that Google returns these exact account emails during sign-in:
+The team mapping follows the existing founder records, Matias onboarding, and the explicitly approved Gibb account. Confirm that Google returns these exact account emails during sign-in:
 
 ```json
 {
   "ramiro.godfrid@bianca-ai.com": "RG",
   "nicolas.casaux@bianca-ai.com": "NC",
   "nicolas.deleon@bianca-ai.com": "NDL",
-  "matias.grinberg@bianca-ai.com": "MG"
+  "matias.grinberg@bianca-ai.com": "MG",
+  "gibb.anella@bianca-ai.com": "GA"
 }
 ```
 
-The Google Cloud setup administrator is not automatically a Hub reviewer. Add an administrator to this mapping only if that person is also explicitly assigned an existing reviewer role.
+Gibb is explicitly approved as reviewer `GA`. This grant does not add Gibb to sales-owner choices, move existing sales assignments, or assign Gibb another person's reviewer identity. Google Cloud administration alone does not grant Hub access to any other administrator.
 
-Add approved accounts using the exact Google account email returned by Google in lowercase and the correct `RG`, `NC`, `NDL`, or `MG` code. Each reviewer can be mapped only once. This assignment determines whose Hub permissions and action attribution the account receives. Do not substitute a mailing list, guessed address, or a second alias for an existing account.
+Add approved accounts using the exact Google account email returned by Google in lowercase and the correct `RG`, `NC`, `NDL`, `MG`, or `GA` reviewer code. Each reviewer can be mapped only once. This assignment determines whose Hub permissions and action attribution the account receives. Do not substitute a mailing list, guessed address, or a second alias for an existing account.
 
 The email suffix and Workspace hosted domain are separate checks. A Workspace account may use a secondary email domain while Google returns a different `hd` value. Confirm the actual hosted domain with the Workspace administrator; do not infer it from mailbox branding or from `@bianca-ai.com` alone. A correctly allowlisted email is still denied if `HUB_GOOGLE_DOMAIN` differs from its verified `hd`. Using External audience does not bypass that check or admit personal Gmail accounts automatically.
 
@@ -93,7 +95,7 @@ Save configuration without deploying while preparing it, or use the appropriate 
 
 1. Test the feature on staging with its own OAuth client, canonical HTTPS URL, and test database.
 2. Merge the implementation into the branch configured for the Render service. If Render deploys `master`, the changes must reach `master` before the production build can contain them.
-3. Deploy the new build with `HUB_GOOGLE_AUTH_ENABLED=false`. Apply migration 022 and add the production OAuth configuration before enabling login. Keep the existing health-check path available.
+3. For first-time setup, deploy the new build with `HUB_GOOGLE_AUTH_ENABLED=false`. Apply Hub authentication migrations 022 and 023 and add the production OAuth configuration before enabling login. For an existing Google-sign-in deployment, apply additive migration 023 before adding Gibb's `GA` account. Keep the existing health-check path available.
 4. Set `HUB_GOOGLE_AUTH_ENABLED=true` and deploy the configuration change.
 5. Open the Hub and complete the checks below with a real approved account and a separate unapproved account.
 
@@ -102,8 +104,9 @@ The current Render HTTPS hostname can be used directly; a new custom domain is n
 ### Acceptance checks
 
 - An approved account signs in and sees the same reviewer-specific content and permitted actions as before.
+- Gibb signs in as `GA`, and Gibb's review actions are attributed to `GA`. Sales-owner filters and existing assignments still contain only `RG`, `NC`, `NDL`, and `MG`.
 - Popup sign-in returns to the original Hub tab and preserves a selected Daily Brief link. Check the full-page fallback when the browser blocks popups.
-- Closing or cancelling the Google window leaves a clear way to try sign-in again. Company data appears only after the Hub confirms a valid session.
+- Closing or cancelling the Google window leaves a clear way to try sign-in again. If a failed popup cannot contact the original tab, its error explanation remains visible. Company data appears only after the Hub confirms a valid session.
 - An unlisted account is denied, including an account in the correct Workspace domain.
 - An account with a different Workspace `hd` claim is denied, even if its email is on the allowlist. An approved account using a secondary email domain succeeds when its verified `hd` matches `HUB_GOOGLE_DOMAIN`.
 - Refreshing or reopening the Hub retains an unexpired session. Expiry is fixed at 7 days after sign-in rather than renewed by activity.
@@ -126,12 +129,12 @@ Disabling a Google Workspace account alone does not instantly expire an already-
 
 ## Rollback and troubleshooting
 
-- **Return to legacy token sign-in:** set `HUB_GOOGLE_AUTH_ENABLED=false` and deploy. Keep the existing `REVIEW_TOKENS` available. Leave migration 022 and its tables in place; they are additive and do not need to be removed to roll back the feature.
+- **Return to legacy token sign-in:** set `HUB_GOOGLE_AUTH_ENABLED=false` and deploy. Keep the existing `REVIEW_TOKENS` available. Leave migrations 022 and 023 in place; they are additive and do not need to be removed to roll back the feature.
 - **`redirect_uri_mismatch`:** compare the exact callback derived from `PUBLIC_BASE_URL` with the Google client's authorized redirect URI.
 - **`org_internal`:** the selected Google account is outside the Cloud project's organization. Check project ownership/audience and the intended team account; changing the Hub allowlist alone cannot resolve this Google-side restriction.
 - **Approved account denied:** check the actual Google email, `hd` domain, mapping format/reviewer code, and whether the identity is disabled or already bound to a different Google account.
-- **Login returns to an error:** confirm the deployment has migration 022, the correct client secret, the production client ID, and the expected canonical URL. Start a fresh login if the one-time login state has expired.
-- **Popup blocked or cannot return to its original tab:** use the full-page sign-in fallback. Both routes use the same Google callback and account checks. If the original tab is unavailable, the completion page returns the sign-in window itself to the Hub.
+- **Login returns to an error:** confirm the deployment has migrations 022 and 023, the correct client secret, the production client ID, and the expected canonical URL. A missing migration 023 can prevent Gibb's `GA` identity from being saved. Start a fresh login if the one-time login state has expired.
+- **Popup blocked or cannot return to its original tab:** use the full-page sign-in fallback. Both routes use the same Google callback and account checks. A successful popup attempts to close even if the browser has disconnected its opener; the original Hub can recover by checking its session. If closing is denied, the popup returns itself to the Hub. A failed popup with no usable opener keeps its explanation and return link visible.
 - **Sessions lost during a deployment:** confirm the deployment still points to the same intended database and has the same approved-account mapping. Durable session state belongs in the database, not Render's ephemeral filesystem. See [Render deployment storage behavior](https://render.com/docs/deploys).
 
 Use error categories and request IDs for troubleshooting. Do not paste client secrets, OAuth authorization codes, identity tokens, or session-cookie values into GitHub issues or logs.
