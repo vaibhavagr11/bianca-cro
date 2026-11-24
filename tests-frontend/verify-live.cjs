@@ -1664,8 +1664,8 @@ test('Closing a popup checks for a finished session and otherwise leaves a retry
   const first=popupWindow(),second=popupWindow();let opens=0,sessionReads=0;
   const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>{sessionReads++;return authResponse({mode:'google',authenticated:false});},popupOpen:()=>++opens===1?first:second});
   await flush();popupClick(page);first.closed=true;
-  [...page.timers.values()].find(t=>t.ms===500).fn();await flush();
-  assert.equal(sessionReads,2);assert.ok(page.get('#connection-error').textContent.includes('closed'));assert.equal(page.get('#google-sign-in').textContent,'Continue with Google');
+  [...page.timers.values()].find(t=>t.ms===2000).fn();await flush();
+  assert.equal(sessionReads,2);assert.equal(page.get('#connection-error').hidden,true);assert.ok(page.get('#google-popup-status').textContent.includes('If you closed it'));assert.equal(page.get('#google-sign-in').textContent,'Continue with Google');
   popupClick(page);assert.equal(opens,2);assert.equal(page.get('#connection-status').textContent,'Waiting for Google sign-in');
 });
 
@@ -1673,7 +1673,7 @@ test('Returning focus can recover sign-in when the browser severed the popup ope
   const popup=popupWindow();let authenticated=false;
   const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>authResponse(authenticated?signedInSession():{mode:'google',authenticated:false}),popupOpen:()=>popup,fetcher:async()=>authResponse(snapshot())});
   await flush();popupClick(page);popup.closed=true;
-  [...page.timers.values()].find(t=>t.ms===500).fn();await flush();
+  [...page.timers.values()].find(t=>t.ms===2000).fn();await flush();
   authenticated=true;page.events['window:focus']();await flush();
   assert.equal(page.get('#account-status').hidden,false);assert.equal(page.get('#connection-panel').hidden,true);assert.ok(page.get('#review-list').innerHTML.includes('A real company'));
 });
@@ -1692,7 +1692,7 @@ test('Leaving the Hub cancels its popup watcher and ignores later completion mes
   const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>{reads++;return authResponse({mode:'google',authenticated:false});},popupOpen:()=>popup});
   await flush();popupClick(page);page.events['window:pagehide']();
   popupMessage(page,popup,{type:'bianca-hub-auth-complete',success:true});await flush();
-  assert.equal(popup.closed,true);assert.equal(reads,1);assert.equal([...page.timers.values()].some(t=>t.ms===500),false);
+  assert.equal(popup.closed,true);assert.equal(reads,1);assert.equal([...page.timers.values()].some(t=>t.ms===2000),false);
 });
 
 test('The hosted page describes seven-day persistence and modified link clicks retain native behavior',async()=>{
@@ -1701,6 +1701,46 @@ test('The hosted page describes seven-day persistence and modified link clicks r
   await flush();assert.ok(html.includes('Your session lasts 7 days from sign-in'));assert.equal(html.includes('Your session lasts 12 hours'),false);
   assert.equal(popupClick(page,{ctrlKey:true}),false);assert.equal(opens,0);
   assert.equal(new URL(page.get('#google-sign-in').href,'https://hub.test').searchParams.has('popup'),false);
+});
+
+function tickPopupPoll(page){
+  const entry=[...page.timers.entries()].filter(([,timer])=>timer.ms===2000).at(-1);
+  assert.ok(entry,'A bounded popup session poll is scheduled.');
+  page.timers.delete(entry[0]);entry[1].fn();
+}
+
+test('A severed popup handle restores a later server session automatically without focus or messages',async()=>{
+  const popup=popupWindow();let authenticated=false,sessionReads=0,opens=0;
+  const page=fakePage(undefined,'/review/app',{
+    sessionFetcher:async()=>{sessionReads++;return authResponse(authenticated?signedInSession():{mode:'google',authenticated:false});},
+    popupOpen:()=>{opens++;return popup;},fetcher:async()=>authResponse(snapshot())
+  });
+  await flush();popupClick(page);popup.closed=true;
+  tickPopupPoll(page);await flush();
+  assert.equal(sessionReads,2);assert.equal(page.get('#connection-error').hidden,true);
+  assert.ok(page.get('#google-popup-status').textContent.includes('Finish sign-in'));
+  authenticated=true;tickPopupPoll(page);await flush();
+  assert.equal(page.get('#account-status').hidden,false);assert.equal(page.get('#connection-panel').hidden,true);
+  assert.ok(page.get('#review-list').innerHTML.includes('A real company'));
+  assert.equal(opens,1,'Recovery never opens another login window or starts a login loop.');
+  assert.equal([...page.timers.values()].some(t=>t.ms===2000),false,'Polling stops after successful restoration.');
+});
+
+test('Popup polling expires after ten minutes and ignores an in-flight result after timeout',async()=>{
+  const popup=popupWindow();let reads=0,finishPoll,businessReads=0;
+  const page=fakePage(undefined,'/review/app',{
+    sessionFetcher:async()=>++reads===1?authResponse({mode:'google',authenticated:false}):new Promise(resolve=>{finishPoll=resolve;}),
+    popupOpen:()=>popup,fetcher:async()=>{businessReads++;return authResponse(snapshot());}
+  });
+  await flush();popupClick(page);popup.closed=true;tickPopupPoll(page);
+  assert.equal(reads,2);
+  vm.runInContext('Date.now = () => '+(Date.now()+10*60*1000+1000),page.context);
+  tickPopupPoll(page);
+  assert.equal(page.get('#google-sign-in-panel').hidden,false);assert.equal(page.get('#google-popup-status').hidden,true);
+  assert.ok(page.get('#connection-error').textContent.includes('attempt expired'));
+  assert.equal([...page.timers.values()].some(t=>t.ms===2000),false);
+  finishPoll(authResponse(signedInSession()));await flush();
+  assert.equal(businessReads,0);assert.equal(page.get('#account-status').hidden,true);
 });
 
 (async()=>{for(const t of tests){try{await t.fn();passed++;process.stdout.write('PASS '+t.name+'\n');}catch(error){failed++;process.stdout.write('FAIL '+t.name+'\n  '+error.stack+'\n');}}process.stdout.write(`\n${passed} passed; ${failed} failed.\n`);process.exitCode=failed?1:0;})();
