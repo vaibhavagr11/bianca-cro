@@ -46,6 +46,7 @@ def test_opening_the_link_changes_nothing(monkeypatch):
     r = client.get("/actions/complete", params={"t": actions.sign("insight:42", "Campari", "Add data")})
     assert r.status_code == 200 and "Mark as complete?" in r.text and "Campari" in r.text and 'method="post"' in r.text
     assert 'name="who" value="MG"' in r.text and "I'm Matias" in r.text
+    assert 'name="who" value="GA"' in r.text and "I'm Gibb" in r.text
 
 
 class FakeConn:
@@ -63,7 +64,7 @@ class FakeConn:
         return self
 
 
-@pytest.mark.parametrize("actor", ["RG", "MG"])
+@pytest.mark.parametrize("actor", ["RG", "MG", "GA"])
 def test_confirm_records_who_and_closes_the_insight(monkeypatch, actor):
     conn = FakeConn()
     monkeypatch.setattr(actions.db, "connect", lambda: conn)

@@ -21,7 +21,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from psycopg import OperationalError
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from app import hub_auth, review_api
 from app.config import Settings, settings
@@ -221,6 +221,38 @@ def verify_token(monkeypatch, signing_key, claims, *, signing=None):
 
 def test_google_token_signature_and_identity_are_verified(monkeypatch, signing_key, claims):
     assert verify_token(monkeypatch, signing_key, claims) == {"google_sub": "google-user-1", "email": EMAIL, "actor": "RG"}
+
+
+def test_approved_gibb_google_identity_is_its_own_reviewer(monkeypatch, signing_key, claims):
+    email = "gibb.anella@bianca-ai.com"
+    monkeypatch.setattr(settings, "hub_google_users", {EMAIL: "RG", email: "GA"})
+    claims.update(email=email, sub="google-gibb-subject")
+    assert hub_auth._configuration()[1] == {EMAIL: "RG", email: "GA"}
+    assert verify_token(monkeypatch, signing_key, claims) == {
+        "google_sub": "google-gibb-subject", "email": email, "actor": "GA",
+    }
+
+
+def test_gibb_session_keeps_own_attribution_and_does_not_grant_machine_or_connector_access(monkeypatch, client, active_session):
+    email = "gibb.anella@bianca-ai.com"
+    monkeypatch.setattr(settings, "hub_google_users", {EMAIL: "RG", email: "GA"})
+    active_session.update(google_sub="google-gibb-subject", email=email, actor="GA")
+    monkeypatch.setattr(review_api, "_workspace", lambda: {"rows": [], "activity": []})
+    assert client.get("/auth/session").json()["actor"] == "GA"
+    assert client.get("/review/workspace").json()["viewer"] == "GA"
+    calls = []
+    monkeypatch.setattr(review_api, "_decision", lambda proposal, actor, action, payload:
+                        calls.append((actor, action)) or {"status": "ignored"})
+    headers = {"Origin": ORIGIN, "X-CSRF-Token": hub_auth._proof(COOKIE, "hub-csrf-v1")}
+    response = client.post(f"/review/proposals/{uuid4()}/ignore", headers=headers,
+                           json={"revision": 1, "idempotency_key": "gibb-decision-0001"})
+    assert response.status_code == 200 and calls == [("GA", "ignore")]
+    assert client.post("/review/build", headers=headers).status_code == 401
+    assert client.post("/brief/build", headers=headers).status_code == 401
+    assert client.get("/review/mcp").status_code == 401
+    with pytest.raises(ValidationError):
+        Settings(database_url="postgresql://test:test@localhost:1/test", ingest_token="test", _env_file=None,
+                 sales_mcp_founders={"google-gibb-subject": "GA"})
 
 
 def test_approved_secondary_domain_email_requires_configured_workspace_domain(monkeypatch, signing_key, claims):
@@ -487,14 +519,15 @@ def test_unauthenticated_session_probe_cannot_erase_new_popup_login_cookie(monke
 
 
 @pytest.mark.parametrize("opener_mode", ["absent", "closed", "throws", "available"])
-def test_popup_script_always_attempts_close_even_when_provider_severs_opener(opener_mode):
+@pytest.mark.parametrize("success", [True, False])
+def test_popup_script_keeps_isolated_errors_visible_and_always_closes_success(opener_mode, success):
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node is needed to execute the popup completion script")
     # Run the actual rendered script against window doubles. This exercises the
     # missing-opener behavior observed after real cross-origin provider navigation.
     harness = r"""
-const {script, mode} = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const {script, mode, success} = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 const events = [], timers = [];
 const opener = mode === 'absent' ? null : {
   closed: mode === 'closed',
@@ -510,7 +543,7 @@ const window = {
   setTimeout: (callback, delay) => timers.push({callback, delay})
 };
 const document = {
-  body: {dataset: {success: 'true', error: ''}},
+  body: {dataset: {success: String(success), error: success ? '' : 'not_allowed'}},
   getElementById: () => ({getAttribute: () => '/review/app?tab=daily-brief'})
 };
 require('vm').runInNewContext(script, {window, document});
@@ -518,14 +551,31 @@ const immediate = events.slice();
 timers.forEach(timer => timer.callback());
 process.stdout.write(JSON.stringify({immediate, events, delays: timers.map(timer => timer.delay)}));
 """
-    completed = subprocess.run([node, "-e", harness], input=json.dumps({"script": hub_auth.POPUP_SCRIPT, "mode": opener_mode}),
+    completed = subprocess.run([node, "-e", harness], input=json.dumps({"script": hub_auth.POPUP_SCRIPT, "mode": opener_mode, "success": success}),
                                text=True, capture_output=True, check=True)
     result = json.loads(completed.stdout)
-    assert ["close"] in result["immediate"]
+    should_close = success or opener_mode == "available"
+    assert (["close"] in result["immediate"]) is should_close
     assert not any(event[0] == "redirect" for event in result["immediate"])
-    assert result["delays"] == [150]
-    assert result["events"][-1] == ["redirect", "/review/app?tab=daily-brief"]
+    assert result["delays"] == ([150] if should_close else [])
+    if should_close:
+        assert result["events"][-1] == ["redirect", "/review/app?tab=daily-brief"]
+    else:
+        assert result["events"] == []
     messages = [event for event in result["immediate"] if event[0] == "message"]
     assert bool(messages) is (opener_mode == "available")
     if messages:
-        assert messages[0][1:] == [{"type": "bianca-hub-auth-complete", "success": True}, "https://hub.example.com"]
+        expected = {"type": "bianca-hub-auth-complete", "success": success}
+        if not success:
+            expected["error"] = "not_allowed"
+        assert messages[0][1:] == [expected, "https://hub.example.com"]
+
+
+@pytest.mark.parametrize("code", sorted(hub_auth.AUTH_ERRORS))
+def test_popup_denial_page_explains_failure_and_preserves_safe_return(client, code):
+    page = client.get("/auth/google/complete", params={"success": "0", "error": code,
+                                                     "return_to": "/review/app?tab=daily-brief"})
+    assert "Google sign-in not completed" in page.text
+    assert hub_auth.AUTH_ERROR_MESSAGES[code] in page.text
+    assert f'href="/review/app?tab=daily-brief&amp;auth_error={code}"' in page.text
+    assert "role=\"status\"" in page.text and "Returning to the War Room Hub…" not in page.text
