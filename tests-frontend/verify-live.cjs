@@ -184,7 +184,7 @@ test('A late refresh cannot put an old pending card back after a newer shared sn
   assert.equal(client.state.rows[0].nextStep,'- Confirm the scope.');
 });
 
-function fakePage(connector,pathname='/artifact',{search='',fetcher,warRoom=false}={}){
+function fakePage(connector,pathname='/artifact',{search='',fetcher,sessionFetcher,warRoom=false}={}){
   class Element {
     constructor(){this.textContent='';this.innerHTML='';this.value='';this.hidden=false;this.disabled=false;this.handlers={};this.attributes={};}
     addEventListener(name,handler){this.handlers[name]=handler;}
@@ -196,7 +196,7 @@ function fakePage(connector,pathname='/artifact',{search='',fetcher,warRoom=fals
     getAttribute(name){return this.attributes[name]??null;}
     querySelectorAll(){return [];}querySelector(){return new Element();}
   }
-  const elements=new Map(),events={};
+  const elements=new Map(),events={},timers=new Map();let timerId=0;
   const get=selector=>{
     if(selector==='dialog[open]')return get('#edit-dialog').open?get('#edit-dialog'):null;
     if(!elements.has(selector)){
@@ -218,9 +218,9 @@ function fakePage(connector,pathname='/artifact',{search='',fetcher,warRoom=fals
   if(warRoom)fakeDocument.body={dataset:{theme:'war-room'}};
   const location={pathname,protocol:'https:',hostname:'hub.test',search,href:'https://hub.test'+pathname+search};
   const fakeWindow={biancaConnector:connector,addEventListener:(name,handler)=>{events['window:'+name]=handler;},scrollTo:()=>{},history:{replaceState:(_state,_unused,url)=>{const next=new URL(url);location.href=next.href;location.search=next.search;}}};
-  const page=vm.createContext({document:fakeDocument,window:fakeWindow,location,URL,URLSearchParams,crypto:{randomUUID:()=> 'new-key'},setTimeout:()=>0,clearTimeout:()=>{},Event,fetch:fetcher||(()=>{throw Error('Unexpected direct network call');})});
+  const page=vm.createContext({document:fakeDocument,window:fakeWindow,location,URL,URLSearchParams,crypto:{randomUUID:()=> 'new-key'},setTimeout:(fn,ms)=>{timers.set(++timerId,{fn,ms});return timerId;},clearTimeout:id=>timers.delete(id),Event,fetch:(url,options)=>url==='/auth/session'?(sessionFetcher||(()=>Promise.resolve({ok:true,status:200,json:async()=>({mode:'token',authenticated:false})})))(url,options):(fetcher||(()=>{throw Error('Unexpected direct network call');}))(url,options)});
   for(const script of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g))vm.runInContext(script[1],page);
-  return {get,events,context:page};
+  return {get,events,context:page,timers};
 }
 
 test('The actual live UI starts empty and explains missing connector access',()=>{
@@ -551,8 +551,10 @@ test('An invalid completion date in an older suggestion does not prefill the fie
   assert.equal([...page.get('#ns-rows').innerHTML.matchAll(/type="text" class="ns-date"[^>]*placeholder="dd\/mm\/yyyy" value=""/g)].length,2);
 });
 
-test('The hosted page offers in-memory sign-in without calling the service before sign-in',()=>{
+test('The hosted page offers token sign-in only after checking the configured authentication mode',async()=>{
   const page=fakePage(undefined,'/review/app');
+  assert.equal(page.get('#sign-in-form').hidden,true);
+  await new Promise(resolve=>setImmediate(resolve));
   assert.equal(page.get('#sign-in-form').hidden,false);
   assert.equal(page.get('#pending-count').textContent,0);
 });
@@ -1255,6 +1257,7 @@ test('An emailed Daily Brief link survives login and reads the pinned brief inde
   const calls=[],data=savedBrief();
   const page=fakePage(undefined,'/review/app',{search:'?tab=daily-brief&brief='+briefId,fetcher:async(url,options)=>{calls.push({url,options});return {ok:true,json:async()=>data};}});
   assert.equal(page.get('#daily-brief-tab').getAttribute('aria-selected'),'true');
+  await new Promise(resolve=>setImmediate(resolve));
   assert.equal(page.get('#sign-in-form').hidden,false);
   assert.equal(calls.length,0);
   page.get('#access-token').value='founder-token';
@@ -1349,6 +1352,239 @@ test('War Room keyboard actions cannot activate a hidden card while Daily Brief 
   page.context.document.querySelector=selector=>{if(selector==='.wr-main .review-card')hiddenCardReads++;return get(selector);};
   for(const key of ['a','e','i','j','k'])page.events.keydown({key,target:{tagName:'BUTTON'},preventDefault(){}});
   assert.equal(hiddenCardReads,0);
+});
+
+const signedInSession=()=>({mode:'google',authenticated:true,actor:'RG',email:'ramiro@bianca-ai.com',expires_at:new Date(Date.now()+12*60*60*1000).toISOString(),csrf_token:'session-csrf-value'});
+const authResponse=data=>({ok:true,status:200,json:async()=>data});
+const flush=()=>new Promise(resolve=>setImmediate(resolve));
+
+test('Session REST transport uses same-origin cookies and CSRF for writes without a bearer token',async()=>{
+  const calls=[];
+  const transport=core.restTransport(async(url,options)=>{calls.push({url,options});return authResponse(snapshot());},()=> 'csrf-only',{sessionAuth:true});
+  await transport(core.TOOLS.workspace,{});
+  await transport(core.TOOLS.brief,{brief_id:briefId});
+  await transport(core.TOOLS.approve,{proposal_id:'p-1',revision:2,idempotency_key:'decision',next_step_bullets:['Confirm.'],client_context_bullets:[]});
+  await transport(core.TOOLS.ignore,{proposal_id:'p-1',revision:2,idempotency_key:'ignore'});
+  await transport(core.TOOLS.status,{row_id:'r-1',expected_status:'2. In Talks',status:'3. Paused'});
+  for(const {options} of calls){assert.equal(options.credentials,'same-origin');assert.equal(options.headers.Authorization,undefined);assert.equal(options.cache,'no-store');assert.equal(options.redirect,'error');}
+  for(const {options} of calls.slice(0,2))assert.equal(options.headers['X-CSRF-Token'],undefined);
+  for(const {options} of calls.slice(2))assert.equal(options.headers['X-CSRF-Token'],'csrf-only');
+});
+
+test('Expired session errors clear the UI even if the server response is unreadable',async()=>{
+  let expired=0;
+  const transport=core.restTransport(async()=>({ok:false,status:401,json:async()=>{throw Error('not JSON');}}),()=> 'csrf',{sessionAuth:true,onAuthError:()=>expired++});
+  await assert.rejects(transport(core.TOOLS.workspace,{}),error=>error.status===401);
+  assert.equal(expired,1);
+});
+
+test('Google mode hides token login and preserves a pinned Daily Brief in the sign-in link',async()=>{
+  let reads=0;
+  const page=fakePage(undefined,'/review/app',{search:'?tab=daily-brief&brief='+briefId,sessionFetcher:async()=>authResponse({mode:'google',authenticated:false}),fetcher:async()=>{reads++;throw Error('No business requests before login');}});
+  await flush();
+  assert.equal(page.get('#google-sign-in-panel').hidden,false);
+  assert.equal(page.get('#sign-in-form').hidden,true);
+  assert.equal(page.get('#account-status').hidden,true);
+  assert.equal(page.get('#disconnect').hidden,true);
+  const login=new URL(page.get('#google-sign-in').href,'https://hub.test');
+  assert.equal(login.pathname,'/auth/google/login');
+  assert.equal(login.searchParams.get('return_to'),'/review/app?tab=daily-brief&brief='+briefId);
+  page.get('#access-token').value='old-founder-token';
+  await page.get('#sign-in-form').handlers.submit({preventDefault(){}});
+  assert.equal(reads,0,'Even a synthetic token form submit cannot bypass Google mode.');
+});
+
+test('Hosted Google mode never falls back to an injected Claude connector',async()=>{
+  let connectorCalls=0;
+  const page=fakePage({callTool:async()=>{connectorCalls++;return snapshot();}},'/review/app',{sessionFetcher:async()=>authResponse({mode:'google',authenticated:false})});
+  await flush();await page.get('#refresh-updates').onclick();
+  assert.equal(connectorCalls,0);
+  assert.equal(page.get('#google-sign-in-panel').hidden,false);
+});
+
+test('Authentication discovery fails closed and can be retried without exposing token login',async()=>{
+  let available=false;
+  const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>available?authResponse({mode:'google',authenticated:false}):{ok:false,status:503}});
+  await flush();
+  assert.equal(page.get('#sign-in-form').hidden,true);
+  assert.equal(page.get('#google-sign-in-panel').hidden,true);
+  assert.equal(page.get('#auth-retry').hidden,false);
+  assert.ok(page.get('#connection-error').textContent.includes('temporarily unavailable'));
+  available=true;await page.get('#auth-retry').onclick();
+  assert.equal(page.get('#google-sign-in-panel').hidden,false);
+  assert.equal(page.get('#auth-retry').hidden,true);
+});
+
+test('A valid Google session restores the Hub automatically without sliding its expiry',async()=>{
+  const auth=signedInSession(),calls=[];
+  const page=fakePage(undefined,'/review/app',{sessionFetcher:async(url,options)=>{calls.push({url,options});return authResponse(auth);},fetcher:async(url,options)=>{calls.push({url,options});return authResponse(snapshot());}});
+  await flush();
+  assert.deepEqual(calls.map(c=>c.url),['/auth/session','/review/workspace']);
+  assert.equal(calls[0].options.credentials,'same-origin');
+  assert.equal(calls[1].options.headers.Authorization,undefined);
+  assert.equal(page.get('#connection-panel').hidden,true);
+  assert.equal(page.get('#account-status').hidden,false);
+  assert.ok(page.get('#account-status').textContent.includes(auth.email));
+  assert.ok(page.get('#account-status').textContent.includes('Sign-in expires'));
+  assert.equal(page.get('#disconnect').textContent,'Sign out');
+  const timer=[...page.timers.values()].find(t=>t.ms>40000000);
+  assert.ok(timer&&timer.ms<=43200000);
+  await page.get('#refresh-updates').onclick();
+  assert.equal([...page.timers.values()].filter(t=>t.ms>40000000).length,1,'Refreshing does not reset the session timer.');
+  assert.equal([...page.timers.values()].find(t=>t.ms>40000000),timer);
+});
+
+test('Google session login opens a saved brief without reading the Pipeline Sheet',async()=>{
+  const calls=[];
+  const page=fakePage(undefined,'/review/app',{search:'?tab=daily-brief&brief='+briefId,sessionFetcher:async()=>authResponse(signedInSession()),fetcher:async(url,options)=>{calls.push({url,options});return authResponse(savedBrief());}});
+  await flush();
+  assert.deepEqual(calls.map(c=>c.url),['/review/briefs/'+briefId]);
+  assert.equal(calls[0].options.credentials,'same-origin');
+  assert.equal(page.get('#daily-brief-frame').hidden,false);
+  assert.ok(page.get('#daily-brief-frame').srcdoc.includes('Final available row'));
+});
+
+test('A Google approval uses the session CSRF and preserves the existing review contract',async()=>{
+  const calls=[],auth=signedInSession();
+  const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>authResponse(auth),fetcher:async(url,options)=>{calls.push({url,options});return authResponse(url==='/review/workspace'?snapshot():{status:'approved'});}});
+  await flush();
+  const button={dataset:{action:'approve'},closest:()=>({dataset:{id:'p-1'}})};
+  page.events.click({target:{closest:()=>button}});await flush();
+  const write=calls.find(c=>c.options.method==='POST');
+  assert.equal(write.url,'/review/proposals/p-1/approve');
+  assert.equal(write.options.headers['X-CSRF-Token'],auth.csrf_token);
+  assert.equal(write.options.headers.Authorization,undefined);
+  assert.deepEqual(JSON.parse(write.options.body),{revision:2,idempotency_key:'new-key',next_step_bullets:['Confirm the scope.'],client_context_bullets:[]});
+});
+
+test('Absolute expiry clears cards, open edits, account identity and pending writes from the page',async()=>{
+  let reads=0;
+  const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>authResponse(signedInSession()),fetcher:async()=>{reads++;return authResponse(snapshot());}});
+  await flush();
+  page.events.click({target:{closest:()=>({dataset:{action:'edit'},closest:()=>({dataset:{id:'p-1'}})})}});
+  assert.equal(page.get('#edit-dialog').open,true);
+  assert.ok(page.get('#edit-content').value.includes('Confirm the scope'));
+  [...page.timers.values()].find(t=>t.ms>40000000).fn();
+  assert.equal(page.get('#pending-count').textContent,0);
+  assert.equal(page.get('#review-list').innerHTML.includes('A real company'),false);
+  assert.equal(page.get('#edit-dialog').open,false);
+  assert.equal(page.get('#edit-content').value,'');
+  assert.equal(page.get('#ns-rows').innerHTML,'');
+  assert.equal(page.get('#account-status').hidden,true);
+  assert.equal(page.get('#google-sign-in-panel').hidden,false);
+  assert.ok(page.get('#connection-error').textContent.includes('session has ended'));
+  assert.equal(reads,1);
+});
+
+test('Session rejection on a write clears cached company data and offers Google sign-in',async()=>{
+  const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>authResponse(signedInSession()),fetcher:async(url)=>url==='/review/workspace'?authResponse(snapshot()):{ok:false,status:403,json:async()=>({detail:'Invalid CSRF'})}});
+  await flush();
+  page.events.click({target:{closest:()=>({dataset:{action:'approve'},closest:()=>({dataset:{id:'p-1'}})})}});await flush();
+  assert.equal(page.get('#review-list').innerHTML.includes('A real company'),false);
+  assert.equal(page.get('#pending-count').textContent,0);
+  assert.equal(page.get('#google-sign-in-panel').hidden,false);
+  assert.equal(page.get('#sign-in-form').hidden,true);
+});
+
+test('Logout revokes the server session with CSRF and clears the Daily Brief immediately',async()=>{
+  const calls=[];let finishLogout;
+  const auth=signedInSession();
+  const page=fakePage(undefined,'/review/app',{search:'?tab=daily-brief',sessionFetcher:async()=>authResponse(auth),fetcher:async(url,options)=>{calls.push({url,options});if(url==='/auth/logout')return new Promise(resolve=>{finishLogout=resolve;});return authResponse(savedBrief());}});
+  await flush();const signingOut=page.get('#disconnect').onclick();
+  assert.equal(page.get('#daily-brief-frame').srcdoc,undefined);
+  assert.equal(page.get('#disconnect').disabled,true);
+  const call=calls.find(c=>c.url==='/auth/logout');
+  assert.equal(call.options.method,'POST');assert.equal(call.options.headers['X-CSRF-Token'],auth.csrf_token);assert.equal(call.options.credentials,'same-origin');
+  finishLogout({ok:true,status:204});await signingOut;
+  assert.equal(page.get('#account-status').hidden,true);
+  assert.equal(page.get('#google-sign-in-panel').hidden,false);
+  assert.ok(page.get('#connection-error').textContent.includes('Signed out'));
+});
+
+test('An uncertain logout keeps its retry available without restoring company data',async()=>{
+  let fail=true,logouts=0;
+  const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>authResponse(signedInSession()),fetcher:async url=>{if(url==='/auth/logout'){logouts++;if(fail)throw Error('offline');return {ok:true,status:204};}return authResponse(snapshot());}});
+  await flush();await page.get('#disconnect').onclick();
+  assert.equal(page.get('#review-list').innerHTML.includes('A real company'),false);
+  assert.ok(page.get('#connection-error').textContent.includes('could not be confirmed'));
+  assert.equal(page.get('#disconnect').hidden,false);
+  assert.equal(page.get('#disconnect').disabled,false);
+  assert.equal(page.get('#google-sign-in-panel').hidden,true);
+  fail=false;await page.get('#disconnect').onclick();
+  assert.equal(logouts,2);
+  assert.equal(page.get('#google-sign-in-panel').hidden,false);
+});
+
+test('Back-forward cache restoration checks the server instead of reusing old session data',async()=>{
+  let loggedIn=true,sessionReads=0;
+  const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>{sessionReads++;return authResponse(loggedIn?signedInSession():{mode:'google',authenticated:false});},fetcher:async()=>authResponse(snapshot())});
+  await flush();assert.ok(page.get('#review-list').innerHTML.includes('A real company'));
+  page.events['window:pagehide']();
+  assert.equal(page.get('#review-list').innerHTML.includes('A real company'),false);
+  assert.equal(page.get('#account-status').hidden,true);
+  loggedIn=false;page.events['window:pageshow']({persisted:true});await flush();
+  assert.equal(sessionReads,2);
+  assert.equal(page.get('#google-sign-in-panel').hidden,false);
+  assert.equal(page.get('#review-list').innerHTML.includes('A real company'),false);
+});
+
+test('A session probe arriving after page exit cannot reattach the prior account',async()=>{
+  let finishSession,businessReads=0;
+  const page=fakePage(undefined,'/review/app',{sessionFetcher:()=>new Promise(resolve=>{finishSession=resolve;}),fetcher:async()=>{businessReads++;return authResponse(snapshot());}});
+  page.events['window:pagehide']();finishSession(authResponse(signedInSession()));await flush();
+  assert.equal(businessReads,0);
+  assert.equal(page.get('#account-status').hidden,true);
+  assert.equal(page.get('#sign-in-form').hidden,true);
+});
+
+test('Expired or malformed restored sessions fail closed before business reads',async()=>{
+  for(const auth of [{...signedInSession(),expires_at:'bad-date'},{...signedInSession(),csrf_token:''},{...signedInSession(),expires_at:new Date(Date.now()-1).toISOString()}]){
+    let reads=0;
+    const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>authResponse(auth),fetcher:async()=>{reads++;return authResponse(snapshot());}});
+    await flush();assert.equal(reads,0);assert.equal(page.get('#sign-in-form').hidden,true);assert.equal(page.get('#account-status').hidden,true);
+  }
+});
+
+test('Login errors use trusted explanations and remove the error from the browser URL',async()=>{
+  for(const reason of ['not_allowed','identity_mismatch','<script>alert(1)</script>']){
+    const page=fakePage(undefined,'/review/app',{search:'?auth_error='+encodeURIComponent(reason)+'&tab=daily-brief&brief='+briefId,sessionFetcher:async()=>authResponse({mode:'google',authenticated:false})});
+    await flush();assert.equal(page.get('#connection-error').hidden,false);assert.equal(page.get('#connection-error').textContent.includes('<script>'),false);assert.equal(page.context.location.search.includes('auth_error'),false);assert.ok(page.context.location.search.includes(briefId));assert.equal(page.get('#google-sign-in-panel').hidden,false);
+  }
+});
+
+test('A delayed unauthorized workspace response cannot strand a pending logout',async()=>{
+  let finishRead,finishLogout,loggedIn=true,sessionReads=0;
+  const page=fakePage(undefined,'/review/app',{
+    sessionFetcher:async()=>{sessionReads++;return authResponse(loggedIn?signedInSession():{mode:'google',authenticated:false});},
+    fetcher:async url=>url==='/auth/logout'?new Promise(resolve=>{finishLogout=resolve;}):new Promise(resolve=>{finishRead=resolve;})
+  });
+  await flush();
+  const signingOut=page.get('#disconnect').onclick();
+  finishRead({ok:false,status:401,json:async()=>({detail:'Session ended'})});await flush();
+  loggedIn=false;finishLogout({ok:true,status:204});await signingOut;
+  assert.equal(page.get('#google-sign-in-panel').hidden,false);
+  assert.equal(page.get('#sign-in-form').hidden,true);
+  assert.equal(page.get('#disconnect').hidden,true);
+  assert.ok(page.get('#connection-error').textContent.includes('Signed out'));
+  await page.get('#refresh-updates').onclick();
+  assert.equal(sessionReads,2,'Session checks are not permanently blocked by an abandoned logout.');
+});
+
+test('An old transport unauthorized response cannot expire a newly restored session',async()=>{
+  let finishOldRead,reads=0;
+  const page=fakePage(undefined,'/review/app',{
+    sessionFetcher:async()=>authResponse({...signedInSession(),email:reads?'new-account@bianca-ai.com':'old-account@bianca-ai.com'}),
+    fetcher:async()=>++reads===1?new Promise(resolve=>{finishOldRead=resolve;}):authResponse(snapshot())
+  });
+  await flush();
+  page.events['window:pagehide']();page.events['window:pageshow']({persisted:true});await flush();
+  assert.ok(page.get('#account-status').textContent.includes('new-account@bianca-ai.com'));
+  assert.ok(page.get('#review-list').innerHTML.includes('A real company'));
+  finishOldRead({ok:false,status:401,json:async()=>({detail:'Old session ended'})});await flush();
+  assert.equal(page.get('#account-status').hidden,false);
+  assert.ok(page.get('#account-status').textContent.includes('new-account@bianca-ai.com'));
+  assert.equal(page.get('#connection-panel').hidden,true);
+  assert.ok(page.get('#review-list').innerHTML.includes('A real company'));
 });
 
 (async()=>{for(const t of tests){try{await t.fn();passed++;process.stdout.write('PASS '+t.name+'\n');}catch(error){failed++;process.stdout.write('FAIL '+t.name+'\n  '+error.stack+'\n');}}process.stdout.write(`\n${passed} passed; ${failed} failed.\n`);process.exitCode=failed?1:0;})();
