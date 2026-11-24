@@ -5,11 +5,15 @@ The approved interface is delivered in two self-contained pages:
 - `sales-pipeline-updates.html` is the **live** client. It starts empty and requires a configured Bianca Review connector or a signed-in session on the hosted Bianca backend.
 - `sales-pipeline-updates-demo.html` is the **fictional-data preview**. It keeps demo decisions in browser storage and never contacts Google Sheets or the backend.
 
-Both use the approved blue/navy design, the title **Sales Pipeline Updates**, and owner filters for Ramiro (`RG`), Nico Casaux (`NC`), and Nico de León (`NDL`). The demo assigns Farmater to NDL to demonstrate that filter.
+Both use the approved blue/navy design, the title **Sales Pipeline Updates**, and owner filters for Ramiro (`RG`), Nico Casaux (`NC`), Nico de León (`NDL`), and Matias (`MG`). The demo assigns Farmater to NDL to demonstrate that filter.
 
 ## Hosted backend
 
 Open `/review/app` on the Bianca backend. With Google sign-in enabled, choose **Continue with Google** to open a Google sign-in window and use an approved Bianca account. Enter any Google password only on Google’s own page. After sign-in, the window closes and the original Hub restores your session and selected Daily Brief. The Hub keeps a secure session for 7 days from sign-in; refreshes and reopening the page do not extend that deadline. **Sign out** revokes the session and clears the displayed company data. If the browser blocks the window, allow pop-ups and retry or choose **Continue in this tab instead**. Closing or cancelling before sign-in completes leaves the Hub signed out with a retry available. While a sign-in attempt is active, the Hub checks its server session every two seconds for up to ten minutes. This restores completed sign-in automatically even when browser isolation disconnects the popup from its original window. The Hub verifies completion with the server; popup messages contain no session credentials. See [Google sign-in setup](../docs/google-hub-sign-in.md).
+
+Gibb Anella (`gibb.anella@bianca-ai.com`) can be configured as the Hub reviewer `GA`. His approvals and other review decisions retain `GA` in the activity history. Reviewer access does not assign sales accounts to him; the four sales-owner filters stay RG, NC, NDL, and MG.
+
+If Google sign-in is denied and browser isolation disconnects the windows, the sign-in window keeps the explanation and a link back to the Hub visible. Return to the Hub and retry with an approved account. When the window can notify the original Hub, the error appears there instead.
 
 While Google sign-in is disabled during rollout, enter your assigned reviewer access token in the connection panel. That token is held only in page memory, is sent in the Authorization header, and is cleared on disconnect or page exit. The live page does not put credentials or company data in localStorage, sessionStorage, a URL, or the HTML source. Google mode uses a server-issued HttpOnly cookie; browser API calls stay on the same origin.
 
