@@ -38,6 +38,12 @@ The configured default destination is the [Pipeline tab of the designated source
 - [Live interface and approved sample-data preview](artifacts/README.md)
 - [Deployment, Claude Enterprise connector, and n8n setup](docs/gsheet-updates.md)
 - [Daily n8n workflow and scheduling setup](n8n/README.md)
+- [Google sign-in for the hosted Hub: Google Cloud and Render setup](docs/google-hub-sign-in.md)
+
+The hosted Hub can use approved Bianca Google Workspace accounts with 12-hour absolute sessions.
+Google sign-in is opt-in: apply the separate `--hub-auth` migration and configure the account allowlist
+before enabling `HUB_GOOGLE_AUTH_ENABLED` in Render. The review connector keeps its individual bearer
+credentials, and scheduled n8n requests keep their ingest credential.
 
 This feature is disabled by default. Enabling it requires the optional review migrations, a configured Google Sheets
 connection, and separate founder review credentials. Apply the review migrations with `uv run python -m scripts.migrate --sheet-review`.
