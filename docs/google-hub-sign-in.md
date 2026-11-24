@@ -6,11 +6,12 @@ This feature is off by default. Deploying the code does not enable Google sign-i
 
 ## Sign-in and session behavior
 
-- Sign-in starts at `/auth/google/login` and returns through `/auth/google/callback`.
+- **Continue with Google** opens a separate sign-in window so the Hub stays open at the selected tab or Daily Brief. The popup starts at `/auth/google/login?popup=1` and returns through `/auth/google/callback`.
+- The popup finishes at `/auth/google/complete`, notifies the original Hub tab, and closes. The Hub then checks `/auth/session` before showing company data; the popup message does not contain a Google token or session credential. A full-page sign-in fallback uses `/auth/google/login` without `popup=1`.
 - The backend checks Google's identity token, verified email, Workspace domain, and the explicit `HUB_GOOGLE_USERS` mapping. Being in the company domain alone does not grant access.
 - The first successful sign-in binds the approved email and reviewer to Google's permanent account ID (`sub`). A different Google account cannot inherit access merely by receiving that email address later.
 - The browser receives an opaque, secure, HttpOnly session cookie. The database stores a hash of its value, not the usable cookie. No `SESSION_SECRET` is required.
-- `HUB_SESSION_HOURS=12` gives each new session a **12-hour absolute lifetime from sign-in**. Activity and page refreshes do not extend it. Closing and reopening the browser can preserve it until that deadline, subject to the browser retaining cookies.
+- `HUB_SESSION_HOURS=168` gives each new session a **7-day absolute lifetime from sign-in**. Activity and page refreshes do not extend it. Closing and reopening the browser can preserve it until that deadline, subject to the browser retaining cookies. There is no separate inactivity timeout.
 - `/auth/session` supplies the current signed-in identity. `/auth/logout` ends the current Hub session. Logging out of the Hub does not sign the user out of Google.
 - After expiry, the user signs in again through Google. An existing Google login may avoid another password prompt; Google controls any password or additional verification challenge.
 
@@ -18,7 +19,7 @@ The Hub session is separate from Google's identity-token expiry. This implementa
 
 ## 1. Create the Google OAuth client
 
-Use a Google Cloud project controlled by Bianca, preferably under Bianca's Google Workspace organization.
+The production setup uses Google Cloud project `bianca-war-room-hub` (display name **Bianca War Room Hub**), created under the `bianca-ai.com` organization. Use this project for the client setup below. The organization name is useful setup evidence; the signed-in account's actual `hd` claim still determines the domain check.
 
 1. Open **Google Cloud Console → Google Auth Platform** for that project.
 2. Configure **Branding** with the name “Bianca War Room Hub,” an appropriate support address, and a maintained developer contact address.
@@ -33,7 +34,7 @@ Use a Google Cloud project controlled by Bianca, preferably under Bianca's Googl
 
 7. Save the client ID and client secret securely for the Render settings below. Do not commit the secret to GitHub.
 
-This is a server-side redirect flow, so it does not require an Authorized JavaScript origin. The callback must match Google's registered URI exactly, including scheme, hostname, path, and trailing-slash behavior. Use a separate OAuth client and an exact callback on a stable HTTPS staging hostname for staging. Avoid dynamically changing preview URLs for sign-in testing.
+Both the popup and full-page fallback use the same server-side OAuth flow and registered callback. They do not require an Authorized JavaScript origin, a Google browser SDK, or registration of `/auth/google/complete` as another callback. The callback must match Google's registered URI exactly, including scheme, hostname, path, and trailing-slash behavior. Use a separate OAuth client and an exact callback on a stable HTTPS staging hostname for staging. Avoid dynamically changing preview URLs for sign-in testing.
 
 Internal availability depends on the project's organization, not its app name or the email used to create it. A Workspace administrator may need to allow the OAuth client if the organization restricts apps. Google's [audience setup](https://support.google.com/cloud/answer/15544987?hl=en), [web-server OAuth instructions](https://developers.google.com/identity/protocols/oauth2/web-server), and [Workspace administrative controls](https://developers.google.com/identity/protocols/oauth2/production-readiness/overview) describe these settings.
 
@@ -51,7 +52,7 @@ Confirm `022_hub_google_auth.sql` is applied. It creates `hub_google_identities`
 
 The runner applies **all pending eligible migrations**, not only migration 022. Review the status output before applying it. Do not add `--seed` during this rollout.
 
-Session and OAuth state records use the existing database. No new Render service, Redis instance, local disk, or session-signing secret is required. Database-backed state also lets the sign-in redirect finish after a request is routed to a different application instance.
+Session and OAuth state records use the existing database. No new Render service, Redis instance, local disk, or session-signing secret is required. Database-backed state also lets the sign-in redirect finish after a request is routed to a different application instance. The popup flow uses the same tables; if migration 022 is already applied, the popup and 7-day session update needs no additional migration.
 
 ## 3. Configure the Render service
 
@@ -64,14 +65,21 @@ Select the existing `bianca-cro-api` web service in Render and open **Environmen
 | `HUB_GOOGLE_CLIENT_SECRET` | That client's secret; store only as a protected Render setting. |
 | `HUB_GOOGLE_DOMAIN` | The approved accounts' actual Google Workspace hosted-domain claim (`hd`). The code defaults to `bianca-ai.com`; use that value only if the Workspace administrator confirms it matches Google's claim. |
 | `HUB_GOOGLE_USERS` | JSON mapping each approved Google account email to its existing reviewer code. |
-| `HUB_SESSION_HOURS` | `12`, the absolute lifetime in hours for new Hub sessions. Accepts whole hours from 1 to 168. Changing it does not extend already-issued sessions. |
+| `HUB_SESSION_HOURS` | `168` (7 days), the absolute lifetime for new Hub sessions. Accepts whole hours from 1 to 168. Changing it does not extend already-issued sessions. |
 | `PUBLIC_BASE_URL` | `https://bianca-cro-api.onrender.com`, without a trailing path. The callback is derived from this canonical public address. |
 
-The mapping has this format; the address below is illustrative and must be replaced with a confirmed team account:
+The initial team mapping follows the existing founder records and Matias onboarding. Confirm that Google returns these exact account emails during sign-in:
 
 ```json
-{"approved.person@bianca-ai.com":"RG"}
+{
+  "ramiro.godfrid@bianca-ai.com": "RG",
+  "nicolas.casaux@bianca-ai.com": "NC",
+  "nicolas.deleon@bianca-ai.com": "NDL",
+  "matias.grinberg@bianca-ai.com": "MG"
+}
 ```
+
+The Google Cloud setup administrator is not automatically a Hub reviewer. Add an administrator to this mapping only if that person is also explicitly assigned an existing reviewer role.
 
 Add approved accounts using the exact Google account email returned by Google in lowercase and the correct `RG`, `NC`, `NDL`, or `MG` code. Each reviewer can be mapped only once. This assignment determines whose Hub permissions and action attribution the account receives. Do not substitute a mailing list, guessed address, or a second alias for an existing account.
 
@@ -94,9 +102,11 @@ The current Render HTTPS hostname can be used directly; a new custom domain is n
 ### Acceptance checks
 
 - An approved account signs in and sees the same reviewer-specific content and permitted actions as before.
+- Popup sign-in returns to the original Hub tab and preserves a selected Daily Brief link. Check the full-page fallback when the browser blocks popups.
+- Closing or cancelling the Google window leaves a clear way to try sign-in again. Company data appears only after the Hub confirms a valid session.
 - An unlisted account is denied, including an account in the correct Workspace domain.
 - An account with a different Workspace `hd` claim is denied, even if its email is on the allowlist. An approved account using a secondary email domain succeeds when its verified `hd` matches `HUB_GOOGLE_DOMAIN`.
-- Refreshing or reopening the Hub retains an unexpired session. Expiry is fixed at 12 hours after sign-in rather than renewed by activity.
+- Refreshing or reopening the Hub retains an unexpired session. Expiry is fixed at 7 days after sign-in rather than renewed by activity.
 - Logout prevents reuse of that session; the browser returns to sign-in.
 - Removing an account from the mapping and deploying the change prevents further authenticated requests with its existing session.
 - Hub write actions succeed from the normal UI and reject requests without the required request-forgery protection.
@@ -121,6 +131,7 @@ Disabling a Google Workspace account alone does not instantly expire an already-
 - **`org_internal`:** the selected Google account is outside the Cloud project's organization. Check project ownership/audience and the intended team account; changing the Hub allowlist alone cannot resolve this Google-side restriction.
 - **Approved account denied:** check the actual Google email, `hd` domain, mapping format/reviewer code, and whether the identity is disabled or already bound to a different Google account.
 - **Login returns to an error:** confirm the deployment has migration 022, the correct client secret, the production client ID, and the expected canonical URL. Start a fresh login if the one-time login state has expired.
+- **Popup blocked or cannot return to its original tab:** use the full-page sign-in fallback. Both routes use the same Google callback and account checks. If the original tab is unavailable, the completion page returns the sign-in window itself to the Hub.
 - **Sessions lost during a deployment:** confirm the deployment still points to the same intended database and has the same approved-account mapping. Durable session state belongs in the database, not Render's ephemeral filesystem. See [Render deployment storage behavior](https://render.com/docs/deploys).
 
 Use error categories and request IDs for troubleshooting. Do not paste client secrets, OAuth authorization codes, identity tokens, or session-cookie values into GitHub issues or logs.

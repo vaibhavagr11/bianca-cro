@@ -141,7 +141,7 @@ matches an original bullet in the same destination; manual edits are recorded as
 ## Deploy the backend
 
 For Google account sign-in on the hosted Hub, follow the [Google Cloud and Render setup](google-hub-sign-in.md).
-It adds a separate optional authentication migration and 12-hour browser sessions. The bearer-token
+It adds popup sign-in, a full-page fallback, a separate optional authentication migration, and 7-day browser sessions. The bearer-token
 instructions below remain applicable to the review connector and to hosted deployments with Google
 sign-in disabled.
 
