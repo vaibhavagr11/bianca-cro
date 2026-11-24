@@ -9,7 +9,9 @@ Both use the approved blue/navy design, the title **Sales Pipeline Updates**, an
 
 ## Hosted backend
 
-Open `/review/app` on the Bianca backend. Enter your assigned reviewer access token in the connection panel. It is held only in this page's memory, is sent in the Authorization header, and is cleared on disconnect or page exit. The live page does not put credentials or company data in localStorage, sessionStorage, a URL, or the HTML source. The page requests only fixed, same-origin `/review/...` routes.
+Open `/review/app` on the Bianca backend. With Google sign-in enabled, choose **Continue with Google** and use an approved Bianca account. The Hub keeps a secure session for 12 hours from sign-in; refreshes and reopening the page do not extend that deadline. **Sign out** revokes the session and clears the displayed company data. See [Google sign-in setup](../docs/google-hub-sign-in.md).
+
+While Google sign-in is disabled during rollout, enter your assigned reviewer access token in the connection panel. That token is held only in page memory, is sent in the Authorization header, and is cleared on disconnect or page exit. The live page does not put credentials or company data in localStorage, sessionStorage, a URL, or the HTML source. Google mode uses a server-issued HttpOnly cookie; browser API calls stay on the same origin.
 
 The workspace tabs below the status strip open **Pipeline Updates** and **Daily Brief**. A normal visit opens Pipeline Updates. The email's link uses `/review/app?tab=daily-brief&brief=<saved-brief-id>` and opens that saved brief after sign-in. Daily Brief loads independently of the live Pipeline Sheet read and displays the saved email tables in an isolated frame. New briefs include every available row. An earlier archive with only email HTML displays its saved rows with an explanation. Opening the tab without a brief ID requests today's saved brief and shows an empty state while it is unavailable.
 
