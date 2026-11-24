@@ -42,12 +42,14 @@ The configured default destination is the [Pipeline tab of the designated source
 
 The hosted Hub can use approved Bianca Google Workspace accounts with popup sign-in and 7-day absolute sessions.
 The Hub stays open during sign-in; a full-page fallback is available when popups are blocked.
-Google sign-in is opt-in: apply the separate `--hub-auth` migration and configure the account allowlist
+Gibb's approved account uses the separate `GA` reviewer identity. Sales owners remain `RG`, `NC`, `NDL`, and `MG`.
+Google sign-in is opt-in: apply the separate `--hub-auth` migrations (022 and additive 023) and configure the account allowlist
 before enabling `HUB_GOOGLE_AUTH_ENABLED` in Render. The review connector keeps its individual bearer
 credentials, and scheduled n8n requests keep their ingest credential.
 
-This feature is disabled by default. Enabling it requires the optional review migrations, a configured Google Sheets
-connection, and separate founder review credentials. Apply the review migrations with `uv run python -m scripts.migrate --sheet-review`.
+Sales Pipeline Updates is disabled by default. Enabling it requires the optional review migrations, a configured Google Sheets
+connection, and approved reviewer access through the configured sign-in method. Apply the review migrations with
+`uv run python -m scripts.migrate --sheet-review`; Google sign-in also requires the separate setup linked above.
 
 For changes to Daily Brief wording or delivery, see the [Daily Brief review handoff](DAILY_BRIEF_REVIEW.md).
 
