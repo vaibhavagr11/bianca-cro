@@ -1743,4 +1743,52 @@ test('Popup polling expires after ten minutes and ignores an in-flight result af
   assert.equal(businessReads,0);assert.equal(page.get('#account-status').hidden,true);
 });
 
+test('Retrying after an isolated failed popup ignores its late messages and in-flight probe',async()=>{
+  const first=popupWindow(),second=popupWindow();let opens=0,reads=0,finishOldProbe,authenticated=false;
+  const page=fakePage(undefined,'/review/app',{
+    sessionFetcher:async()=>{reads++;if(reads===2)return new Promise(resolve=>{finishOldProbe=resolve;});return authResponse(authenticated?signedInSession():{mode:'google',authenticated:false});},
+    popupOpen:()=>++opens===1?first:second,fetcher:async()=>authResponse(snapshot())
+  });
+  await flush();popupClick(page);first.closed=true;tickPopupPoll(page);
+  popupClick(page);assert.equal(opens,2);
+  popupMessage(page,first,{type:'bianca-hub-auth-complete',success:false,error:'not_allowed'});
+  assert.equal(page.get('#connection-error').hidden,true);
+  authenticated=true;popupMessage(page,second,{type:'bianca-hub-auth-complete',success:true});await flush();
+  finishOldProbe(authResponse({mode:'google',authenticated:false}));await flush();
+  assert.equal(page.get('#connection-panel').hidden,true);assert.equal(page.get('#account-status').hidden,false);
+  assert.ok(page.get('#review-list').innerHTML.includes('A real company'));
+  assert.equal([...page.timers.values()].some(t=>t.ms===2000),false);
+});
+
+test('Gibb signs in as reviewer GA and approvals keep his attribution without adding a sales owner',async()=>{
+  const auth={...signedInSession(),actor:'GA',email:'gibb.anella@bianca-ai.com'},writes=[];
+  let approved=false;
+  const after=completed();after.activity[0].actor='GA';
+  const page=fakePage(undefined,'/review/app',{
+    sessionFetcher:async()=>authResponse(auth),
+    fetcher:async(url,options)=>{
+      if(url==='/review/workspace')return authResponse(approved?after:snapshot());
+      writes.push({url,options});approved=true;return authResponse({status:'approved'});
+    }
+  });
+  await flush();
+  assert.equal(page.get('#connection-panel').hidden,true);
+  assert.ok(page.get('#account-status').textContent.includes('gibb.anella@bianca-ai.com'));
+  assert.ok(page.get('#review-list').innerHTML.includes('A real company'));
+  page.events.click({target:{closest:()=>({dataset:{action:'approve'},closest:()=>({dataset:{id:'p-1'}})})}});await flush();
+  assert.equal(writes.length,1);assert.equal(writes[0].url,'/review/proposals/p-1/approve');
+  assert.equal(writes[0].options.headers['X-CSRF-Token'],auth.csrf_token);
+  assert.equal('actor' in JSON.parse(writes[0].options.body),false,'Reviewer identity comes from the authenticated server session.');
+  assert.ok(page.get('#activity-list').innerHTML.includes(' · GA'));
+  assert.equal(html.includes('data-owner="GA"'),false);assert.equal(html.includes('<option value="GA">'),false);
+  assert.deepEqual([...new Set([...html.matchAll(/data-owner="([^"]+)"/g)].map(match=>match[1]))],['all','RG','NC','NDL','MG']);
+});
+
+test('Adding reviewer GA does not allow unknown session actor codes',async()=>{
+  let reads=0;
+  const page=fakePage(undefined,'/review/app',{sessionFetcher:async()=>authResponse({...signedInSession(),actor:'UNKNOWN'}),fetcher:async()=>{reads++;return authResponse(snapshot());}});
+  await flush();assert.equal(reads,0);assert.equal(page.get('#account-status').hidden,true);
+  assert.equal(page.get('#sign-in-form').hidden,true);assert.ok(page.get('#connection-error').textContent.includes('temporarily unavailable'));
+});
+
 (async()=>{for(const t of tests){try{await t.fn();passed++;process.stdout.write('PASS '+t.name+'\n');}catch(error){failed++;process.stdout.write('FAIL '+t.name+'\n  '+error.stack+'\n');}}process.stdout.write(`\n${passed} passed; ${failed} failed.\n`);process.exitCode=failed?1:0;})();
