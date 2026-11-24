@@ -4,6 +4,7 @@ Usage (from backend/):
     uv run python -m scripts.migrate           # apply new migrations
     uv run python -m scripts.migrate --seed    # ...and (re)run seeds/*.sql
     uv run python -m scripts.migrate --sheet-review  # also apply optional War Room migrations
+    uv run python -m scripts.migrate --hub-auth  # also apply optional Google browser sign-in schema
     uv run python -m scripts.migrate --status  # list applied / pending, change nothing
 """
 
@@ -18,6 +19,7 @@ MIGRATIONS_DIR = BACKEND_DIR / "migrations"
 SEEDS_DIR = BACKEND_DIR / "seeds"
 SHEET_REVIEW_MIGRATIONS = {"012_sheet_review", "013_sheet_review_columns", "014_review_daily_lineage",
                            "021_review_priority_selection"}
+HUB_AUTH_MIGRATIONS = {"022_hub_google_auth"}
 
 
 def main() -> int:
@@ -25,6 +27,7 @@ def main() -> int:
     parser.add_argument("--seed", action="store_true", help="run seeds/*.sql after migrating")
     parser.add_argument("--status", action="store_true", help="show applied/pending and exit")
     parser.add_argument("--sheet-review", action="store_true", help="include the optional War Room schema")
+    parser.add_argument("--hub-auth", action="store_true", help="include the optional Google browser sign-in schema")
     args = parser.parse_args()
 
     files = sorted(MIGRATIONS_DIR.glob("*.sql"))
@@ -38,6 +41,8 @@ def main() -> int:
         conn.commit()
         applied = {row[0] for row in conn.execute("select version from schema_migrations")}
         deferred = set() if args.sheet_review else SHEET_REVIEW_MIGRATIONS - applied
+        if not args.hub_auth:
+            deferred |= HUB_AUTH_MIGRATIONS - applied
         pending = [f for f in files if f.stem not in applied and f.stem not in deferred]
         conn.commit()  # close the read so each migration below gets its own real transaction
 
