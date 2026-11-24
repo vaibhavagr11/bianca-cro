@@ -19,7 +19,7 @@ MIGRATIONS_DIR = BACKEND_DIR / "migrations"
 SEEDS_DIR = BACKEND_DIR / "seeds"
 SHEET_REVIEW_MIGRATIONS = {"012_sheet_review", "013_sheet_review_columns", "014_review_daily_lineage",
                            "021_review_priority_selection"}
-HUB_AUTH_MIGRATIONS = {"022_hub_google_auth"}
+HUB_AUTH_MIGRATIONS = {"022_hub_google_auth", "023_hub_gibb_reviewer"}
 
 
 def main() -> int:
