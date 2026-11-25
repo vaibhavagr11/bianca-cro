@@ -478,6 +478,129 @@ class PassingGate:
         pass
 
 
+def status_check_data():
+    company = deal("Legal Review Co")
+    action = "Confirm whether legal approved the pilot terms before sending the order form."
+    quote = "Bianca needs to confirm whether legal approved the pilot terms before sending the order form."
+    original = email("legal-status-evidence", company["company_id"], quote)
+    evidence = insight("legal-status", company["company_id"], quote, SALES, type_="need", origin=original,
+                       quote=quote, owner_side=None, dated=False)
+    entry = {
+        "action": action, "action_kind": "status_check", "responsible_side": "bianca",
+        "status_question": "Has legal approved the pilot terms?",
+        "commercial_impact": "The answer determines whether Bianca can send the order form.",
+        "why": "The legal approval determines whether the order form can be sent.",
+        "evidence": ["I1"], "action_scope": SALES,
+    }
+    profile = {"opportunity_id": company["id"], "generated_at": NOW, "profile": {
+        "refs": {"I1": evidence["id"]}, "recommended_actions": [entry],
+    }}
+    return BriefData([company], [original], [evidence], [profile])
+
+
+@pytest.mark.parametrize("verification", ["off", "shadow"])
+def test_explicit_status_check_uses_its_source_and_rec_ref_in_brief_and_full_view(
+        monkeypatch, brief_client, verification):
+    checked = []
+
+    class Gate(PassingGate):
+        def __call__(self, actions):
+            checked.extend(actions)
+            return super().__call__(actions)
+
+    monkeypatch.setattr(brief_api, "create_gate", lambda *_: Gate())
+    monkeypatch.setattr(brief_api.settings, "brief_action_secret", __import__("pydantic").SecretStr("secret"))
+    monkeypatch.setattr(brief_api.actions, "link", lambda ref, *_: f"https://actions.example/{ref}")
+    data = status_check_data()
+    action = data.profiles[0]["profile"]["recommended_actions"][0]["action"]
+    ref = f"rec:{brief_api._recommendation_ref(data.deals[0]['id'], action)}"
+    result = brief_client(data).post(f"/brief/build?dry_run=true&version=v2&verification={verification}",
+                                     headers={"X-Ingest-Token": "test-token"}).json()
+    for payload in (result["payload"], result["full_payload"]):
+        founder = payload["sections"][0]
+        [highlight] = founder["highlights"]
+        assert highlight["deal"] == "Legal Review Co"
+        assert highlight["move"]["tag"] == "Confirm status"
+        assert highlight["move"]["text"] == action
+        assert "Nov 3" in highlight["move"]["when"]
+        assert founder["also_active"] == []
+    for body in (html.unescape(result["html"]), result["text"], html.unescape(result["full_html"])):
+        assert action in body and "Confirm status" in body
+    for body in (result["html"], result["full_html"]):
+        assert "Email · Nov 3" in html.unescape(body) and f"https://actions.example/{ref}" in body
+    if verification == "shadow":
+        assert checked
+        assert all(a.key.startswith(ref) and a.origin_record_id == "legal-status-evidence"
+                   and a.kind == "recommendation" for a in checked)
+
+
+@pytest.mark.parametrize("verdict", ["handled", "unclear", "waiting"])
+def test_status_check_verdict_removes_it_from_both_brief_and_full_highlights(monkeypatch, brief_client, verdict):
+    checked = []
+
+    class Gate(PassingGate):
+        def __call__(self, actions):
+            checked.extend(actions)
+            return {a.key: Verdict(verdict, "fixture") for a in actions}
+
+    monkeypatch.setattr(brief_api, "create_gate", lambda *_: Gate())
+    result = brief_client(status_check_data()).post("/brief/build?dry_run=true&version=v2&verification=shadow",
+                                                    headers={"X-Ingest-Token": "test-token"}).json()
+    assert checked and all(a.origin_record_id == "legal-status-evidence" for a in checked)
+    for payload in (result["payload"], result["full_payload"]):
+        assert payload["sections"][0]["highlights"] == []
+    if verdict == "handled":
+        for body in (result["html"], result["text"], result["full_html"]):
+            assert "Confirm whether legal approved" not in body
+
+
+@pytest.mark.parametrize("verification", ["off", "shadow"])
+@pytest.mark.parametrize("invalid", [
+    "stage-only", "legacy-generic", "missing-evidence", "pipeline-evidence", "customer-owned", "unclear-owner",
+    "missing-question", "missing-impact", "generic-question", "missing-source", "bad-quote", "stale-profile",
+    "inferred-source-date",
+])
+def test_ineligible_status_checks_do_not_surface_in_brief_or_full_view(
+        monkeypatch, brief_client, verification, invalid):
+    monkeypatch.setattr(brief_api, "create_gate", lambda *_: PassingGate())
+    data = status_check_data()
+    entry = data.profiles[0]["profile"]["recommended_actions"][0]
+    if invalid == "stage-only":
+        data.messages = data.insights = data.profiles = []
+    elif invalid == "legacy-generic":
+        entry.clear()
+        entry.update(action="Check where this deal stands", evidence=["I1"], action_scope=SALES)
+    elif invalid == "missing-evidence":
+        entry["evidence"] = []
+    elif invalid == "pipeline-evidence":
+        entry["evidence"] = ["P1"]
+    elif invalid == "customer-owned":
+        entry["responsible_side"] = "customer"
+    elif invalid == "unclear-owner":
+        entry.pop("responsible_side")
+    elif invalid == "missing-question":
+        entry.pop("status_question")
+    elif invalid == "missing-impact":
+        entry.pop("commercial_impact")
+    elif invalid == "generic-question":
+        entry["status_question"] = "What is the status?"
+    elif invalid == "missing-source":
+        data.messages = []
+    elif invalid == "bad-quote":
+        data.insights[0]["quote"] = "An unsupported status question."
+    elif invalid == "stale-profile":
+        data.profiles[0]["generated_at"] = NOW - timedelta(days=3)
+    elif invalid == "inferred-source-date":
+        data.messages[0]["meta"]["date_inferred"] = True
+    result = brief_client(data).post(f"/brief/build?dry_run=true&version=v2&verification={verification}",
+                                     headers={"X-Ingest-Token": "test-token"}).json()
+    for payload in (result["payload"], result["full_payload"]):
+        founder = payload["sections"][0]
+        assert founder["highlights"] == [] and founder["also_active"] == []
+    for body in (html.unescape(result["html"]), result["text"], html.unescape(result["full_html"])):
+        assert "Confirm whether legal approved" not in body and "Check where this deal stands" not in body
+
+
 @pytest.mark.parametrize("verification", ["off", "shadow"])
 def test_every_meeting_tied_to_a_deal_gets_a_prep_line(monkeypatch, brief_client, verification):
     monkeypatch.setattr(brief_api, "create_gate", lambda *_: PassingGate())

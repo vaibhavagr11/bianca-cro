@@ -60,6 +60,27 @@ def test_check_accepts_fact_citations():
     assert data["summary"]["evidence"] == ["P1"] and "unsupported" not in data["summary"]
 
 
+def test_legacy_action_defaults_to_an_ordinary_move():
+    action = Action(action="Send the pilot terms", why="The buyer asked", urgency="high", evidence=["I1"])
+    assert action.action_kind == "next_move" and action.responsible_side == "unclear"
+    assert action.status_question is action.commercial_impact is None
+
+
+def test_status_check_keeps_its_question_impact_and_responsibility():
+    action = Action(
+        action="Confirm whether legal approved the terms before sending the order form",
+        why="Legal approval determines whether the order form can be sent", urgency="high", evidence=["I1"],
+        action_scope="deal_progression", action_kind="status_check", responsible_side="bianca",
+        status_question="Has legal approved the terms?",
+        commercial_impact="The answer determines whether Bianca can send the order form.",
+    )
+    data, _ = check(profile(recommended_actions=[action]), {"I1"})
+    saved, = data["recommended_actions"]
+    assert saved["action_kind"] == "status_check" and saved["responsible_side"] == "bianca"
+    assert saved["status_question"] == action.status_question
+    assert saved["commercial_impact"] == action.commercial_impact
+
+
 @pytest.mark.parametrize(("stage", "uses_pilot_scope"), [("4. Pilot", True), ("3. Proposal", False)])
 def test_generated_recommendations_use_pilot_scope_only_at_pilot_stage(stage, uses_pilot_scope):
     client = Mock()
