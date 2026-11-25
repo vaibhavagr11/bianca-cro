@@ -49,6 +49,10 @@ class Action(BaseModel):
     evidence: list[str]
     action_scope: ActionScope = Field(default="out_of_scope", description="Scope of the suggested action itself.")
     followup_only: bool = Field(default=False, description="True if Bianca would only nudge or re-ask for a pending reply.")
+    action_kind: Literal["next_move", "status_check"] = "next_move"
+    responsible_side: Literal["bianca", "customer", "unclear"] = "unclear"
+    status_question: str | None = Field(default=None, description="The specific unresolved commercial question to answer.")
+    commercial_impact: str | None = Field(default=None, description="The commercial decision or next step the answer affects.")
 
 
 class Profile(BaseModel):
@@ -90,6 +94,14 @@ Rules:
   a request or idea into an agreement, infer a deadline or assignee, or suggest repeating completed work.
   Set followup_only to true for a check-in, reminder, or repeated ask that just chases a pending response.
   Use false if Bianca also has a concrete new step, such as sending revised terms or preparing the pilot plan.
+  Use action_kind=status_check only when current cited insights explicitly establish a specific unresolved
+  commercial question and why its answer affects a buyer decision or Bianca's next commercial step. State that
+  question in status_question, its consequence in commercial_impact, and responsible_side=bianca only when the
+  cited source assigns Bianca the work of resolving it. Cite the original quoted insight, including the source
+  that establishes the outstanding question. Pipeline presence, stage, missing profile information, elapsed
+  time, silence, and a general "check where the deal stands" do not establish a status check. A customer-owned
+  pending reply stays followup_only=true with responsible_side=customer. Omit a status check when responsibility
+  or its commercial consequence is unclear. Other concrete actions use action_kind=next_move.
 - A blocker is commercially relevant when the evidence shows what Bianca deal decision or step it prevents.
   A support issue alone does not establish a commercial blocker.
 - unknowns: list what matters for closing or growing the deal that the evidence does not say.
