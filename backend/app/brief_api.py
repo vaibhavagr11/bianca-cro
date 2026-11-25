@@ -184,6 +184,24 @@ def _profile_sales_entry(entry: dict, profile: dict, sales_by_id: dict[str, dict
                                   for r in evidence)
 
 
+def _status_source_valid(insight: dict, records: dict[str, dict], deal: dict, now: datetime) -> bool:
+    record = records.get(str(insight.get("origin_record_id")))
+    return bool(
+        record
+        and insight["action_scope"] == "deal_progression"
+        and insight["status"] == "open"
+        and str(insight["opportunity_id"]) == str(deal["id"])
+        and str(insight["company_id"]) == str(record["company_id"]) == str(deal["company_id"])
+        and insight["source"] == record["source"]
+        and record["source"] in ("gmail", "notes")
+        and not (record.get("meta") or {}).get("date_inferred")
+        and record["occurred_at"] is not None
+        and record["occurred_at"] <= now
+        and insight["origin_occurred_at"] == record["occurred_at"]
+        and extractor.quote_in_record(insight["quote"], record, body_only=True)
+    )
+
+
 # Words too common in company names to tie a guest's email domain to one deal on their own.
 _GENERIC_NAME_WORDS = frozenset("grupo group foods food wines wine brands brand company companies club coca cola "
                                 "distribuidora distri bebidas drinks snacks snack global international holding "
@@ -728,10 +746,20 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
         eligible_statuses = ("open", "possibly_done") if gate else ("open",)
         bianca_actions = [r for r in sales if r["type"] in ("commitment", "next_step") and r["owner_side"] == "bianca"]
         open_items = [r for r in bianca_actions if r["status"] in eligible_statuses]
+        status_record_ids = {
+            r["origin_record_id"]
+            for profile in profiles.values()
+            for entry in profile["profile"].get("recommended_actions") or []
+            if entry.get("action_kind") == "status_check"
+            for ref in entry.get("evidence") or []
+            if (r := sales_by_id.get(str((profile["profile"].get("refs") or {}).get(ref))))
+            and r["origin_record_id"]
+        }
         # Who wrote the passage each open item quotes: Bianca, the customer, or the notes doc.
         recs = {str(r["id"]): r for r in conn.execute(
-            "select id, subject, body, participants from source_records where id = any(%s)",
-            ([rid for r in open_items for rid in r["source_record_ids"]],))}
+            "select id, source, company_id, subject, body, occurred_at, participants, meta"
+            " from source_records where id = any(%s)",
+            (list({rid for r in open_items for rid in r["source_record_ids"]} | status_record_ids),))}
         last_contact = {str(r["company_id"]): r["last"].astimezone(tz).date() for r in conn.execute(
             "select company_id, max(occurred_at) as last from source_records where workspace_id = %s"
             " and company_id is not null and occurred_at <= now() group by company_id", (workspace_id,))}
@@ -908,12 +936,26 @@ def build_brief_v2(dry_run: bool = False, since: datetime | None = None,
             when = when.astimezone(tz)  # notes carry the meeting's calendar date in UTC
         source = f"{SOURCE_LABEL.get(newest['source'], newest['source'])} · {when:%b} {when.day}" if newest else ""
         ref = _recommendation_ref(d["id"], text)
+        action_kind = entry.get("action_kind", "next_move") if with_why else "next_move"
+        status_evidence_valid = False
+        if action_kind == "status_check":
+            cited = entry.get("evidence") or []
+            status_evidence_valid = (verified and len(refs) == len(cited)
+                                     and _profile_sales_entry(entry, prof_row, sales_by_id, d)
+                                     and bool(source) and when is not None
+                                     and any(r["type"] in ("blocker", "objection", "need", "commitment", "next_step")
+                                             for r in resolved)
+                                     and all(_status_source_valid(r, recs, d, now) for r in resolved))
         if gate and with_why:
             sources[f"rec:{ref}"] = brief_review.profile_source(prof, entry, ins_by_id)
         return brief_v2.Note(text, entry.get("why") if with_why else None, verified, entry.get("basis"),
                              link if verified else None, frozenset(str(x["id"]) for x in resolved), source, ref,
                              followup_only=with_why and entry.get("followup_only") is True,
-                             on=when.date() if when else None)
+                             on=when.date() if when else None, action_kind=action_kind,
+                             responsible_side=entry.get("responsible_side", "unclear") if with_why else "unclear",
+                             status_question=entry.get("status_question") if with_why else None,
+                             commercial_impact=entry.get("commercial_impact") if with_why else None,
+                             status_evidence_valid=status_evidence_valid)
 
     def replied_since(evidence: frozenset):
         """Already-done cue for builds without the pre-send check (11/09 evals, FEMSA): the day we last wrote in

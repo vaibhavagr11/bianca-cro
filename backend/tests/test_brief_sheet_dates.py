@@ -55,9 +55,8 @@ def test_dated_sheet_step_is_due_on_its_date_and_overdue_after_it(monkeypatch, b
     for hidden in ("Check back", "Renewal call", "Email her Monday", "Revisit after their planning cycle"):
         assert hidden not in body and hidden not in result["text"]
     assert "[Sheet date] Due Today — Email Franco the revised deck (due today)" in result["text"]
-    # A dated deal gets no "check where this deal stands" row on top, and its Sheet row is not sent for checking.
-    if verification == "off":
-        assert {h["deal"] for h in section["highlights"]} == {"Long Past", "Undated"}
+    # Sheet timing does not create a status action, and the dated Sheet row is not sent for checking.
+    assert section["highlights"] == []
     noted = [deal for _, rows in section.get("verification", []) for deal, _ in rows]
     assert not {"Due Today", "Late", "Months Out"} & set(noted)
 

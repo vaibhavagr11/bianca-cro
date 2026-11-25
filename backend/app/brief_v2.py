@@ -76,6 +76,11 @@ class Note:
     followup_only: bool = False
     on: date | None = None          # day of the newest evidence it cites
     replied: date | None = None     # we wrote in every email thread it cites on or before this day, after `on`
+    action_kind: str = "next_move"
+    responsible_side: str = "unclear"
+    status_question: str | None = None
+    commercial_impact: str | None = None
+    status_evidence_valid: bool = False
 
 
 @dataclass
@@ -571,7 +576,49 @@ def recorded_move(i: Item, text: str) -> Move:
                      f"date mentioned {_date(i.due)}" if i.due else f"recorded {_date(i.recorded)}", i)
 
 
-def primary_move(d: DealView, today: date, used: set[str]) -> Move:
+_GENERIC_STATUS = re.compile(
+    r"^(?:(?:check|confirm|review|verify|clarify|update|assess)(?: the)?(?: current)?"
+    r"(?: (?:deal|client|customer|pilot|opportunity))? status"
+    r"(?: of (?:this |the |our )?(?:deal|client|customer|pilot|opportunity))?"
+    r"|(?:(?:check|confirm|review) )?where (?:this|the) (?:deal|client|opportunity) stands"
+    r"|what is (?:the )?(?:current )?(?:deal |pilot )?status"
+    r"|(?:confirmar|revisar|verificar) (?:el )?(?:estado|estatus)(?: actual)?(?: del (?:cliente|piloto))?)"
+    r"(?: with (?:the )?(?:buyer|customer|client))?(?: and (?:the )?next steps?)?$"
+)
+_CUSTOMER_STATUS_REPLY = re.compile(
+    r"^(?:(?:check|confirm|verify) (?:whether|if) |whether |has |have |did |will )"
+    r"(?:the )?(?:buyer|customer|client|prospect|they)\b.*"
+    r"\b(?:repl(?:y|ied)|respond(?:ed)?|answer(?:ed)?|approv(?:e|ed)|confirm(?:ed)?)\b"
+)
+_GENERIC_COMMERCIAL_IMPACT = re.compile(
+    r"^(?:to )?(?:(?:move|advance|progress|close|understand|clarify) (?:the |this )?"
+    r"(?:deal|opportunity)(?: forward)?|(?:decide|determine|plan) (?:the )?next steps?)$"
+)
+
+
+def _generic_status(text: str | None) -> bool:
+    return bool(_GENERIC_STATUS.fullmatch(norm(text).rstrip(".!?")))
+
+
+def _recommendation_move(d: DealView, note: Note, today: date) -> Move | None:
+    if not note.verified or not note.text.strip() or _generic_status(note.text):
+        return None
+    if note.action_kind != "status_check":
+        return note_move("AI recommendation", note.text, _last(d, today), note, note.link, d.deal)
+    question = (note.status_question or "").strip()
+    impact = (note.commercial_impact or "").strip()
+    if (not note.status_evidence_valid or note.responsible_side != "bianca" or not note.evidence
+            or not note.ref or not note.source.strip() or note.on is None or note.on > today
+            or not question or not impact or _generic_status(question) or _generic_status(impact)
+            or _GENERIC_COMMERCIAL_IMPACT.fullmatch(norm(impact).rstrip(".!?"))
+            or note.followup_only or is_followup_only(note.text) or is_waiting_only(note.text)
+            or is_followup_only(question) or is_waiting_only(question)
+            or _CUSTOMER_STATUS_REPLY.search(norm(question))):
+        return None
+    return note_move("Confirm status", note.text, f"evidence {_date(note.on)}", note, note.link, d.deal)
+
+
+def primary_move(d: DealView, today: date, used: set[str]) -> Move | None:
     """One next move per deal.
 
     With a verified blocker (the situation shown next to it), the move must address that blocker: a promise,
@@ -579,15 +626,21 @@ def primary_move(d: DealView, today: date, used: set[str]) -> Move:
     clarification rather than show an unrelated task. Without a blocker: obligations first, then the customer,
     then AI suggestions.
     """
-    open_items = [i for i in d.items if i.id not in used]
+    open_items = [i for i in d.items if i.id not in used and not _generic_status(i.text)]
+    recommendations = list(d.recommendations)
+    if d.recommendation and d.recommendation not in recommendations:
+        recommendations.insert(0, d.recommendation)
+    used_actions = {norm(i.text).rstrip(".!?") for i in d.items if i.id in used}
+    recommendations = [r for r in recommendations if not (
+        r.action_kind == "status_check" and r.evidence & used and norm(r.text).rstrip(".!?") in used_actions)]
     b = d.blocker if d.blocker and d.blocker.verified else None
     if b is not None:
         for i in sorted((i for i in open_items if i.kind in ("owed", "customer_request", "next_step") and i.id in b.evidence),
                         key=lambda i: i.due or date.max):
             return recorded_move(i, i.text)
-        for r in d.recommendations:
-            if r.verified and addresses(r.evidence, b):
-                return note_move("AI recommendation", r.text, _last(d, today), r, r.link)
+        for r in recommendations:
+            if addresses(r.evidence, b) and (move := _recommendation_move(d, r, today)):
+                return move
         if d.last_reply and b.on and d.last_reply > b.on:
             # The customer has written since this blocker was recorded; the profile was not rebuilt because nothing
             # new was extracted from the reply, so do not present the old blocker as untouched.
@@ -604,10 +657,10 @@ def primary_move(d: DealView, today: date, used: set[str]) -> Move:
         for i in sorted((i for i in open_items if i.kind == kind and i.bucket not in ("stale", "old_undated")),
                         key=lambda i: (i.due or date.max, -i.recorded.toordinal())):
             return recorded_move(i, i.text)
-    if d.recommendation and d.recommendation.verified:
-        return note_move("AI recommendation", d.recommendation.text, _last(d, today), d.recommendation,
-                         d.recommendation.link)
-    return Move("Confirm status", "Check where this deal stands", _last(d, today), None)
+    for r in recommendations:
+        if move := _recommendation_move(d, r, today):
+            return move
+    return None
 
 
 def _last(d: DealView, today: date) -> str:
@@ -659,17 +712,21 @@ def deal_signals(v: DealView, today: date, in_today: set[str], critical_ahead: i
     dated = [i for i in v.items if i.kind == "owed" and i.bucket in ("overdue", "week")]
     if dated:
         signals.append(f"deadline: {len(dated)} dated promise(s)")
-    if any(i.kind == "customer_request" and i.bucket not in ("stale", "old_undated")
-           and (today - i.recorded).days <= REQUEST_FRESH_DAYS
-           for i in v.items):
-        signals.append("outstanding customer request")
+    requests = [i for i in v.items if i.kind == "customer_request" and i.bucket not in ("stale", "old_undated")
+                and not _generic_status(i.text)]
+    if requests:
+        fresh = any((today - i.recorded).days <= REQUEST_FRESH_DAYS for i in requests)
+        signals.append("outstanding customer request" if fresh else "recorded customer request")
     if v.blocker and v.blocker.verified:
         signals.append("verified blocker")
     if v.developments:
         signals.append(f"{v.developments} new or late-recorded development(s)")
     if v.unanswered and reply_label(v.unanswered) == "reply_needed":
         signals.append(f"customer email waiting {v.unanswered.days}d")
-    if v.recommendation and v.recommendation.verified:
+    if any(i.kind == "next_step" and i.bucket not in ("stale", "old_undated") and not _generic_status(i.text)
+           for i in v.items):
+        signals.append("recorded next step")
+    if v.recommendation and _recommendation_move(v, v.recommendation, today):
         signals.append("next milestone: verified recommendation")
     return critical, signals
 
@@ -703,13 +760,13 @@ def select_deals(eligible: list[DealView], today: date, in_today: set[str], crit
             take(v, f"In Talks preference (target {in_talks_target}): " + "; ".join(info[v.deal][1]))
             talks += 1
     for v in ranked:
-        if info[v.deal][1] or v.rank != 1:
-            take(v, "ranked by signals: " + ("; ".join(info[v.deal][1]) or "no signal beyond recent activity"))
+        if info[v.deal][0] or info[v.deal][1]:
+            take(v, "ranked by signals: " + "; ".join(info[v.deal][1]))
 
     selected = [v for v in ranked if v.deal in chosen]
     if full:
         selected += [v for v in ranked if v.deal not in chosen
-                     and (info[v.deal][0] or info[v.deal][1] or v.rank != 1)]
+                     and (info[v.deal][0] or info[v.deal][1])]
     order = {v.deal: n for n, v in enumerate(selected, start=1)}
     records = []
     for v in ranked:
@@ -717,7 +774,7 @@ def select_deals(eligible: list[DealView], today: date, in_today: set[str], crit
         if v.deal in chosen:
             reason = chosen[v.deal]
         elif v.deal in order:
-            reason = "additional eligible deal: " + ("; ".join(sig) or "no signal beyond recent activity")
+            reason = "additional eligible deal: " + "; ".join(sig)
         elif not sig and not crit:
             reason = "no evidence-backed signal (recent activity alone is not enough)"
         else:
@@ -968,6 +1025,9 @@ def _split_followups(view: DealView, today: date, used: set[str], cadence: Caden
     for rec in recommendations:
         if not rec.verified:
             continue
+        if (_generic_status(rec.text)
+                or (rec.action_kind == "status_check" and _recommendation_move(view, rec, today) is None)):
+            continue
         repeats_reminder = bool(rec.evidence & followup_items) and norm(rec.text).rstrip(".!?") in reminder_texts
         if (rec.followup_only or is_followup_only(rec.text) or (timed and is_waiting_only(rec.text))
                 or repeats_reminder):
@@ -997,7 +1057,8 @@ def _split_followups(view: DealView, today: date, used: set[str], cadence: Caden
         if worded:
             followups.append(replace(target, text=worded[0], when=worded[1], deal=view.deal))
 
-    return (replace(view, items=[i for i in view.items if i.id not in followup_items], unanswered=unanswered,
+    return (replace(view, items=[i for i in view.items if i.id not in followup_items and not _generic_status(i.text)],
+                    unanswered=unanswered,
                     blocker=blocker, recommendation=next(iter(deal_moves), None), recommendations=deal_moves),
             followups, bool(followups or nudges))
 
@@ -1088,24 +1149,25 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
     followup_only = set()
     dated_only = set()
     today_only = set()
+    no_action = set()
     sheet_dated = {r.deal for r in today_rows if r.tag == "Sheet date"} | {deal for deal, _ in sheet_later}
     primary_moves = {}
     for original in eligible:
         v = action_views[original.deal]
         move = primary_move(v, today, used)
         has_reminder = bool(waits_by_deal.get(v.deal) or reminders[v.deal] or v.deal in quiet_reminders)
-        proposal_only = move.tag == "Confirm status" and any(i.kind == "proposed" for i in original.items)
-        # A generic fallback would give a follow-up-only deal a highlight slot.
-        if proposal_only or (has_reminder and move.tag in ("Confirm status", "Clarify next action")):
+        if move is None:
+            if has_reminder or any(i.kind == "proposed" for i in original.items):
+                followup_only.add(v.deal)
+            elif v.deal in sheet_dated:
+                dated_only.add(v.deal)
+            elif v.deal in in_today:
+                today_only.add(v.deal)
+            else:
+                no_action.add(v.deal)
+            continue
+        if has_reminder and move.tag == "Clarify next action":
             followup_only.add(v.deal)
-            continue
-        # The founder already dated this deal's next step in the Sheet: no "check where this stands" on top of it.
-        if move.tag == "Confirm status" and v.deal in sheet_dated:
-            dated_only.add(v.deal)
-            continue
-        # A deal whose one open thing is already in Needs you today has nothing left for a second row.
-        if move.tag == "Confirm status" and v.deal in in_today:
-            today_only.add(v.deal)
             continue
         primary_moves[v.deal] = move
         highlight_views.append(v)
@@ -1122,6 +1184,9 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
         elif v.deal in today_only:
             audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
                                          "not eligible: already in Needs you today and nothing else is open"))
+        elif v.deal in no_action:
+            audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
+                                         "not eligible: no concrete next move or source-backed status check"))
         elif v.rank in PROSPECT_RANKS and v not in eligible:
             status = deal_status(v, today)
             audit.append(SelectionRecord(v.deal, v.stage, False, None, [], [],
@@ -1132,7 +1197,11 @@ def build_section(code: str, name: str, short: str, views: dict[str, DealView], 
         m = primary_moves[v.deal]
         if m.item_id:
             used.add(m.item_id)
-        highlights.append((v, m, situation(v)))
+        sit = situation(v)
+        if m.tag == "Confirm status":
+            check = next(r for r in v.recommendations if m.done == f"rec:{r.ref}")
+            sit = replace(check, text=check.commercial_impact)
+        highlights.append((v, m, sit))
     shown = {v.deal for v, _, _ in highlights}
 
     # Follow-ups stay here even when the deal also has a separate highlighted move.

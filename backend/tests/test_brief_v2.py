@@ -222,8 +222,123 @@ def test_delegated_never_today_and_other_founders_deal_not_duplicated():
 
 def test_unverified_recommendation_does_not_become_a_move():
     v = view("FEMSA MX", 2, recommendation=Note("Re-engage the buyer", verified=False))
-    m = primary_move(v, TODAY, set())
-    assert m.tag == "Confirm status" and m.text == "Check where this deal stands" and m.link is None
+    assert primary_move(v, TODAY, set()) is None
+
+
+@pytest.mark.parametrize("full", [False, True], ids=["email", "full-brief"])
+def test_recent_activity_and_summary_do_not_create_a_status_action(full):
+    idle = [view(f"Quiet {rank}", rank, owner="RG", developments=1,
+                 summary=Note("The pilot was discussed", verified=True)) for rank in (1, 2, 3, 4)]
+    actual = item("Actual work", "Send the pilot agreement", due=TODAY + timedelta(days=4), deal_owner="RG")
+    views = {v.deal: v for v in [*idle, view(actual.deal, 3, owner="RG")]}
+
+    s = build_section("RG", "Ramiro", "Ramiro", views, [actual], [], TODAY, DISPLAY, full=full)
+
+    assert [(v.deal, move.item_id) for v, move, _ in s.highlights] == [(actual.deal, actual.id)]
+    assert s.also_active == []
+    assert all(not record.selected for record in s.audit if record.deal.startswith("Quiet"))
+    assert "Check where this deal stands" not in render([s], [], [], TODAY, len(views), "c", False, full=full)
+
+
+def status_check_note(**changes):
+    note = Note("Confirm the signing entity before preparing the pilot contract", verified=True,
+                evidence=frozenset({"signatory"}), source="Email · Oct 26", on=TODAY - timedelta(days=2),
+                ref="signing-entity", action_kind="status_check", responsible_side="bianca",
+                status_question="Which legal entity will sign the pilot contract?",
+                commercial_impact="The signing entity determines the contract and invoice terms",
+                status_evidence_valid=True)
+    return replace(note, **changes)
+
+
+def test_evidence_backed_status_check_preserves_its_source_and_completion_ref():
+    check = status_check_note()
+    v = view("Andina Chile", 3, owner="RG", recommendation=check, recommendations=[check])
+
+    s = section("RG", [v], [])
+
+    _, move, _ = s.highlights[0]
+    assert move.text == check.text and move.source == "Email · Oct 26"
+    assert move.tag == "Confirm status" and move.when == "evidence Oct 26"
+    assert move.done == "rec:signing-entity"
+    assert completable([s], [])[move.done] == (v.deal, check.text)
+
+
+@pytest.mark.parametrize("changes", [
+    {"verified": False},
+    {"status_evidence_valid": False},
+    {"responsible_side": "customer"},
+    {"responsible_side": "unclear"},
+    {"status_question": None},
+    {"status_question": "   "},
+    {"commercial_impact": None},
+    {"commercial_impact": "   "},
+    {"commercial_impact": "Move the deal forward"},
+    {"commercial_impact": "Determine the next steps"},
+    {"evidence": frozenset()},
+    {"source": ""},
+    {"ref": None},
+    {"on": None},
+    {"on": TODAY + timedelta(days=1)},
+    {"text": "   "},
+    {"text": "Check where this deal stands"},
+    {"status_question": "What is the current status?"},
+    {"commercial_impact": "Confirm the current status"},
+    {"status_question": "Has the buyer replied to our proposal?"},
+    {"text": "Follow up on the pilot approval", "status_question": "Has the buyer approved our proposal yet?"},
+    {"text": "Wait for the buyer's response", "status_question": "Has the buyer replied to our proposal?"},
+])
+def test_status_check_requires_a_grounded_question_with_commercial_impact(changes):
+    check = status_check_note(**changes)
+    v = view("Andina Chile", 3, owner="RG", recommendation=check, recommendations=[check])
+
+    assert primary_move(v, TODAY, set()) is None
+    s = section("RG", [v], [])
+    assert s.highlights == s.also_active == []
+
+
+@pytest.mark.parametrize("text", [
+    "Check where this deal stands", "Confirm the current status",
+    "Check where this opportunity stands with the buyer", "Confirm the customer status and next steps",
+    "Check the status of this deal", "Confirm the current status of the pilot",
+])
+def test_legacy_generic_status_recommendation_cannot_supply_missing_status_evidence(text):
+    check = Note(text, verified=True, evidence=frozenset({"recent-email"}), source="Email · Oct 26")
+    v = view("Andina Chile", 3, owner="RG", recommendation=check, recommendations=[check])
+
+    assert primary_move(v, TODAY, set()) is None
+    assert section("RG", [v], []).highlights == []
+
+
+def test_invalid_status_recommendation_leaves_a_separate_next_move_available():
+    check = status_check_note(status_evidence_valid=False)
+    actual = Note("Send the pilot agreement", verified=True, evidence=frozenset({"contract"}), ref="contract")
+    v = view("Andina Chile", 3, owner="RG", recommendation=check, recommendations=[check, actual])
+
+    s = section("RG", [v], [])
+
+    assert [move.done for _, move, _ in s.highlights] == ["rec:contract"]
+
+
+def test_still_open_customer_request_does_not_need_a_generic_status_fallback():
+    request = item("Andina Chile", "Send the revised pilot agreement", recorded=TODAY - timedelta(days=22),
+                   deal_owner="RG", kind="customer_request", id="agreement")
+    s = section("RG", [view(request.deal, 3, owner="RG")], [request])
+
+    assert [move.done for _, move, _ in s.highlights] == ["insight:agreement"]
+
+
+def test_status_check_does_not_repeat_an_action_already_due_today():
+    check = status_check_note()
+    promise = item("Andina Chile", check.text, due=TODAY, deal_owner="RG", id="signatory")
+    v = view(promise.deal, 3, owner="RG", recommendation=check, recommendations=[check])
+
+    s = section("RG", [v], [promise])
+
+    assert [row.done for row in s.today] == ["insight:signatory"]
+    assert s.highlights == []
+    separate = replace(check, text="Reconcile the signing entity with our billing team")
+    v.recommendation, v.recommendations = separate, [separate]
+    assert [move.done for _, move, _ in section("RG", [v], [promise]).highlights] == ["rec:signing-entity"]
 
 
 def test_legacy_followup_recommendation_leaves_room_for_an_independent_move():
@@ -355,14 +470,16 @@ def test_new_changes_rank_before_late_ones():
 
 def ramiro_oct28():
     """Ramiro's eligible deals as of Oct 28, reduced to the signals the selection uses."""
-    vb, rec = Note("blocker", verified=True), Note("next move", verified=True)
+    vb = Note("The pilot pricing terms need the budget owner's approval", verified=True,
+              evidence=frozenset({"terms"}))
+    rec = Note("Send the revised pilot terms for approval", verified=True, evidence=frozenset({"terms"}))
     d = lambda n: TODAY - timedelta(days=n)
     views = [
-        view("Pernod Ricard", 3, owner="RG", last=d(2), blocker=vb, recommendation=rec,
+        view("Pernod Ricard", 3, owner="RG", last=d(2), blocker=vb, recommendation=rec, recommendations=[rec],
              unanswered=Unanswered("Próximos pasos?", 1, "l", True, "Confirm the pilot decision date")),
-        view("Campari", 4, owner="RG", last=d(6), blocker=vb, recommendation=rec, developments=1),
-        view("Farmater", 4, owner="RG", last=d(1), blocker=vb, recommendation=rec, developments=1),
-        view("Andina Chile", 2, owner="RG", last=d(9), blocker=vb, recommendation=rec),
+        view("Campari", 4, owner="RG", last=d(6), blocker=vb, recommendation=rec, recommendations=[rec], developments=1),
+        view("Farmater", 4, owner="RG", last=d(1), blocker=vb, recommendation=rec, recommendations=[rec], developments=1),
+        view("Andina Chile", 2, owner="RG", last=d(9), blocker=vb, recommendation=rec, recommendations=[rec]),
         view("Chifles", 2, owner="RG", last=d(9), recommendation=rec),
         view("Arca Peru", 2, owner="RG", last=d(9), blocker=vb),
         view("Martin Albretch", 1, owner="RG", last=d(13), recommendation=rec),
@@ -389,7 +506,7 @@ def test_in_talks_deals_get_considered_and_two_are_shown():
 
 def test_time_critical_pilots_are_never_displaced_for_in_talks():
     pilots = [view(f"Pilot {n}", 4, owner="RG") for n in range(6)]
-    talks = [view("Talks co", 2, owner="RG", blocker=Note("b", verified=True), recommendation=Note("r", verified=True))]
+    talks = [view("Talks co", 2, owner="RG", recommendation=Note("Send the commercial proposal", verified=True))]
     items = [item(v.deal, "promise", due=TODAY + timedelta(days=2), deal_owner="RG", id=f"p{n}")
              for n, v in enumerate(pilots)]
     s = section("RG", pilots + talks, items)
@@ -398,7 +515,8 @@ def test_time_critical_pilots_are_never_displaced_for_in_talks():
 
 
 def test_in_talks_without_evidence_is_not_forced_in():
-    s = section("RG", [view("Quiet talks", 2, owner="RG"), view("Pilot", 4, owner="RG", blocker=Note("b", verified=True))], [])
+    pilot = view("Pilot", 4, owner="RG", recommendation=Note("Send the pilot agreement", verified=True))
+    s = section("RG", [view("Quiet talks", 2, owner="RG"), pilot], [])
     reasons = {r.deal: r.reason for r in s.audit}
     assert "In Talks preference" not in reasons.get("Quiet talks", "")
 
@@ -595,7 +713,9 @@ def test_stage_badges_sit_below_escaped_company_names():
     views = [view("Cedar & Co", 0, owner="RG"), view("Harbor Foods", 1, owner="RG")]
     views += [view(label + " Co", rank, owner="RG") for rank, (label, _, _) in enumerate(BADGE_PALETTE[2:5], start=2)]
     views += [view("Willow Retail", 5, owner="RG")]
-    s = section("RG", views, [paused, opening, customer])
+    steps = [item(v.deal, "Send the pilot proposal", deal_owner="RG", id=f"stage-{v.rank}", kind="next_step")
+             for v in views if v.rank in (2, 3, 4)]
+    s = section("RG", views, [paused, opening, customer, *steps])
     urgent = TodayRow("Nico <Urgent>", "4. Pilot", "Due now", "Review the file", "due today", "Nico DL", None)
     html = render([s], [urgent], [], TODAY, 7, "c", False, action_url=lambda ref: f"https://x/done?r={ref}")
     for company, label in (("Cedar &amp; Co", "Paused"), ("Harbor Foods", "Opening"), ("In Talks Co", "In Talks"),
@@ -635,8 +755,7 @@ def test_done_buttons_link_each_closable_row_and_skip_the_rest():
     html = render([s], [], [], TODAY, 2, "c", False, action_url=lambda ref: f"https://x/done?r={ref}")
     assert html.count("✓ Done") >= len(refs)
     assert "https://x/done?r=insight:c" in html and "https://x/done?r=thread:t1" in html
-    no_target = primary_move(view("Quiet Co", 2, owner="RG"), TODAY, set())
-    assert no_target.tag == "Confirm status" and no_target.done is None
+    assert primary_move(view("Quiet Co", 2, owner="RG"), TODAY, set()) is None
 
 
 # ---------------------------------------------------------------- Nov 4 founder feedback: automated mail, waiting list
@@ -754,11 +873,13 @@ def test_waiting_proposal_leaves_its_highlight_slot_for_another_deal(has_evidenc
                     id="proposal", kind="proposed")
     other_deals = [view(f"Prospect {n}", 3, owner="RG") for n in range(6)]
     views = [view(proposal.deal, 4, owner="RG", last=sent), *other_deals]
+    actual_moves = [item(v.deal, "Send the pilot agreement", due=TODAY + timedelta(days=4), deal_owner="RG",
+                         id=f"agreement-{n}") for n, v in enumerate(other_deals)]
     action = "Customer to confirm the pilot approval date" if has_evidence else proposal.text
     evidence = frozenset({proposal.id}) if has_evidence else frozenset()
     waiting = wait(proposal.deal, 9, rank=4, sent=sent, action=action, evidence=evidence)
     proposal.link = waiting.link
-    brief = build_section("RG", "Ramiro", "Ramiro", {v.deal: v for v in views}, [proposal], [], TODAY, DISPLAY,
+    brief = build_section("RG", "Ramiro", "Ramiro", {v.deal: v for v in views}, [proposal, *actual_moves], [], TODAY, DISPLAY,
                           waiting=[waiting])
 
     assert brief.waiting == [waiting]
